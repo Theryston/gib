@@ -88,13 +88,11 @@ pub fn commit(matches: &ArgMatches) {
     // - open the file and read chunks
     // - for each chunk:
     //   - generate a hash of the chunk
-    //   - compress the chunk (if needed)
-    //   - encrypt the chunk (if needed)
     //   - update in memory the indexes/chunk.msgpack for the chunk hash by incrementing the count by 1
     //   - if the chunk hash is NOT in the indexes/chunk.msgpack in memory:
-    //     - save the bytes to the storage
-    //   - if the chunk hash is IN the indexes/chunk.msgpack in memory:
-    //     - DO NOT save the bytes to the storage (because it already exists)
+    //      - compress the chunk (if needed)
+    //      - encrypt the chunk (if needed)
+    //      - save the bytes to the storage
     // - save the commit file with all the chunk hashes and tree
     // - save the new indexes/chunk.msgpack to the storage
 
