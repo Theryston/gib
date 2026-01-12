@@ -1,0 +1,106 @@
+use clap::{Arg, Command, arg};
+
+mod commands;
+mod fs;
+mod utils;
+
+fn cli() -> Command {
+    Command::new("gib")
+        .about("Fast and versionable backup tool")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .allow_external_subcommands(true)
+        .subcommand(
+            Command::new("config")
+                .about("Configure your backup tool")
+                .arg(
+                arg!(-a --author <AUTHOR> "Your identity like 'John Doe <john.doe@example.com>'")
+                    .required(false),
+            ),
+        )
+        .subcommand(
+            Command::new("whoami")
+                .about("Show your identity")
+        )
+        .subcommand(
+            Command::new("commit")
+                .about("Commit an backup to the remote")
+                .arg(arg!(-k --key <KEY> "The key to use for the commit").required(false))
+                .arg(arg!(-m --message <MESSAGE> "The commit message").required(false))
+                .arg(arg!(-s --storage <STORAGE> "The storage to use for the commit").required(false))
+                .arg(
+                    Arg::new("root-path")
+                        .short('r')
+                        .long("root-path")
+                        .value_name("ROOT_PATH")
+                        .help("The root path to commit")
+                        .required(false),
+                )
+        )
+        .subcommand(
+            Command::new("storage")
+                .about("Manage your storage")
+                .subcommand(
+                    Command::new("add")
+                        .about("Add a new storage")
+                        .arg(arg!(-n --name <NAME> "The name of the storage").required(false))
+                        .arg(
+                            arg!(-t --type <TYPE> "The type of the storage ('local' or 's3')")
+                                .required(false)
+                                .value_parser(["local", "s3"]),
+                        )
+                        .arg(arg!(-p --path <PATH> "The path for storing backups (only for local storage)").required(false))
+                        .arg(arg!(-r --region <REGION> "The region for the S3 storage (only for S3 storage)").required(false))
+                        .arg(arg!(-b --bucket <BUCKET> "The bucket for the S3 storage (only for S3 storage)").required(false))
+                        .arg(
+                            Arg::new("access-key")
+                                .short('a')
+                                .long("access-key")
+                                .value_name("ACCESS_KEY")
+                                .help("The access key for the S3 storage (only for S3 storage)")
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("secret-key")
+                                .short('s')
+                                .long("secret-key")
+                                .value_name("SECRET_KEY")
+                                .help("The secret key for the S3 storage (only for S3 storage)")
+                                .required(false),
+                        )
+                        .arg(arg!(-e --endpoint <ENDPOINT> "The endpoint for the S3 storage (only for S3 storage)").required(false))
+                )
+                .subcommand(
+                    Command::new("list")
+                        .about("List all storages")
+                )
+                .subcommand(
+                    Command::new("remove")
+                        .about("Remove a storage")
+                        .arg(arg!(-n --name <NAME> "The name of the storage").required(false))
+                )
+        )
+}
+
+fn main() {
+    let matches = cli().get_matches();
+
+    match matches.subcommand() {
+        Some(("config", matches)) => commands::config(matches),
+        Some(("whoami", _)) => commands::whoami(),
+        Some(("commit", matches)) => commands::commit(matches),
+        Some(("storage", matches)) => match matches.subcommand() {
+            Some(("add", matches)) => {
+                commands::storage::add(matches);
+            }
+            Some(("list", _)) => {
+                commands::storage::list();
+            }
+            Some(("remove", matches)) => {
+                commands::storage::remove(matches);
+            }
+            _ => unreachable!(),
+        },
+        _ => unreachable!(),
+    }
+}
