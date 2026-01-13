@@ -49,7 +49,7 @@ struct ChunkIndex {
     refcount: u32,
 }
 
-pub async fn commit(matches: &ArgMatches) {
+pub async fn backup(matches: &ArgMatches) {
     let (key, message, root_path_string, storage, compress, password, chunk_size) =
         match get_params(matches) {
             Ok(params) => params,
@@ -61,7 +61,7 @@ pub async fn commit(matches: &ArgMatches) {
     pb.enable_steady_tick(Duration::from_millis(100));
     pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
 
-    pb.set_message("Loading commit metadata...");
+    pb.set_message("Loading metadata from the repository key...");
 
     let home_dir = match home_dir() {
         Some(dir) => dir,
@@ -91,7 +91,7 @@ pub async fn commit(matches: &ArgMatches) {
         _ => handle_error("Invalid storage type".to_string(), Some(&pb)),
     };
 
-    pb.set_message("Generating new commit...");
+    pb.set_message("Generating new backup...");
 
     let (new_commit, root_files, chunk_indexes) = match load_metadata(
         Arc::clone(&fs),
@@ -119,7 +119,7 @@ pub async fn commit(matches: &ArgMatches) {
     );
 
     pb.set_message(format!(
-        "Committing files to {}...",
+        "Backing up files to {}...",
         new_commit.hash[..8].to_string()
     ));
 
@@ -302,13 +302,13 @@ pub async fn commit(matches: &ArgMatches) {
     }
 
     if write_commit_file_result.is_err() {
-        handle_error("Failed to write commit file".to_string(), Some(&pb));
+        handle_error("Failed to write backup file".to_string(), Some(&pb));
     }
 
     let elapsed = pb.elapsed();
     pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
     pb.set_prefix("✓");
-    pb.finish_with_message(format!("Committed files ({:.2?})", elapsed));
+    pb.finish_with_message(format!("Backed up files ({:.2?})", elapsed));
 }
 
 fn get_file_permissions_with_path(metadata: &std::fs::Metadata, path: &str) -> u32 {
@@ -365,8 +365,8 @@ async fn load_metadata(
         tokio::join!(new_commit_future, root_files_future, chunk_indexes_future);
 
     let new_commit = new_commit_result
-        .map_err(|e| format!("Failed to create new commit: {}", e))?
-        .map_err(|e| format!("Failed to create new commit: {}", e))?;
+        .map_err(|e| format!("Failed to create new backup: {}", e))?
+        .map_err(|e| format!("Failed to create new backup: {}", e))?;
 
     let root_files = root_files_result.map_err(|e| format!("Failed to list root files: {}", e))?;
 
@@ -460,7 +460,7 @@ async fn create_new_commit(
     commit_sumaries.insert(0, new_commit_summary);
 
     let commit_sumaries_bytes = rmp_serde::to_vec(&commit_sumaries)
-        .map_err(|e| format!("Failed to serialize commit summaries: {}", e))?;
+        .map_err(|e| format!("Failed to serialize backup summaries: {}", e))?;
     let compressed_commit_sumaries_bytes = compress_bytes(&commit_sumaries_bytes, compress);
 
     let final_commit_sumaries_bytes = match password {
@@ -471,7 +471,7 @@ async fn create_new_commit(
     let index_path = format!("{}/indexes/commits", key);
     fs.write_file(&index_path, &final_commit_sumaries_bytes)
         .await
-        .map_err(|e| format!("Failed to write commit index: {}", e))?;
+        .map_err(|e| format!("Failed to write backup index: {}", e))?;
 
     Ok(commit)
 }
@@ -502,7 +502,7 @@ async fn list_commit_summaries(
             None => {
                 if is_encrypted {
                     return Err(
-                        "Commit summaries are encrypted but no password provided".to_string()
+                        "Backup summaries are encrypted but no password provided".to_string()
                     );
                 } else {
                     commit_summaries_bytes
@@ -514,7 +514,7 @@ async fn list_commit_summaries(
             decompress_bytes(&decrypted_commit_summaries_bytes);
 
         rmp_serde::from_slice(&decompressed_commit_summaries_bytes)
-            .map_err(|e| format!("Failed to deserialize commit summaries: {}", e))?
+            .map_err(|e| format!("Failed to deserialize backup summaries: {}", e))?
     };
 
     Ok(commit_summaries)
@@ -553,7 +553,7 @@ fn get_params(
     let message = match matches.get_one::<String>("message") {
         Some(message) => message.to_string(),
         None => Input::<String>::new()
-            .with_prompt("Enter the commit message")
+            .with_prompt("Enter the backup message")
             .interact_text()
             .map_err(|e| format!("{}", e))?,
     };

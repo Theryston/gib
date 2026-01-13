@@ -23,19 +23,19 @@ fn cli() -> Command {
                 .about("Show your identity")
         )
         .subcommand(
-            Command::new("commit")
-                .about("Commit an backup to the remote")
-                .arg(arg!(-k --key <KEY> "The key to use for the commit").required(false))
-                .arg(arg!(-m --message <MESSAGE> "The commit message").required(false))
-                .arg(arg!(-s --storage <STORAGE> "The storage to use for the commit").required(false))
-                .arg(arg!(-p --password <PASSWORD> "The password to use for the commit").required(false))
-                .arg(arg!(-c --compress <COMPRESS> "The compression level to use for the commit").required(false))
+            Command::new("backup")
+                .about("Create a backup of a directory and store it in a storage (similar to git commit)")
+                .arg(arg!(-k --key <KEY> "The key to use for the backup").required(false))
+                .arg(arg!(-m --message <MESSAGE> "The backup message").required(false))
+                .arg(arg!(-s --storage <STORAGE> "The storage to use for the backup").required(false))
+                .arg(arg!(-p --password <PASSWORD> "The password to use for the backup").required(false))
+                .arg(arg!(-c --compress <COMPRESS> "The compression level to use for the backup").required(false))
                 .arg(
                     Arg::new("chunk-size")
                         .short('z')
                         .long("chunk-size")
                         .value_name("CHUNK_SIZE")
-                        .help("The chunk size to use for the commit (default: 5 MB)")
+                        .help("The chunk size to use for the backup (default: 5 MB)")
                         .required(false),
                 )
                 .arg(
@@ -43,7 +43,7 @@ fn cli() -> Command {
                         .short('r')
                         .long("root-path")
                         .value_name("ROOT_PATH")
-                        .help("The root path to commit")
+                        .help("The root path to backup")
                         .required(false),
                 )
         )
@@ -99,7 +99,7 @@ async fn main() {
     match matches.subcommand() {
         Some(("config", matches)) => commands::config(matches),
         Some(("whoami", _)) => commands::whoami(),
-        Some(("commit", matches)) => commands::commit(matches).await,
+        Some(("backup", matches)) => commands::backup(matches).await,
         Some(("storage", matches)) => match matches.subcommand() {
             Some(("add", matches)) => {
                 commands::storage::add(matches);
