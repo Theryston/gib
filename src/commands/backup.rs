@@ -561,6 +561,10 @@ fn get_params(
     let home_dir = home_dir().unwrap();
     let storage_path = home_dir.join(".gib").join("storages");
 
+    if !storage_path.exists() {
+        return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
+    }
+
     let files = std::fs::read_dir(&storage_path).unwrap();
 
     let storages_names = &files
@@ -575,6 +579,10 @@ fn get_params(
                 .to_string()
         })
         .collect::<Vec<String>>();
+
+    if storages_names.is_empty() {
+        return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
+    }
 
     let storage = match matches.get_one::<String>("storage") {
         Some(storage) => storage.to_string(),
