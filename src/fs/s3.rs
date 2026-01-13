@@ -1,4 +1,5 @@
 use crate::fs::FS;
+use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sdk_s3 as s3;
 use aws_types::region::Region;
@@ -43,50 +44,37 @@ impl S3FS {
     }
 }
 
+#[async_trait]
 impl FS for S3FS {
-    fn read_file(&self, path: &str) -> Result<Vec<u8>, std::io::Error> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+    async fn read_file(&self, path: &str) -> Result<Vec<u8>, std::io::Error> {
+        let resp = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(path)
+            .send()
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-        rt.block_on(async {
-            let resp = self
-                .client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(path)
-                .send()
-                .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let data = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-            let data = resp
-                .body
-                .collect()
-                .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-
-            Ok(data.into_bytes().to_vec())
-        })
+        Ok(data.into_bytes().to_vec())
     }
 
-    fn write_file(&self, path: &str, data: &[u8]) -> Result<(), std::io::Error> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+    async fn write_file(&self, path: &str, data: &[u8]) -> Result<(), std::io::Error> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(path)
+            .body(Bytes::from(data.to_vec()).into())
+            .send()
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-        rt.block_on(async {
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(path)
-                .body(Bytes::from(data.to_vec()).into())
-                .send()
-                .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-
-            Ok(())
-        })
+        Ok(())
     }
 }

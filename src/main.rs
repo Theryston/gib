@@ -28,6 +28,8 @@ fn cli() -> Command {
                 .arg(arg!(-k --key <KEY> "The key to use for the commit").required(false))
                 .arg(arg!(-m --message <MESSAGE> "The commit message").required(false))
                 .arg(arg!(-s --storage <STORAGE> "The storage to use for the commit").required(false))
+                .arg(arg!(-p --password <PASSWORD> "The password to use for the commit").required(false))
+                .arg(arg!(-c --compress <COMPRESS> "The compression level to use for the commit").required(false))
                 .arg(
                     Arg::new("root-path")
                         .short('r')
@@ -82,13 +84,14 @@ fn cli() -> Command {
         )
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let matches = cli().get_matches();
 
     match matches.subcommand() {
         Some(("config", matches)) => commands::config(matches),
         Some(("whoami", _)) => commands::whoami(),
-        Some(("commit", matches)) => commands::commit(matches),
+        Some(("commit", matches)) => commands::commit(matches).await,
         Some(("storage", matches)) => match matches.subcommand() {
             Some(("add", matches)) => {
                 commands::storage::add(matches);

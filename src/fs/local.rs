@@ -1,4 +1,5 @@
 use crate::fs::FS;
+use async_trait::async_trait;
 
 pub struct LocalFS {
     path: std::path::PathBuf,
@@ -10,12 +11,13 @@ impl LocalFS {
     }
 }
 
+#[async_trait]
 impl FS for LocalFS {
-    fn read_file(&self, path: &str) -> Result<Vec<u8>, std::io::Error> {
+    async fn read_file(&self, path: &str) -> Result<Vec<u8>, std::io::Error> {
         std::fs::read(&self.path.join(path))
     }
 
-    fn write_file(&self, path: &str, data: &[u8]) -> Result<(), std::io::Error> {
+    async fn write_file(&self, path: &str, data: &[u8]) -> Result<(), std::io::Error> {
         let path = self.path.join(path);
         let parent_dir = path.parent().unwrap();
 

@@ -1,4 +1,7 @@
-pub trait FS {
-    fn read_file(&self, path: &str) -> Result<Vec<u8>, std::io::Error>;
-    fn write_file(&self, path: &str, data: &[u8]) -> Result<(), std::io::Error>;
+use async_trait::async_trait;
+
+#[async_trait]
+pub trait FS: Send + Sync {
+    async fn read_file(&self, path: &str) -> Result<Vec<u8>, std::io::Error>;
+    async fn write_file(&self, path: &str, data: &[u8]) -> Result<(), std::io::Error>;
 }

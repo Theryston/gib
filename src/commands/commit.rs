@@ -1,6 +1,9 @@
 use crate::commands::config::Config;
 use crate::fs::{FS, LocalFS, S3FS, S3FSConfig};
-use crate::utils::{get_pwd_string, get_storage, list_files};
+use crate::utils::{
+    compress_bytes, decompress_bytes, decrypt_bytes, encrypt_bytes, get_pwd_string, get_storage,
+    is_encrypted, list_files,
+};
 use clap::ArgMatches;
 use dialoguer::{Input, Select};
 use dirs::home_dir;
@@ -9,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
@@ -35,10 +39,25 @@ struct CommitObject {
     chunks: Vec<String>,
 }
 
-pub fn commit(matches: &ArgMatches) {
-    let (key, message, root_path_string, storage) = get_params(matches);
+#[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
+struct ChunkIndex {
+    refcount: u32,
+}
+
+struct ProgressGuard(ProgressBar);
+
+impl Drop for ProgressGuard {
+    fn drop(&mut self) {
+        self.0.finish_and_clear();
+    }
+}
+
+pub async fn commit(matches: &ArgMatches) {
+    let (key, message, root_path_string, storage, compress, password) = get_params(matches);
 
     let pb = ProgressBar::new(100);
+    let _guard = ProgressGuard(pb.clone());
+
     pb.enable_steady_tick(Duration::from_millis(100));
     pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
 
@@ -51,9 +70,9 @@ pub fn commit(matches: &ArgMatches) {
 
     let storage = get_storage(&storage);
 
-    let fs: Box<dyn FS> = match storage.storage_type {
-        0 => Box::new(LocalFS::new(storage.path.unwrap())),
-        1 => Box::new(S3FS::new(S3FSConfig {
+    let fs: Arc<dyn FS> = match storage.storage_type {
+        0 => Arc::new(LocalFS::new(storage.path.unwrap())),
+        1 => Arc::new(S3FS::new(S3FSConfig {
             region: storage.region,
             bucket: storage.bucket,
             access_key: storage.access_key,
@@ -68,11 +87,16 @@ pub fn commit(matches: &ArgMatches) {
 
     pb.set_message("Generating new commit...");
 
-    let commit_summaries = get_last_commit(&fs, &key);
-
-    let new_commit = create_new_commit(&fs, &key, &message, &config.author, commit_summaries);
-
-    let root_files = list_files(&root_path_string);
+    let (new_commit, root_files, file_indexes, chunk_indexes) = load_metadata(
+        Arc::clone(&fs),
+        key,
+        message,
+        config,
+        root_path_string,
+        compress,
+        password,
+    )
+    .await;
 
     pb.set_message(format!(
         "Committing {} files to {}...",
@@ -81,6 +105,8 @@ pub fn commit(matches: &ArgMatches) {
     ));
 
     println!("{:?}", root_files);
+    println!("{:?}", file_indexes);
+    println!("{:?}", chunk_indexes);
 
     // TODO: Load the indexes/chunk.msgpack in memory
     // TODO: for each root file:
@@ -102,116 +128,270 @@ pub fn commit(matches: &ArgMatches) {
     pb.finish_with_message(format!("Committed files ({:.2?})", elapsed));
 }
 
-fn create_new_commit(
-    fs: &Box<dyn FS>,
-    key: &str,
-    message: &str,
-    author: &str,
-    commit_sumaries: Vec<CommitSummary>,
-) -> Commit {
-    let last_commit_summary = commit_sumaries.first();
+async fn load_metadata(
+    fs: Arc<dyn FS>,
+    key: String,
+    message: String,
+    config: Config,
+    root_path_string: String,
+    compress: i32,
+    password: Option<String>,
+) -> (
+    Commit,
+    Vec<String>,
+    HashMap<String, Vec<String>>,
+    HashMap<String, ChunkIndex>,
+) {
+    let new_commit_future = tokio::spawn(create_new_commit(
+        Arc::clone(&fs),
+        key.clone(),
+        message.clone(),
+        config.author.clone(),
+        compress.clone(),
+        password.clone(),
+    ));
 
-    if last_commit_summary.is_none() {
-        let commit_hash = Sha256::digest(format!("{}:{}", message, author).as_bytes());
+    let root_files_future = tokio::spawn(async move { list_files(&root_path_string) });
 
-        return write_commit(
-            fs,
-            key,
-            &Commit {
-                message: message.to_string(),
-                author: author.to_string(),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                tree: std::collections::HashMap::new(),
-                hash: format!("{:x}", commit_hash),
-            },
-            &mut commit_sumaries.to_owned(),
-        );
-    };
+    let file_indexes_future = tokio::spawn(load_file_indexes(
+        Arc::clone(&fs),
+        key.clone(),
+        password.clone(),
+    ));
 
-    let last_commit_hash = &last_commit_summary.unwrap().hash;
-    let commit_path = format!("{}/commits/{}.msgpack", key, last_commit_hash);
+    let chunk_indexes_future =
+        tokio::spawn(load_chunk_indexes(Arc::clone(&fs), key.clone(), password));
 
-    let last_commit_bytes = fs.read_file(&commit_path).unwrap_or_else(|_| Vec::new());
+    let (new_commit_result, root_files_result, file_indexes_result, chunk_indexes_result) = tokio::join!(
+        new_commit_future,
+        root_files_future,
+        file_indexes_future,
+        chunk_indexes_future
+    );
 
-    let last_commit: Commit = if !last_commit_bytes.is_empty() {
-        rmp_serde::from_slice(&last_commit_bytes).unwrap()
-    } else {
-        Commit {
-            message: String::new(),
-            author: String::new(),
-            timestamp: 0,
-            tree: std::collections::HashMap::new(),
-            hash: String::new(),
+    let new_commit = match new_commit_result {
+        Ok(commit) => commit,
+        Err(e) => {
+            eprintln!("Failed to create new commit: {e}");
+            std::process::exit(1);
         }
     };
 
-    let new_commit = Commit {
-        hash: format!(
-            "{:x}",
-            Sha256::digest(format!("{}:{}", message, author).as_bytes())
-        ),
+    let root_files = match root_files_result {
+        Ok(files) => files,
+        Err(e) => {
+            eprintln!("Failed to list root files: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let file_indexes = match file_indexes_result {
+        Ok(indexes) => indexes,
+        Err(e) => {
+            eprintln!("Failed to load file indexes: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let chunk_indexes = match chunk_indexes_result {
+        Ok(indexes) => indexes,
+        Err(e) => {
+            eprintln!("Failed to load chunk indexes: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    (new_commit, root_files, file_indexes, chunk_indexes)
+}
+
+async fn load_chunk_indexes(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+) -> HashMap<String, ChunkIndex> {
+    let chunk_index_bytes = fs
+        .read_file(format!("{}/indexes/chunks.msgpack", key).as_str())
+        .await
+        .unwrap_or_else(|_| Vec::new());
+
+    let chunk_indexes: HashMap<String, ChunkIndex> = if chunk_index_bytes.is_empty() {
+        HashMap::new()
+    } else {
+        let is_encrypted = is_encrypted(&chunk_index_bytes);
+
+        let decrypted_chunk_index_bytes = match password {
+            Some(password) => {
+                if is_encrypted {
+                    decrypt_bytes(&chunk_index_bytes, password.as_bytes()).unwrap()
+                } else {
+                    chunk_index_bytes
+                }
+            }
+            None => {
+                if is_encrypted {
+                    eprintln!("Chunk indexes are encrypted but no password provided");
+                    std::process::exit(1);
+                } else {
+                    chunk_index_bytes
+                }
+            }
+        };
+
+        let decompressed_chunk_index_bytes = decompress_bytes(&decrypted_chunk_index_bytes);
+
+        rmp_serde::from_slice(&decompressed_chunk_index_bytes).unwrap()
+    };
+
+    chunk_indexes
+}
+
+async fn load_file_indexes(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+) -> HashMap<String, Vec<String>> {
+    let file_index_bytes = fs
+        .read_file(format!("{}/indexes/files.msgpack", key).as_str())
+        .await
+        .unwrap_or_else(|_| Vec::new());
+
+    let file_indexes: HashMap<String, Vec<String>> = if file_index_bytes.is_empty() {
+        HashMap::new()
+    } else {
+        let is_encrypted = is_encrypted(&file_index_bytes);
+
+        let decrypted_file_index_bytes = match password {
+            Some(password) => {
+                if is_encrypted {
+                    decrypt_bytes(&file_index_bytes, password.as_bytes()).unwrap()
+                } else {
+                    file_index_bytes
+                }
+            }
+            None => {
+                if is_encrypted {
+                    eprintln!("File indexes are encrypted but no password provided");
+                    std::process::exit(1);
+                } else {
+                    file_index_bytes
+                }
+            }
+        };
+
+        let decompressed_file_index_bytes = decompress_bytes(&decrypted_file_index_bytes);
+
+        rmp_serde::from_slice(&decompressed_file_index_bytes).unwrap()
+    };
+
+    file_indexes
+}
+
+async fn create_new_commit(
+    fs: Arc<dyn FS>,
+    key: String,
+    message: String,
+    author: String,
+    compress: i32,
+    password: Option<String>,
+) -> Commit {
+    let commit_hash = Sha256::digest(format!("{}:{}", message, author).as_bytes());
+
+    let commit = Commit {
         message: message.to_string(),
         author: author.to_string(),
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs(),
-        tree: last_commit.tree,
+        tree: std::collections::HashMap::new(),
+        hash: format!("{:x}", commit_hash),
     };
 
-    write_commit(fs, key, &new_commit, &mut commit_sumaries.to_owned())
-}
+    let commit_bytes = rmp_serde::to_vec(&commit).unwrap();
+    let compressed_commit_bytes = compress_bytes(&commit_bytes, compress);
 
-fn write_commit(
-    fs: &Box<dyn FS>,
-    key: &str,
-    commit: &Commit,
-    commit_sumaries: &mut Vec<CommitSummary>,
-) -> Commit {
-    let commit_bytes = rmp_serde::to_vec(commit).unwrap();
+    let final_commit_bytes = match &password {
+        Some(password) => encrypt_bytes(&compressed_commit_bytes, password.as_bytes()),
+        None => compressed_commit_bytes,
+    };
 
-    fs.write_file(
-        format!("{}/commits/{}.msgpack", key, commit.hash).as_str(),
-        &commit_bytes,
-    )
-    .unwrap();
+    let commit_path = format!("{}/commits/{}.msgpack", key, commit.hash);
+    let write_commit_future = fs.write_file(&commit_path, &final_commit_bytes);
 
     let new_commit_summary = CommitSummary {
         message: commit.message.clone(),
         hash: commit.hash.clone(),
     };
 
+    let mut commit_sumaries = list_commit_summaries(&fs, &key, password.clone()).await;
+
     commit_sumaries.insert(0, new_commit_summary);
 
     let commit_sumaries_bytes = rmp_serde::to_vec(&commit_sumaries).unwrap();
+    let compressed_commit_sumaries_bytes = compress_bytes(&commit_sumaries_bytes, compress);
 
-    fs.write_file(
-        format!("{}/indexes/commits.msgpack", key).as_str(),
-        &commit_sumaries_bytes,
-    )
-    .unwrap();
+    let final_commit_sumaries_bytes = match password {
+        Some(password) => encrypt_bytes(&compressed_commit_sumaries_bytes, password.as_bytes()),
+        None => compressed_commit_sumaries_bytes,
+    };
 
-    commit.clone()
+    let index_path = format!("{}/indexes/commits.msgpack", key);
+    let write_index_future = fs.write_file(&index_path, &final_commit_sumaries_bytes);
+
+    let (write_commit_result, write_index_result) =
+        tokio::join!(write_commit_future, write_index_future);
+
+    if write_commit_result.is_err() || write_index_result.is_err() {
+        eprintln!("Error: Failed to write commit or index");
+        std::process::exit(1);
+    }
+
+    commit
 }
 
-fn get_last_commit(fs: &Box<dyn FS>, key: &str) -> Vec<CommitSummary> {
-    let last_commit = fs
+async fn list_commit_summaries(
+    fs: &Arc<dyn FS>,
+    key: &String,
+    password: Option<String>,
+) -> Vec<CommitSummary> {
+    let commit_summaries_bytes = fs
         .read_file(format!("{}/indexes/commits.msgpack", key).as_str())
+        .await
         .unwrap_or_else(|_| Vec::new());
 
-    let commit_summaries: Vec<CommitSummary> = if last_commit.is_empty() {
+    let commit_summaries: Vec<CommitSummary> = if commit_summaries_bytes.is_empty() {
         Vec::new()
     } else {
-        rmp_serde::from_slice(&last_commit).unwrap()
+        let is_encrypted = is_encrypted(&commit_summaries_bytes);
+
+        let decrypted_commit_summaries_bytes = match password {
+            Some(password) => {
+                if is_encrypted {
+                    decrypt_bytes(&commit_summaries_bytes, password.as_bytes()).unwrap()
+                } else {
+                    commit_summaries_bytes
+                }
+            }
+            None => {
+                if is_encrypted {
+                    eprintln!("Commit summaries are encrypted but no password provided");
+                    std::process::exit(1);
+                } else {
+                    commit_summaries_bytes
+                }
+            }
+        };
+
+        let decompressed_commit_summaries_bytes =
+            decompress_bytes(&decrypted_commit_summaries_bytes);
+
+        rmp_serde::from_slice(&decompressed_commit_summaries_bytes).unwrap()
     };
 
     commit_summaries
 }
 
-fn get_params(matches: &ArgMatches) -> (String, String, String, String) {
+fn get_params(matches: &ArgMatches) -> (String, String, String, String, i32, Option<String>) {
     let pwd_string = get_pwd_string();
     let root_path_string = matches.get_one::<String>("root-path").map_or_else(
         || pwd_string.clone(),
@@ -283,6 +463,12 @@ fn get_params(matches: &ArgMatches) -> (String, String, String, String) {
         |storage| storage.to_string(),
     );
 
+    let password = matches.get_one::<String>("password").map(|s| s.to_string());
+
+    let compress: i32 = matches
+        .get_one::<String>("compress")
+        .map_or_else(|| 3, |compress| compress.parse().unwrap());
+
     let exists = storages_names
         .iter()
         .any(|storage_name| storage_name == &storage);
@@ -292,5 +478,5 @@ fn get_params(matches: &ArgMatches) -> (String, String, String, String) {
         std::process::exit(1);
     }
 
-    (key, message, root_path_string, storage)
+    (key, message, root_path_string, storage, compress, password)
 }
