@@ -56,26 +56,33 @@ pub async fn backup(matches: &ArgMatches) {
             Err(e) => handle_error(e, None),
         };
 
+    let home_dir = match home_dir() {
+        Some(dir) => dir,
+        None => handle_error("Failed to get home directory".to_string(), None),
+    };
+
+    let config_path = home_dir.join(".gib").join("config.msgpack");
+
+    if !config_path.exists() {
+        handle_error("Seams like you didn't configure your backup tool yet. Run 'gib config' to configure your backup tool.".to_string(), None);
+    }
+
+    let config_bytes = match std::fs::read(&config_path) {
+        Ok(bytes) => bytes,
+        Err(e) => handle_error(format!("Failed to read config file: {}", e), None),
+    };
+
+    let config: Config = match rmp_serde::from_slice(&config_bytes) {
+        Ok(config) => config,
+        Err(e) => handle_error(format!("Failed to deserialize config: {}", e), None),
+    };
+
     let pb = ProgressBar::new(100);
 
     pb.enable_steady_tick(Duration::from_millis(100));
     pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
 
     pb.set_message("Loading metadata from the repository key...");
-
-    let home_dir = match home_dir() {
-        Some(dir) => dir,
-        None => handle_error("Failed to get home directory".to_string(), Some(&pb)),
-    };
-    let config_path = home_dir.join(".gib").join("config.msgpack");
-    let config_bytes = match std::fs::read(&config_path) {
-        Ok(bytes) => bytes,
-        Err(e) => handle_error(format!("Failed to read config file: {}", e), Some(&pb)),
-    };
-    let config: Config = match rmp_serde::from_slice(&config_bytes) {
-        Ok(config) => config,
-        Err(e) => handle_error(format!("Failed to deserialize config: {}", e), Some(&pb)),
-    };
 
     let storage = get_storage(&storage);
 
