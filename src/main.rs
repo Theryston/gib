@@ -31,6 +31,14 @@ fn cli() -> Command {
                 .arg(arg!(-p --password <PASSWORD> "The password to use for the commit").required(false))
                 .arg(arg!(-c --compress <COMPRESS> "The compression level to use for the commit").required(false))
                 .arg(
+                    Arg::new("chunk-size")
+                        .short('z')
+                        .long("chunk-size")
+                        .value_name("CHUNK_SIZE")
+                        .help("The chunk size to use for the commit (default: 5 MB)")
+                        .required(false),
+                )
+                .arg(
                     Arg::new("root-path")
                         .short('r')
                         .long("root-path")

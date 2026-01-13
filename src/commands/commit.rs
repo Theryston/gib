@@ -5,15 +5,20 @@ use crate::utils::{
     handle_error, is_encrypted, list_files,
 };
 use clap::ArgMatches;
-use dialoguer::{Input, Select};
+use dialoguer::{Input, Password, Select};
 use dirs::home_dir;
 use indicatif::{ProgressBar, ProgressStyle};
+use parse_size::parse_size;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::task::JoinSet;
 
 #[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
 struct CommitSummary {
@@ -45,10 +50,11 @@ struct ChunkIndex {
 }
 
 pub async fn commit(matches: &ArgMatches) {
-    let (key, message, root_path_string, storage, compress, password) = match get_params(matches) {
-        Ok(params) => params,
-        Err(e) => handle_error(e, None),
-    };
+    let (key, message, root_path_string, storage, compress, password, chunk_size) =
+        match get_params(matches) {
+            Ok(params) => params,
+            Err(e) => handle_error(e, None),
+        };
 
     let pb = ProgressBar::new(100);
 
@@ -87,14 +93,14 @@ pub async fn commit(matches: &ArgMatches) {
 
     pb.set_message("Generating new commit...");
 
-    let (new_commit, root_files, file_indexes, chunk_indexes) = match load_metadata(
+    let (new_commit, root_files, chunk_indexes) = match load_metadata(
         Arc::clone(&fs),
-        key,
+        key.clone(),
         message,
         config,
-        root_path_string,
+        root_path_string.clone(),
         compress,
-        password,
+        password.clone(),
     )
     .await
     {
@@ -102,34 +108,234 @@ pub async fn commit(matches: &ArgMatches) {
         Err(e) => handle_error(e, Some(&pb)),
     };
 
+    pb.finish_and_clear();
+
+    let pb = ProgressBar::new(root_files.len() as u64);
+    pb.enable_steady_tick(Duration::from_millis(100));
+
+    pb.set_style(
+        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .unwrap(),
+    );
+
     pb.set_message(format!(
-        "Committing {} files to {}...",
-        root_files.len(),
+        "Committing files to {}...",
         new_commit.hash[..8].to_string()
     ));
 
-    println!("{:?}", root_files);
-    println!("{:?}", file_indexes);
-    println!("{:?}", chunk_indexes);
+    let chunk_indexes: Arc<Mutex<HashMap<String, ChunkIndex>>> =
+        Arc::new(Mutex::new(chunk_indexes));
 
-    // TODO: Load the indexes/chunks in memory
-    // TODO: for each root file:
-    // - generate a hash of the file
-    // - open the file and read chunks
-    // - for each chunk:
-    //   - generate a hash of the chunk
-    //   - update in memory the indexes/chunks for the chunk hash by incrementing the count by 1
-    //   - if the chunk hash is NOT in the indexes/chunks in memory:
-    //      - compress the chunk (if needed)
-    //      - encrypt the chunk (if needed)
-    //      - save the bytes to the storage
-    // - save the commit file with all the chunk hashes and tree
-    // - save the new indexes/chunks to the storage
+    let new_commit: Arc<Mutex<Commit>> = Arc::new(Mutex::new(new_commit));
+
+    let mut files_set: JoinSet<Result<(), String>> = JoinSet::new();
+
+    for file_path in root_files {
+        let pb_clone = pb.clone();
+        let chunk_indexes_clone = Arc::clone(&chunk_indexes);
+        let password_clone = password.clone();
+        let key_clone = key.clone();
+        let fs_clone = Arc::clone(&fs);
+        let new_commit_clone = Arc::clone(&new_commit);
+        let root_path_string_clone = root_path_string.clone();
+
+        files_set.spawn(async move {
+            let mut file = std::fs::File::open(file_path.clone())
+                .map_err(|e| format!("Failed to open file: {}", e))?;
+            let mut file_hasher = Sha256::new();
+            let mut file_chunks = Vec::new();
+
+            let file_metadata = file
+                .metadata()
+                .map_err(|e| format!("Failed to get file metadata: {}", e))?;
+
+            let mut buffer = vec![0u8; chunk_size as usize];
+
+            loop {
+                let bytes_read = file
+                    .read(&mut buffer)
+                    .map_err(|e| format!("Failed to read file: {}", e))
+                    .unwrap_or(0);
+
+                if bytes_read == 0 {
+                    break;
+                }
+
+                let chunk_bytes = &buffer[..bytes_read];
+
+                file_hasher.update(chunk_bytes);
+
+                let chunk_hash = format!("{:x}", Sha256::digest(chunk_bytes));
+                file_chunks.push(chunk_hash.clone());
+
+                let is_in_chunk_indexes = {
+                    let mut chunk_indexes_guard = chunk_indexes_clone.lock().unwrap();
+                    let entry = chunk_indexes_guard
+                        .entry(chunk_hash.clone())
+                        .or_insert(ChunkIndex { refcount: 0 });
+                    entry.refcount += 1;
+
+                    entry.refcount > 1
+                };
+
+                if is_in_chunk_indexes {
+                    continue;
+                }
+
+                let compressed_chunk_bytes = compress_bytes(chunk_bytes, compress);
+
+                let final_chunk_bytes = match password_clone {
+                    Some(ref password_clone) => {
+                        encrypt_bytes(&compressed_chunk_bytes, password_clone.as_bytes())?
+                    }
+                    None => compressed_chunk_bytes,
+                };
+
+                let (chunk_hash_prefix, chunk_hash_rest) = chunk_hash.split_at(2);
+                let chunk_path = format!(
+                    "{}/chunks/{}/{}",
+                    key_clone, chunk_hash_prefix, chunk_hash_rest
+                );
+
+                fs_clone
+                    .write_file(&chunk_path, &final_chunk_bytes)
+                    .await
+                    .map_err(|e| format!("Failed to write chunk: {}", e))?;
+            }
+
+            let file_hash = format!("{:x}", file_hasher.finalize());
+
+            let relative_path = {
+                let content = file_path
+                    .strip_prefix(&root_path_string_clone)
+                    .unwrap_or(&file_path);
+
+                let mut content = content.replace('\\', "/");
+
+                if content.starts_with('/') {
+                    content = content[1..].to_string();
+                }
+
+                content
+            };
+
+            let file_permissions = get_file_permissions_with_path(&file_metadata, &file_path);
+
+            {
+                let mut new_commit_guard = new_commit_clone.lock().unwrap();
+
+                new_commit_guard.tree.insert(
+                    relative_path.to_string(),
+                    CommitObject {
+                        hash: file_hash.clone(),
+                        size: file_metadata.len(),
+                        content_type: "application/octet-stream".to_string(),
+                        permissions: file_permissions,
+                        chunks: file_chunks,
+                    },
+                );
+            }
+
+            pb_clone.inc(1);
+            Ok(())
+        });
+    }
+
+    let mut failed_files = Vec::new();
+
+    while let Some(file_process_result) = files_set.join_next().await {
+        match file_process_result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => failed_files.push(e),
+            Err(e) => failed_files.push(e.to_string()),
+        }
+    }
+
+    if !failed_files.is_empty() {
+        handle_error(
+            format!(
+                "Failed to process {} files:\n{}",
+                failed_files.len(),
+                failed_files
+                    .iter()
+                    .map(|f| format!("  - {}", f))
+                    .collect::<Vec<String>>()
+                    .join("\n")
+            ),
+            Some(&pb),
+        );
+    }
+
+    let chunk_indexes_bytes =
+        rmp_serde::to_vec(&*chunk_indexes.lock().unwrap()).unwrap_or_else(|_| Vec::new());
+
+    let compressed_chunk_indexes_bytes = compress_bytes(&chunk_indexes_bytes, compress);
+
+    let final_chunk_indexes_bytes = match password {
+        Some(ref password) => encrypt_bytes(&compressed_chunk_indexes_bytes, password.as_bytes())
+            .unwrap_or_else(|_| Vec::new()),
+        None => compressed_chunk_indexes_bytes,
+    };
+
+    let chunk_index_path = format!("{}/indexes/chunks", key);
+    let write_chunk_index_future = fs.write_file(&chunk_index_path, &final_chunk_indexes_bytes);
+
+    let commit_file_bytes =
+        rmp_serde::to_vec(&*new_commit.lock().unwrap()).unwrap_or_else(|_| Vec::new());
+
+    let compressed_commit_file_bytes = compress_bytes(&commit_file_bytes, compress);
+
+    let final_commit_file_bytes = match password {
+        Some(ref password) => encrypt_bytes(&compressed_commit_file_bytes, password.as_bytes())
+            .unwrap_or_else(|_| Vec::new()),
+        None => compressed_commit_file_bytes,
+    };
+
+    let commit_file_path = format!("{}/commits/{}", key, new_commit.lock().unwrap().hash);
+    let write_commit_file_future = fs.write_file(&commit_file_path, &final_commit_file_bytes);
+
+    let (write_chunk_index_result, write_commit_file_result) =
+        tokio::join!(write_chunk_index_future, write_commit_file_future);
+
+    if write_chunk_index_result.is_err() {
+        handle_error("Failed to write chunk indexes".to_string(), Some(&pb));
+    }
+
+    if write_commit_file_result.is_err() {
+        handle_error("Failed to write commit file".to_string(), Some(&pb));
+    }
 
     let elapsed = pb.elapsed();
     pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
     pb.set_prefix("✓");
     pb.finish_with_message(format!("Committed files ({:.2?})", elapsed));
+}
+
+fn get_file_permissions_with_path(metadata: &std::fs::Metadata, path: &str) -> u32 {
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o777
+    }
+
+    #[cfg(not(unix))]
+    {
+        let is_executable = Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| {
+                matches!(
+                    ext.to_lowercase().as_str(),
+                    "exe" | "bat" | "cmd" | "com" | "msi" | "ps1"
+                )
+            })
+            .unwrap_or(false);
+
+        if metadata.permissions().readonly() {
+            if is_executable { 0o555 } else { 0o444 }
+        } else {
+            if is_executable { 0o755 } else { 0o644 }
+        }
+    }
 }
 
 async fn load_metadata(
@@ -140,15 +346,7 @@ async fn load_metadata(
     root_path_string: String,
     compress: i32,
     password: Option<String>,
-) -> Result<
-    (
-        Commit,
-        Vec<String>,
-        HashMap<String, Vec<String>>,
-        HashMap<String, ChunkIndex>,
-    ),
-    String,
-> {
+) -> Result<(Commit, Vec<String>, HashMap<String, ChunkIndex>), String> {
     let new_commit_future = tokio::spawn(create_new_commit(
         Arc::clone(&fs),
         key.clone(),
@@ -160,21 +358,11 @@ async fn load_metadata(
 
     let root_files_future = tokio::spawn(async move { list_files(&root_path_string) });
 
-    let file_indexes_future = tokio::spawn(load_file_indexes(
-        Arc::clone(&fs),
-        key.clone(),
-        password.clone(),
-    ));
-
     let chunk_indexes_future =
         tokio::spawn(load_chunk_indexes(Arc::clone(&fs), key.clone(), password));
 
-    let (new_commit_result, root_files_result, file_indexes_result, chunk_indexes_result) = tokio::join!(
-        new_commit_future,
-        root_files_future,
-        file_indexes_future,
-        chunk_indexes_future
-    );
+    let (new_commit_result, root_files_result, chunk_indexes_result) =
+        tokio::join!(new_commit_future, root_files_future, chunk_indexes_future);
 
     let new_commit = new_commit_result
         .map_err(|e| format!("Failed to create new commit: {}", e))?
@@ -182,15 +370,11 @@ async fn load_metadata(
 
     let root_files = root_files_result.map_err(|e| format!("Failed to list root files: {}", e))?;
 
-    let file_indexes = file_indexes_result
-        .map_err(|e| format!("Failed to load file indexes: {}", e))?
-        .map_err(|e| format!("Failed to load file indexes: {}", e))?;
-
     let chunk_indexes = chunk_indexes_result
         .map_err(|e| format!("Failed to load chunk indexes: {}", e))?
         .map_err(|e| format!("Failed to load chunk indexes: {}", e))?;
 
-    Ok((new_commit, root_files, file_indexes, chunk_indexes))
+    Ok((new_commit, root_files, chunk_indexes))
 }
 
 async fn load_chunk_indexes(
@@ -234,47 +418,6 @@ async fn load_chunk_indexes(
     Ok(chunk_indexes)
 }
 
-async fn load_file_indexes(
-    fs: Arc<dyn FS>,
-    key: String,
-    password: Option<String>,
-) -> Result<HashMap<String, Vec<String>>, String> {
-    let file_index_bytes = fs
-        .read_file(format!("{}/indexes/files", key).as_str())
-        .await
-        .unwrap_or_else(|_| Vec::new());
-
-    let file_indexes: HashMap<String, Vec<String>> = if file_index_bytes.is_empty() {
-        HashMap::new()
-    } else {
-        let is_encrypted = is_encrypted(&file_index_bytes);
-
-        let decrypted_file_index_bytes = match password {
-            Some(password) => {
-                if is_encrypted {
-                    decrypt_bytes(&file_index_bytes, password.as_bytes())?
-                } else {
-                    file_index_bytes
-                }
-            }
-            None => {
-                if is_encrypted {
-                    return Err("File indexes are encrypted but no password provided".to_string());
-                } else {
-                    file_index_bytes
-                }
-            }
-        };
-
-        let decompressed_file_index_bytes = decompress_bytes(&decrypted_file_index_bytes);
-
-        rmp_serde::from_slice(&decompressed_file_index_bytes)
-            .map_err(|e| format!("Failed to deserialize file indexes: {}", e))?
-    };
-
-    Ok(file_indexes)
-}
-
 async fn create_new_commit(
     fs: Arc<dyn FS>,
     key: String,
@@ -307,18 +450,6 @@ async fn create_new_commit(
         hash: format!("{:x}", commit_hash),
     };
 
-    let commit_bytes =
-        rmp_serde::to_vec(&commit).map_err(|e| format!("Failed to serialize commit: {}", e))?;
-    let compressed_commit_bytes = compress_bytes(&commit_bytes, compress);
-
-    let final_commit_bytes = match &password {
-        Some(password) => encrypt_bytes(&compressed_commit_bytes, password.as_bytes())?,
-        None => compressed_commit_bytes,
-    };
-
-    let commit_path = format!("{}/commits/{}", key, commit.hash);
-    let write_commit_future = fs.write_file(&commit_path, &final_commit_bytes);
-
     let new_commit_summary = CommitSummary {
         message: commit.message.clone(),
         hash: commit.hash.clone(),
@@ -338,14 +469,9 @@ async fn create_new_commit(
     };
 
     let index_path = format!("{}/indexes/commits", key);
-    let write_index_future = fs.write_file(&index_path, &final_commit_sumaries_bytes);
-
-    let (write_commit_result, write_index_result) =
-        tokio::join!(write_commit_future, write_index_future);
-
-    if write_commit_result.is_err() || write_index_result.is_err() {
-        return Err("Failed to write commit or index".to_string());
-    }
+    fs.write_file(&index_path, &final_commit_sumaries_bytes)
+        .await
+        .map_err(|e| format!("Failed to write commit index: {}", e))?;
 
     Ok(commit)
 }
@@ -396,8 +522,14 @@ async fn list_commit_summaries(
 
 fn get_params(
     matches: &ArgMatches,
-) -> Result<(String, String, String, String, i32, Option<String>), String> {
+) -> Result<(String, String, String, String, i32, Option<String>, u64), String> {
+    let password: Option<String> = matches
+        .get_one::<String>("password")
+        .map(|s| s.to_string())
+        .map_or_else(|| get_password(), |password| Some(password.to_string()));
+
     let pwd_string = get_pwd_string();
+
     let root_path_string = matches.get_one::<String>("root-path").map_or_else(
         || pwd_string.clone(),
         |root_path| {
@@ -457,11 +589,14 @@ fn get_params(
         }
     };
 
-    let password = matches.get_one::<String>("password").map(|s| s.to_string());
-
     let compress: i32 = matches
         .get_one::<String>("compress")
         .map_or_else(|| 3, |compress| compress.parse().unwrap());
+
+    let chunk_size: u64 = matches.get_one::<String>("chunk-size").map_or_else(
+        || parse_size("5 MB").unwrap(),
+        |chunk_size| parse_size(chunk_size).unwrap(),
+    );
 
     let exists = storages_names
         .iter()
@@ -471,5 +606,39 @@ fn get_params(
         return Err(format!("Storage '{}' not found", storage));
     }
 
-    Ok((key, message, root_path_string, storage, compress, password))
+    Ok((
+        key,
+        message,
+        root_path_string,
+        storage,
+        compress,
+        password,
+        chunk_size,
+    ))
+}
+
+fn get_password() -> Option<String> {
+    let password = Password::new()
+        .allow_empty_password(true)
+        .with_prompt("Enter your repository password (leave empty to skip encryption)")
+        .interact()
+        .unwrap();
+
+    let password = if !password.is_empty() {
+        let confirm = Password::new()
+            .with_prompt("Repeat password")
+            .allow_empty_password(false)
+            .interact()
+            .unwrap();
+
+        if password != confirm {
+            handle_error("Error: the passwords don't match.".to_string(), None);
+        }
+
+        Some(password)
+    } else {
+        None
+    };
+
+    password
 }
