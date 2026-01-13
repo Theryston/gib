@@ -311,7 +311,7 @@ pub async fn backup(matches: &ArgMatches) {
     pb.finish_with_message(format!("Backed up files ({:.2?})", elapsed));
 }
 
-fn get_file_permissions_with_path(metadata: &std::fs::Metadata, path: &str) -> u32 {
+fn get_file_permissions_with_path(metadata: &std::fs::Metadata, _path: &str) -> u32 {
     #[cfg(unix)]
     {
         metadata.permissions().mode() & 0o777
@@ -319,7 +319,7 @@ fn get_file_permissions_with_path(metadata: &std::fs::Metadata, path: &str) -> u
 
     #[cfg(not(unix))]
     {
-        let is_executable = Path::new(path)
+        let is_executable = Path::new(_path)
             .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| {
