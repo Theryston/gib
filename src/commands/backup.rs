@@ -5,6 +5,7 @@ use crate::utils::{
     handle_error, is_encrypted, list_files,
 };
 use clap::ArgMatches;
+use console::style;
 use dialoguer::{Input, Password, Select};
 use dirs::home_dir;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -100,6 +101,8 @@ pub async fn backup(matches: &ArgMatches) {
 
     pb.set_message("Generating new backup...");
 
+    let prev_not_encrypted_but_now_yes = Arc::new(Mutex::new(false));
+
     let (new_commit, root_files, chunk_indexes) = match load_metadata(
         Arc::clone(&fs),
         key.clone(),
@@ -108,6 +111,7 @@ pub async fn backup(matches: &ArgMatches) {
         root_path_string.clone(),
         compress,
         password.clone(),
+        Arc::clone(&prev_not_encrypted_but_now_yes),
     )
     .await
     {
@@ -116,6 +120,10 @@ pub async fn backup(matches: &ArgMatches) {
     };
 
     pb.finish_and_clear();
+
+    if *prev_not_encrypted_but_now_yes.lock().unwrap() {
+        println!("{}", style("The backup was not encrypted but you provided a password! Only new chunks will be encrypted, for old chunks run 'gib encrypt'").yellow());
+    }
 
     let pb = ProgressBar::new(root_files.len() as u64);
     pb.enable_steady_tick(Duration::from_millis(100));
@@ -353,6 +361,7 @@ async fn load_metadata(
     root_path_string: String,
     compress: i32,
     password: Option<String>,
+    prev_not_encrypted_but_now_yes: Arc<Mutex<bool>>,
 ) -> Result<(Commit, Vec<String>, HashMap<String, ChunkIndex>), String> {
     let new_commit_future = tokio::spawn(create_new_commit(
         Arc::clone(&fs),
@@ -365,8 +374,12 @@ async fn load_metadata(
 
     let root_files_future = tokio::spawn(async move { list_files(&root_path_string) });
 
-    let chunk_indexes_future =
-        tokio::spawn(load_chunk_indexes(Arc::clone(&fs), key.clone(), password));
+    let chunk_indexes_future = tokio::spawn(load_chunk_indexes(
+        Arc::clone(&fs),
+        key.clone(),
+        password,
+        prev_not_encrypted_but_now_yes,
+    ));
 
     let (new_commit_result, root_files_result, chunk_indexes_result) =
         tokio::join!(new_commit_future, root_files_future, chunk_indexes_future);
@@ -388,6 +401,7 @@ async fn load_chunk_indexes(
     fs: Arc<dyn FS>,
     key: String,
     password: Option<String>,
+    prev_not_encrypted_but_now_yes: Arc<Mutex<bool>>,
 ) -> Result<HashMap<String, ChunkIndex>, String> {
     let chunk_index_bytes = fs
         .read_file(format!("{}/indexes/chunks", key).as_str())
@@ -404,6 +418,9 @@ async fn load_chunk_indexes(
                 if is_encrypted {
                     decrypt_bytes(&chunk_index_bytes, password.as_bytes())?
                 } else {
+                    let mut prev_not_encrypted_guard =
+                        prev_not_encrypted_but_now_yes.lock().unwrap();
+                    *prev_not_encrypted_guard = true;
                     chunk_index_bytes
                 }
             }
