@@ -44,19 +44,10 @@ struct ChunkIndex {
     refcount: u32,
 }
 
-struct ProgressGuard(ProgressBar);
-
-impl Drop for ProgressGuard {
-    fn drop(&mut self) {
-        self.0.finish_and_clear();
-    }
-}
-
 pub async fn commit(matches: &ArgMatches) {
     let (key, message, root_path_string, storage, compress, password) = get_params(matches);
 
     let pb = ProgressBar::new(100);
-    let _guard = ProgressGuard(pb.clone());
 
     pb.enable_steady_tick(Duration::from_millis(100));
     pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
