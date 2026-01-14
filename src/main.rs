@@ -9,7 +9,7 @@ mod utils;
 
 fn cli() -> Command {
     Command::new("gib")
-        .about("Fast and versionable backup tool")
+        .about("A blazingly fast, modern backup tool with versioning, deduplication, and encryption.")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .allow_external_subcommands(true)
