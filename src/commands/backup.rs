@@ -1,7 +1,7 @@
 use crate::commands::config::Config;
 use crate::core::crypto::get_password;
 use crate::core::crypto::write_file_maybe_encrypt;
-use crate::core::indexes::{create_new_backup, load_chunk_indexes};
+use crate::core::indexes::{add_backup_summary, create_new_backup, load_chunk_indexes};
 use crate::core::metadata::{Backup, BackupObject, ChunkIndex};
 use crate::core::permissions::get_file_permissions_with_path;
 use crate::fs::FS;
@@ -70,7 +70,6 @@ pub async fn backup(matches: &ArgMatches) {
         message,
         config,
         root_path_string.clone(),
-        compress,
         password.clone(),
         Arc::clone(&prev_not_encrypted_but_now_yes),
     )
@@ -313,6 +312,21 @@ pub async fn backup(matches: &ArgMatches) {
         handle_error("Failed to write backup file".to_string(), Some(&pb));
     }
 
+    {
+        let backup_guard = new_backup.lock().unwrap();
+        if let Err(e) = add_backup_summary(
+            Arc::clone(&fs),
+            key.clone(),
+            &backup_guard,
+            compress,
+            password.clone(),
+        )
+        .await
+        {
+            handle_error(format!("Failed to save backup summary: {}", e), Some(&pb));
+        }
+    }
+
     let written_bytes = *written_bytes.lock().unwrap();
     let deduplicated_bytes = *deduplicated_bytes.lock().unwrap();
 
@@ -333,18 +347,10 @@ async fn load_metadata(
     message: String,
     config: Config,
     root_path_string: String,
-    compress: i32,
     password: Option<String>,
     prev_not_encrypted_but_now_yes: Arc<Mutex<bool>>,
 ) -> Result<(Backup, Vec<String>, HashMap<String, ChunkIndex>), String> {
-    let new_backup_future = tokio::spawn(create_new_backup(
-        Arc::clone(&fs),
-        key.clone(),
-        message.clone(),
-        config.author.clone(),
-        compress.clone(),
-        password.clone(),
-    ));
+    let new_backup = create_new_backup(message, config.author);
 
     let root_files_future = tokio::spawn(async move { list_files(&root_path_string) });
 
@@ -355,12 +361,8 @@ async fn load_metadata(
         prev_not_encrypted_but_now_yes,
     ));
 
-    let (new_backup_result, root_files_result, chunk_indexes_result) =
-        tokio::join!(new_backup_future, root_files_future, chunk_indexes_future);
-
-    let new_backup = new_backup_result
-        .map_err(|e| format!("Failed to create new backup: {}", e))?
-        .map_err(|e| format!("Failed to create new backup: {}", e))?;
+    let (root_files_result, chunk_indexes_result) =
+        tokio::join!(root_files_future, chunk_indexes_future);
 
     let root_files = root_files_result.map_err(|e| format!("Failed to list root files: {}", e))?;
 

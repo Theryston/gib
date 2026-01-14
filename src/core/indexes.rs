@@ -63,14 +63,7 @@ pub(crate) async fn list_backup_summaries(
     Ok(backup_summaries)
 }
 
-pub(crate) async fn create_new_backup(
-    fs: Arc<dyn FS>,
-    key: String,
-    message: String,
-    author: String,
-    compress: i32,
-    password: Option<String>,
-) -> Result<Backup, String> {
+pub(crate) fn create_new_backup(message: String, author: String) -> Backup {
     let backup_hash = Sha256::digest(
         format!(
             "{}:{}:{}",
@@ -84,7 +77,7 @@ pub(crate) async fn create_new_backup(
         .as_bytes(),
     );
 
-    let backup = Backup {
+    Backup {
         message: message.to_string(),
         author: author.to_string(),
         timestamp: std::time::SystemTime::now()
@@ -93,8 +86,16 @@ pub(crate) async fn create_new_backup(
             .as_secs(),
         tree: std::collections::HashMap::new(),
         hash: format!("{:x}", backup_hash),
-    };
+    }
+}
 
+pub(crate) async fn add_backup_summary(
+    fs: Arc<dyn FS>,
+    key: String,
+    backup: &Backup,
+    compress: i32,
+    password: Option<String>,
+) -> Result<(), String> {
     let new_backup_summary = BackupSummary {
         message: backup.message.clone(),
         hash: backup.hash.clone(),
@@ -119,5 +120,5 @@ pub(crate) async fn create_new_backup(
     .await
     .map_err(|e| format!("Failed to write backup index: {}", e))?;
 
-    Ok(backup)
+    Ok(())
 }
