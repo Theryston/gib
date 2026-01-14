@@ -63,6 +63,14 @@ fn cli() -> Command {
                         .help("The root path to backup")
                         .required(false),
                 )
+                .subcommand(
+                    Command::new("delete")
+                        .about("Delete a backup and its orphaned chunks")
+                        .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
+                        .arg(arg!(-b --backup <BACKUP> "The backup hash to delete (full hash or first 8 chars)").required(false))
+                        .arg(arg!(-s --storage <STORAGE> "The storage to use").required(false))
+                        .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))
+                )
         )
         .subcommand(
             Command::new("restore")
@@ -141,7 +149,16 @@ async fn main() {
         Some(("whoami", _)) => commands::whoami(),
         Some(("encrypt", matches)) => commands::encrypt(matches).await,
         Some(("log", matches)) => commands::log(matches).await,
-        Some(("backup", matches)) => commands::backup(matches).await,
+        Some(("backup", matches)) => match matches.subcommand() {
+            Some(("delete", matches)) => commands::delete(matches).await,
+            None => commands::backup(matches).await,
+            _ => {
+                handle_error(
+                    "Invalid subcommand! Run 'gib backup --help' for more information.".to_string(),
+                    None,
+                );
+            }
+        },
         Some(("restore", matches)) => commands::restore(matches).await,
         Some(("storage", matches)) => match matches.subcommand() {
             Some(("add", matches)) => {
