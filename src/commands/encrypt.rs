@@ -226,7 +226,10 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
     let password: Option<String> = matches
         .get_one::<String>("password")
         .map(|s| s.to_string())
-        .map_or_else(|| get_password(true), |password| Some(password.to_string()));
+        .map_or_else(
+            || get_password(true, false),
+            |password| Some(password.to_string()),
+        );
 
     let key = matches.get_one::<String>("key").map_or_else(
         || {

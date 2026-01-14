@@ -33,8 +33,15 @@ fn cli() -> Command {
                 .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
         )
         .subcommand(
+            Command::new("log")
+                .about("List all backups for a repository")
+                .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
+                .arg(arg!(-s --storage <STORAGE> "The storage to use").required(false))
+                .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))
+        )
+        .subcommand(
             Command::new("backup")
-                .about("Create a backup of a directory and store it in a storage (similar to git commit)")
+                .about("Create a backup of a directory and store it in a storage")
                 .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
                 .arg(arg!(-m --message <MESSAGE> "The backup message").required(false))
                 .arg(arg!(-s --storage <STORAGE> "The storage to use for the backup").required(false))
@@ -110,6 +117,7 @@ async fn main() {
         Some(("config", matches)) => commands::config(matches),
         Some(("whoami", _)) => commands::whoami(),
         Some(("encrypt", matches)) => commands::encrypt(matches).await,
+        Some(("log", matches)) => commands::log(matches).await,
         Some(("backup", matches)) => commands::backup(matches).await,
         Some(("storage", matches)) => match matches.subcommand() {
             Some(("add", matches)) => {

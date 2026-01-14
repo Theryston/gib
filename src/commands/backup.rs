@@ -356,7 +356,7 @@ fn get_params(
         .get_one::<String>("password")
         .map(|s| s.to_string())
         .map_or_else(
-            || get_password(false),
+            || get_password(false, false),
             |password| Some(password.to_string()),
         );
 

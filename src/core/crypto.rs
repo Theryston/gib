@@ -67,7 +67,7 @@ pub(crate) async fn write_file_maybe_encrypt(
     Ok(())
 }
 
-pub(crate) fn get_password(is_required: bool) -> Option<String> {
+pub(crate) fn get_password(is_required: bool, is_readonly: bool) -> Option<String> {
     let password = Password::new()
         .allow_empty_password(!is_required)
         .with_prompt("Enter your repository password (leave empty to skip encryption)")
@@ -75,6 +75,10 @@ pub(crate) fn get_password(is_required: bool) -> Option<String> {
         .unwrap();
 
     let password = if !password.is_empty() {
+        if is_readonly {
+            return Some(password);
+        }
+
         let confirm = Password::new()
             .with_prompt("Repeat password")
             .allow_empty_password(false)
