@@ -65,6 +65,22 @@ fn cli() -> Command {
                 )
         )
         .subcommand(
+            Command::new("restore")
+                .about("Restore files from a backup commit")
+                .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
+                .arg(arg!(-c --commit <COMMIT> "The commit hash to restore (full hash or first 8 chars)").required(false))
+                .arg(arg!(-s --storage <STORAGE> "The storage to use").required(false))
+                .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))
+                .arg(
+                    Arg::new("target-path")
+                        .short('t')
+                        .long("target-path")
+                        .value_name("TARGET_PATH")
+                        .help("The target directory to restore files to (default: current directory)")
+                        .required(false),
+                )
+        )
+        .subcommand(
             Command::new("storage")
                 .about("Manage your storage")
                 .subcommand(
@@ -119,6 +135,7 @@ async fn main() {
         Some(("encrypt", matches)) => commands::encrypt(matches).await,
         Some(("log", matches)) => commands::log(matches).await,
         Some(("backup", matches)) => commands::backup(matches).await,
+        Some(("restore", matches)) => commands::restore(matches).await,
         Some(("storage", matches)) => match matches.subcommand() {
             Some(("add", matches)) => {
                 commands::storage::add(matches);

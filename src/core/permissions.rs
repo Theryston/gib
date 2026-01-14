@@ -28,3 +28,20 @@ pub(crate) fn get_file_permissions_with_path(metadata: &std::fs::Metadata, _path
         }
     }
 }
+
+pub(crate) fn set_file_permissions(path: &Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let readonly = (mode & 0o222) == 0;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_readonly(readonly);
+        std::fs::set_permissions(path, perms)?;
+    }
+
+    Ok(())
+}
