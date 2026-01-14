@@ -4,11 +4,14 @@ use crate::core::crypto::write_file_maybe_encrypt;
 use crate::core::indexes::{list_backup_summaries, load_chunk_indexes};
 use crate::core::metadata::Backup;
 use crate::fs::FS;
-use crate::utils::{compress_bytes, decompress_bytes, get_fs, get_storage, handle_error};
+use crate::utils::{
+    compress_bytes, decompress_bytes, get_fs, get_pwd_string, get_storage, handle_error,
+};
 use clap::ArgMatches;
-use dialoguer::{Input, Select};
+use dialoguer::Select;
 use dirs::home_dir;
 use indicatif::{ProgressBar, ProgressStyle};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -337,19 +340,17 @@ fn get_params(
             |password| Some(password.to_string()),
         );
 
-    let key = matches.get_one::<String>("key").map_or_else(
-        || {
-            let typed_key: String = Input::<String>::new()
-                .with_prompt("Enter the key of the repository")
-                .interact_text()
-                .unwrap_or_else(|e| {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                });
-            typed_key
-        },
-        |key| key.to_string(),
-    );
+    let pwd_string = get_pwd_string();
+
+    let default_key = Path::new(&pwd_string)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let key = matches
+        .get_one::<String>("key")
+        .map_or_else(|| default_key, |key| key.to_string());
 
     let home_dir = home_dir().unwrap();
     let storage_path = home_dir.join(".gib").join("storages");

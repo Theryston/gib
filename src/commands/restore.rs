@@ -6,7 +6,7 @@ use crate::core::permissions::set_file_permissions;
 use crate::fs::FS;
 use crate::utils::{decompress_bytes, get_fs, get_pwd_string, get_storage, handle_error};
 use clap::ArgMatches;
-use dialoguer::{Input, Select};
+use dialoguer::Select;
 use dirs::home_dir;
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
@@ -398,20 +398,15 @@ fn get_params(
         },
     );
 
-    let key = matches.get_one::<String>("key").map_or_else(
-        || {
-            let typed_key: String = Input::<String>::new()
-                .with_prompt("Enter the key of the repository")
-                .interact_text()
-                .unwrap_or_else(|e| {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                });
+    let default_key = Path::new(&pwd_string)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
 
-            typed_key
-        },
-        |key| key.to_string(),
-    );
+    let key = matches
+        .get_one::<String>("key")
+        .map_or_else(|| default_key, |key| key.to_string());
 
     let home_dir = home_dir().unwrap();
     let storage_path = home_dir.join(".gib").join("storages");
