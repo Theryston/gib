@@ -157,8 +157,9 @@ pub fn add(matches: &ArgMatches) {
         let endpoint = matches.get_one::<String>("endpoint").map_or_else(
             || {
                 let typed_endpoint: String = Input::<String>::new()
-                    .with_prompt("Enter the S3 endpoint (leave empty for default)")
-                    .allow_empty(true)
+                    .with_prompt("Enter the S3 endpoint")
+                    .default(format!("https://s3.{}.amazonaws.com", region))
+                    .show_default(true)
                     .interact_text()
                     .unwrap_or_else(|e| {
                         eprintln!("Error: {}", e);
