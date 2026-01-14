@@ -6,6 +6,7 @@ use crate::core::metadata::{ChunkIndex, Commit, CommitObject};
 use crate::core::permissions::get_file_permissions_with_path;
 use crate::fs::FS;
 use crate::utils::{compress_bytes, get_fs, get_pwd_string, get_storage, handle_error, list_files};
+use bytesize::ByteSize;
 use clap::ArgMatches;
 use console::style;
 use dialoguer::{Input, Select};
@@ -104,6 +105,8 @@ pub async fn backup(matches: &ArgMatches) {
     let new_commit: Arc<Mutex<Commit>> = Arc::new(Mutex::new(new_commit));
 
     let mut files_set: JoinSet<Result<(), String>> = JoinSet::new();
+    let written_bytes = Arc::new(Mutex::new(0));
+    let deduplicated_bytes = Arc::new(Mutex::new(0));
 
     for file_path in root_files {
         let pb_clone = pb.clone();
@@ -113,6 +116,8 @@ pub async fn backup(matches: &ArgMatches) {
         let fs_clone = Arc::clone(&fs);
         let new_commit_clone = Arc::clone(&new_commit);
         let root_path_string_clone = root_path_string.clone();
+        let written_bytes_clone = Arc::clone(&written_bytes);
+        let deduplicated_bytes_clone = Arc::clone(&deduplicated_bytes);
 
         files_set.spawn(async move {
             let mut file = std::fs::File::open(file_path.clone())
@@ -154,6 +159,10 @@ pub async fn backup(matches: &ArgMatches) {
                 };
 
                 if is_in_chunk_indexes {
+                    {
+                        let mut deduplicated_bytes_guard = deduplicated_bytes_clone.lock().unwrap();
+                        *deduplicated_bytes_guard += chunk_bytes.len() as u64;
+                    }
                     continue;
                 }
 
@@ -173,6 +182,11 @@ pub async fn backup(matches: &ArgMatches) {
                 )
                 .await
                 .map_err(|e| format!("Failed to write chunk: {}", e))?;
+
+                {
+                    let mut written_bytes_guard = written_bytes_clone.lock().unwrap();
+                    *written_bytes_guard += chunk_bytes.len() as u64;
+                }
             }
 
             let file_hash = format!("{:x}", file_hasher.finalize());
@@ -277,10 +291,18 @@ pub async fn backup(matches: &ArgMatches) {
         handle_error("Failed to write backup file".to_string(), Some(&pb));
     }
 
+    let written_bytes = *written_bytes.lock().unwrap();
+    let deduplicated_bytes = *deduplicated_bytes.lock().unwrap();
+
     let elapsed = pb.elapsed();
     pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
     pb.set_prefix("✓");
-    pb.finish_with_message(format!("Backed up files ({:.2?})", elapsed));
+    pb.finish_with_message(format!(
+        "Backed up files ({:.2?}) - {} written, {} deduplicated",
+        elapsed,
+        ByteSize(written_bytes),
+        ByteSize(deduplicated_bytes),
+    ));
 }
 
 async fn load_metadata(

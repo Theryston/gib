@@ -12,6 +12,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 pub async fn encrypt(matches: &ArgMatches) {
@@ -93,8 +94,10 @@ pub async fn encrypt(matches: &ArgMatches) {
     let encrypted_amount = Arc::new(Mutex::new(0));
     let already_encrypted_amount = Arc::new(Mutex::new(0));
     let mut files_set: JoinSet<Result<(), String>> = JoinSet::new();
+    let semaphore = Arc::new(Semaphore::new(100));
 
     for file_path in files_to_encrypt {
+        let semaphore_clone = Arc::clone(&semaphore);
         let pb_clone = pb.clone();
         let password_clone = password.clone();
         let fs_clone = Arc::clone(&fs);
@@ -103,6 +106,11 @@ pub async fn encrypt(matches: &ArgMatches) {
         let encrypted_amount_clone = Arc::clone(&encrypted_amount);
 
         files_set.spawn(async move {
+            let _permit = semaphore_clone
+                .acquire()
+                .await
+                .map_err(|e| format!("Semaphore error: {}", e))?;
+
             let read_result = read_file_maybe_decrypt(
                 &fs_clone,
                 &file_path_clone,

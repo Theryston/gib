@@ -62,7 +62,7 @@ pub(crate) async fn write_file_maybe_encrypt(
 
     fs.write_file(path, &final_bytes)
         .await
-        .map_err(|e| format!("Failed to write file: {}", e))?;
+        .map_err(|e| format!("Failed to write file {}: {}", path, e))?;
 
     Ok(())
 }
