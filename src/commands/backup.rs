@@ -4,8 +4,8 @@ use crate::core::crypto::write_file_maybe_encrypt;
 use crate::core::indexes::{create_new_commit, load_chunk_indexes};
 use crate::core::metadata::{ChunkIndex, Commit, CommitObject};
 use crate::core::permissions::get_file_permissions_with_path;
-use crate::fs::{FS, LocalFS, S3FS, S3FSConfig};
-use crate::utils::{compress_bytes, get_pwd_string, get_storage, handle_error, list_files};
+use crate::fs::FS;
+use crate::utils::{compress_bytes, get_fs, get_pwd_string, get_storage, handle_error, list_files};
 use clap::ArgMatches;
 use console::style;
 use dialoguer::{Input, Select};
@@ -57,17 +57,7 @@ pub async fn backup(matches: &ArgMatches) {
 
     let storage = get_storage(&storage);
 
-    let fs: Arc<dyn FS> = match storage.storage_type {
-        0 => Arc::new(LocalFS::new(storage.path.unwrap())),
-        1 => Arc::new(S3FS::new(S3FSConfig {
-            region: storage.region,
-            bucket: storage.bucket,
-            access_key: storage.access_key,
-            secret_key: storage.secret_key,
-            endpoint: storage.endpoint,
-        })),
-        _ => handle_error("Invalid storage type".to_string(), Some(&pb)),
-    };
+    let fs = get_fs(&storage, Some(&pb));
 
     pb.set_message("Generating new backup...");
 
@@ -343,7 +333,10 @@ fn get_params(
     let password: Option<String> = matches
         .get_one::<String>("password")
         .map(|s| s.to_string())
-        .map_or_else(|| get_password(), |password| Some(password.to_string()));
+        .map_or_else(
+            || get_password(false),
+            |password| Some(password.to_string()),
+        );
 
     let pwd_string = get_pwd_string();
 

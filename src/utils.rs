@@ -1,4 +1,5 @@
 use crate::commands::storage::add::Storage;
+use crate::fs::{FS, LocalFS, S3FS, S3FSConfig};
 use argon2::Argon2;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
@@ -8,6 +9,7 @@ use console::style;
 use dirs::home_dir;
 use indicatif::ProgressBar;
 use rand_core::{OsRng, TryRngCore};
+use std::sync::Arc;
 use walkdir;
 
 const MAGIC: &[u8; 4] = b"GIB1";
@@ -122,4 +124,20 @@ pub fn handle_error(error: String, pb: Option<&ProgressBar>) -> ! {
     }
     eprintln!("{}", style(error).red());
     std::process::exit(1);
+}
+
+pub fn get_fs(storage: &Storage, pb: Option<&ProgressBar>) -> Arc<dyn FS> {
+    let fs: Arc<dyn FS> = match storage.storage_type {
+        0 => Arc::new(LocalFS::new(storage.path.as_ref().unwrap().clone())),
+        1 => Arc::new(S3FS::new(S3FSConfig {
+            region: storage.region.clone(),
+            bucket: storage.bucket.clone(),
+            access_key: storage.access_key.clone(),
+            secret_key: storage.secret_key.clone(),
+            endpoint: storage.endpoint.clone(),
+        })),
+        _ => handle_error("Invalid storage type".to_string(), pb),
+    };
+
+    fs
 }

@@ -39,12 +39,12 @@ pub(crate) async fn load_chunk_indexes(
 }
 
 pub(crate) async fn list_commit_summaries(
-    fs: &Arc<dyn FS>,
-    key: &String,
+    fs: Arc<dyn FS>,
+    key: String,
     password: Option<String>,
 ) -> Result<Vec<CommitSummary>, String> {
     let read_result = read_file_maybe_decrypt(
-        fs,
+        &fs,
         format!("{}/indexes/commits", key).as_str(),
         password.as_deref(),
         "Backup summaries are encrypted but no password provided",
@@ -100,7 +100,8 @@ pub(crate) async fn create_new_commit(
         hash: commit.hash.clone(),
     };
 
-    let mut commit_sumaries = list_commit_summaries(&fs, &key, password.clone()).await?;
+    let mut commit_sumaries =
+        list_commit_summaries(Arc::clone(&fs), key.clone(), password.clone()).await?;
 
     commit_sumaries.insert(0, new_commit_summary);
 

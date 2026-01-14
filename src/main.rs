@@ -26,9 +26,16 @@ fn cli() -> Command {
                 .about("Show your identity")
         )
         .subcommand(
+            Command::new("encrypt")
+                .about("Encrypt all chunks of your repository")
+                .arg(arg!(-p --password <PASSWORD> "The password to use for the encryption").required(false))
+                .arg(arg!(-s --storage <STORAGE> "The storage to use for the encryption").required(false))
+                .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
+        )
+        .subcommand(
             Command::new("backup")
                 .about("Create a backup of a directory and store it in a storage (similar to git commit)")
-                .arg(arg!(-k --key <KEY> "The key to use for the backup").required(false))
+                .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
                 .arg(arg!(-m --message <MESSAGE> "The backup message").required(false))
                 .arg(arg!(-s --storage <STORAGE> "The storage to use for the backup").required(false))
                 .arg(arg!(-p --password <PASSWORD> "The password to use for the backup").required(false))
@@ -102,6 +109,7 @@ async fn main() {
     match matches.subcommand() {
         Some(("config", matches)) => commands::config(matches),
         Some(("whoami", _)) => commands::whoami(),
+        Some(("encrypt", matches)) => commands::encrypt(matches).await,
         Some(("backup", matches)) => commands::backup(matches).await,
         Some(("storage", matches)) => match matches.subcommand() {
             Some(("add", matches)) => {
