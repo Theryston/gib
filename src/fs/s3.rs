@@ -77,4 +77,58 @@ impl FS for S3FS {
 
         Ok(())
     }
+
+    async fn list_files(&self, path: &str) -> Result<Vec<String>, std::io::Error> {
+        let mut files = Vec::new();
+        let mut continuation_token = None;
+        let prefix = if path.is_empty() {
+            "".to_string()
+        } else if path.ends_with('/') {
+            path.to_string()
+        } else {
+            format!("{}/", path)
+        };
+
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&prefix);
+
+            if let Some(ref token) = continuation_token {
+                req = req.continuation_token(token);
+            }
+
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+            for obj in resp.contents() {
+                if let Some(key) = obj.key() {
+                    files.push(key.to_string());
+                }
+            }
+
+            continuation_token = resp.next_continuation_token().map(|ct| ct.to_string());
+
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+
+        Ok(files)
+    }
+
+    async fn delete_file(&self, path: &str) -> Result<(), std::io::Error> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(path)
+            .send()
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
 }

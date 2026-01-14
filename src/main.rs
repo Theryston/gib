@@ -122,6 +122,13 @@ fn cli() -> Command {
                         .about("Remove a storage")
                         .arg(arg!(-n --name <NAME> "The name of the storage").required(false))
                 )
+                .subcommand(
+                    Command::new("prune")
+                        .about("Prune not used chunks")
+                        .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
+                        .arg(arg!(-s --storage <STORAGE> "The storage to use").required(false))
+                        .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))
+                )
         )
 }
 
@@ -146,6 +153,7 @@ async fn main() {
             Some(("remove", matches)) => {
                 commands::storage::remove(matches);
             }
+            Some(("prune", matches)) => commands::storage::prune(matches).await,
             _ => {
                 handle_error(
                     "Invalid subcommand! Run 'gib --help' for more information.".to_string(),
