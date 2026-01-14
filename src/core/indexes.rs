@@ -1,6 +1,7 @@
+use crate::core::crypto::{read_file_maybe_decrypt, write_file_maybe_encrypt};
 use crate::core::metadata::{ChunkIndex, Commit, CommitSummary};
 use crate::fs::FS;
-use crate::utils::{compress_bytes, decompress_bytes, decrypt_bytes, encrypt_bytes, is_encrypted};
+use crate::utils::{compress_bytes, decompress_bytes};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -11,37 +12,24 @@ pub(crate) async fn load_chunk_indexes(
     password: Option<String>,
     prev_not_encrypted_but_now_yes: Arc<Mutex<bool>>,
 ) -> Result<HashMap<String, ChunkIndex>, String> {
-    let chunk_index_bytes = fs
-        .read_file(format!("{}/indexes/chunks", key).as_str())
-        .await
-        .unwrap_or_else(|_| Vec::new());
+    let read_result = read_file_maybe_decrypt(
+        &fs,
+        format!("{}/indexes/chunks", key).as_str(),
+        password.as_deref(),
+        "Chunk indexes are encrypted but no password provided",
+    )
+    .await?;
 
-    let chunk_indexes: HashMap<String, ChunkIndex> = if chunk_index_bytes.is_empty() {
+    // Handle the case where password was provided but file was not encrypted
+    if password.is_some() && !read_result.was_encrypted && !read_result.bytes.is_empty() {
+        let mut prev_not_encrypted_guard = prev_not_encrypted_but_now_yes.lock().unwrap();
+        *prev_not_encrypted_guard = true;
+    }
+
+    let chunk_indexes: HashMap<String, ChunkIndex> = if read_result.bytes.is_empty() {
         HashMap::new()
     } else {
-        let is_encrypted = is_encrypted(&chunk_index_bytes);
-
-        let decrypted_chunk_index_bytes = match password {
-            Some(password) => {
-                if is_encrypted {
-                    decrypt_bytes(&chunk_index_bytes, password.as_bytes())?
-                } else {
-                    let mut prev_not_encrypted_guard =
-                        prev_not_encrypted_but_now_yes.lock().unwrap();
-                    *prev_not_encrypted_guard = true;
-                    chunk_index_bytes
-                }
-            }
-            None => {
-                if is_encrypted {
-                    return Err("Chunk indexes are encrypted but no password provided".to_string());
-                } else {
-                    chunk_index_bytes
-                }
-            }
-        };
-
-        let decompressed_chunk_index_bytes = decompress_bytes(&decrypted_chunk_index_bytes);
+        let decompressed_chunk_index_bytes = decompress_bytes(&read_result.bytes);
 
         rmp_serde::from_slice(&decompressed_chunk_index_bytes)
             .map_err(|e| format!("Failed to deserialize chunk indexes: {}", e))?
@@ -55,37 +43,18 @@ pub(crate) async fn list_commit_summaries(
     key: &String,
     password: Option<String>,
 ) -> Result<Vec<CommitSummary>, String> {
-    let commit_summaries_bytes = fs
-        .read_file(format!("{}/indexes/commits", key).as_str())
-        .await
-        .unwrap_or_else(|_| Vec::new());
+    let read_result = read_file_maybe_decrypt(
+        fs,
+        format!("{}/indexes/commits", key).as_str(),
+        password.as_deref(),
+        "Backup summaries are encrypted but no password provided",
+    )
+    .await?;
 
-    let commit_summaries: Vec<CommitSummary> = if commit_summaries_bytes.is_empty() {
+    let commit_summaries: Vec<CommitSummary> = if read_result.bytes.is_empty() {
         Vec::new()
     } else {
-        let is_encrypted = is_encrypted(&commit_summaries_bytes);
-
-        let decrypted_commit_summaries_bytes = match password {
-            Some(password) => {
-                if is_encrypted {
-                    decrypt_bytes(&commit_summaries_bytes, password.as_bytes())?
-                } else {
-                    commit_summaries_bytes
-                }
-            }
-            None => {
-                if is_encrypted {
-                    return Err(
-                        "Backup summaries are encrypted but no password provided".to_string()
-                    );
-                } else {
-                    commit_summaries_bytes
-                }
-            }
-        };
-
-        let decompressed_commit_summaries_bytes =
-            decompress_bytes(&decrypted_commit_summaries_bytes);
+        let decompressed_commit_summaries_bytes = decompress_bytes(&read_result.bytes);
 
         rmp_serde::from_slice(&decompressed_commit_summaries_bytes)
             .map_err(|e| format!("Failed to deserialize backup summaries: {}", e))?
@@ -139,15 +108,15 @@ pub(crate) async fn create_new_commit(
         .map_err(|e| format!("Failed to serialize backup summaries: {}", e))?;
     let compressed_commit_sumaries_bytes = compress_bytes(&commit_sumaries_bytes, compress);
 
-    let final_commit_sumaries_bytes = match password {
-        Some(password) => encrypt_bytes(&compressed_commit_sumaries_bytes, password.as_bytes())?,
-        None => compressed_commit_sumaries_bytes,
-    };
-
     let index_path = format!("{}/indexes/commits", key);
-    fs.write_file(&index_path, &final_commit_sumaries_bytes)
-        .await
-        .map_err(|e| format!("Failed to write backup index: {}", e))?;
+    write_file_maybe_encrypt(
+        &fs,
+        &index_path,
+        &compressed_commit_sumaries_bytes,
+        password.as_deref(),
+    )
+    .await
+    .map_err(|e| format!("Failed to write backup index: {}", e))?;
 
     Ok(commit)
 }

@@ -1,5 +1,7 @@
 use clap::{Arg, Command, arg};
 
+use crate::utils::handle_error;
+
 mod commands;
 mod core;
 mod fs;
@@ -111,8 +113,18 @@ async fn main() {
             Some(("remove", matches)) => {
                 commands::storage::remove(matches);
             }
-            _ => unreachable!(),
+            _ => {
+                handle_error(
+                    "Invalid subcommand! Run 'gib --help' for more information.".to_string(),
+                    None,
+                );
+            }
         },
-        _ => unreachable!(),
+        _ => {
+            handle_error(
+                "Invalid command! Run 'gib --help' for more information.".to_string(),
+                None,
+            );
+        }
     }
 }

@@ -1,12 +1,11 @@
 use crate::commands::config::Config;
 use crate::core::crypto::get_password;
+use crate::core::crypto::write_file_maybe_encrypt;
 use crate::core::indexes::{create_new_commit, load_chunk_indexes};
 use crate::core::metadata::{ChunkIndex, Commit, CommitObject};
 use crate::core::permissions::get_file_permissions_with_path;
 use crate::fs::{FS, LocalFS, S3FS, S3FSConfig};
-use crate::utils::{
-    compress_bytes, encrypt_bytes, get_pwd_string, get_storage, handle_error, list_files,
-};
+use crate::utils::{compress_bytes, get_pwd_string, get_storage, handle_error, list_files};
 use clap::ArgMatches;
 use console::style;
 use dialoguer::{Input, Select};
@@ -170,23 +169,20 @@ pub async fn backup(matches: &ArgMatches) {
 
                 let compressed_chunk_bytes = compress_bytes(chunk_bytes, compress);
 
-                let final_chunk_bytes = match password_clone {
-                    Some(ref password_clone) => {
-                        encrypt_bytes(&compressed_chunk_bytes, password_clone.as_bytes())?
-                    }
-                    None => compressed_chunk_bytes,
-                };
-
                 let (chunk_hash_prefix, chunk_hash_rest) = chunk_hash.split_at(2);
                 let chunk_path = format!(
                     "{}/chunks/{}/{}",
                     key_clone, chunk_hash_prefix, chunk_hash_rest
                 );
 
-                fs_clone
-                    .write_file(&chunk_path, &final_chunk_bytes)
-                    .await
-                    .map_err(|e| format!("Failed to write chunk: {}", e))?;
+                write_file_maybe_encrypt(
+                    &fs_clone,
+                    &chunk_path,
+                    &compressed_chunk_bytes,
+                    password_clone.as_deref(),
+                )
+                .await
+                .map_err(|e| format!("Failed to write chunk: {}", e))?;
             }
 
             let file_hash = format!("{:x}", file_hasher.finalize());
@@ -257,28 +253,28 @@ pub async fn backup(matches: &ArgMatches) {
 
     let compressed_chunk_indexes_bytes = compress_bytes(&chunk_indexes_bytes, compress);
 
-    let final_chunk_indexes_bytes = match password {
-        Some(ref password) => encrypt_bytes(&compressed_chunk_indexes_bytes, password.as_bytes())
-            .unwrap_or_else(|_| Vec::new()),
-        None => compressed_chunk_indexes_bytes,
-    };
-
     let chunk_index_path = format!("{}/indexes/chunks", key);
-    let write_chunk_index_future = fs.write_file(&chunk_index_path, &final_chunk_indexes_bytes);
+
+    let write_chunk_index_future = write_file_maybe_encrypt(
+        &fs,
+        &chunk_index_path,
+        &compressed_chunk_indexes_bytes,
+        password.as_deref(),
+    );
 
     let commit_file_bytes =
         rmp_serde::to_vec(&*new_commit.lock().unwrap()).unwrap_or_else(|_| Vec::new());
 
     let compressed_commit_file_bytes = compress_bytes(&commit_file_bytes, compress);
 
-    let final_commit_file_bytes = match password {
-        Some(ref password) => encrypt_bytes(&compressed_commit_file_bytes, password.as_bytes())
-            .unwrap_or_else(|_| Vec::new()),
-        None => compressed_commit_file_bytes,
-    };
-
     let commit_file_path = format!("{}/commits/{}", key, new_commit.lock().unwrap().hash);
-    let write_commit_file_future = fs.write_file(&commit_file_path, &final_commit_file_bytes);
+
+    let write_commit_file_future = write_file_maybe_encrypt(
+        &fs,
+        &commit_file_path,
+        &compressed_commit_file_bytes,
+        password.as_deref(),
+    );
 
     let (write_chunk_index_result, write_commit_file_result) =
         tokio::join!(write_chunk_index_future, write_commit_file_future);
