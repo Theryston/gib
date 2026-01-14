@@ -174,14 +174,36 @@ pub async fn backup(matches: &ArgMatches) {
                     key_clone, chunk_hash_prefix, chunk_hash_rest
                 );
 
-                write_file_maybe_encrypt(
-                    &fs_clone,
-                    &chunk_path,
-                    &compressed_chunk_bytes,
-                    password_clone.as_deref(),
-                )
-                .await
-                .map_err(|e| format!("Failed to write chunk: {}", e))?;
+                let mut last_error = String::new();
+                let mut success = false;
+
+                for attempt in 1..=3 {
+                    match write_file_maybe_encrypt(
+                        &fs_clone,
+                        &chunk_path,
+                        &compressed_chunk_bytes,
+                        password_clone.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            success = true;
+                            break;
+                        }
+                        Err(e) => {
+                            last_error =
+                                format!("Failed to write chunk (attempt {}/3): {}", attempt, e);
+                            if attempt < 3 {
+                                tokio::time::sleep(Duration::from_millis(100 * attempt as u64))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+
+                if !success {
+                    return Err(last_error);
+                }
 
                 {
                     let mut written_bytes_guard = written_bytes_clone.lock().unwrap();
