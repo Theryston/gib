@@ -1,6 +1,6 @@
 use crate::core::crypto::{read_file_maybe_decrypt, write_file_maybe_encrypt};
-use crate::core::indexes::list_commit_summaries;
-use crate::core::metadata::{ChunkIndex, CommitSummary};
+use crate::core::indexes::list_backup_summaries;
+use crate::core::metadata::{BackupSummary, ChunkIndex};
 use crate::core::{crypto::get_password, indexes::load_chunk_indexes};
 use crate::fs::FS;
 use crate::utils::{get_fs, get_storage, handle_error};
@@ -38,7 +38,7 @@ pub async fn encrypt(matches: &ArgMatches) {
 
     let prev_not_encrypted_but_now_yes = Arc::new(Mutex::new(false));
 
-    let (chunk_indexes, commit_sumaries) = match load_metadata(
+    let (chunk_indexes, backup_summaries) = match load_metadata(
         Arc::clone(&fs),
         key.clone(),
         password.clone(),
@@ -53,7 +53,7 @@ pub async fn encrypt(matches: &ArgMatches) {
     let mut files_to_encrypt = Vec::new();
 
     files_to_encrypt.push(format!("{}/indexes/chunks", key));
-    files_to_encrypt.push(format!("{}/indexes/commits", key));
+    files_to_encrypt.push(format!("{}/indexes/backups", key));
 
     for (chunk_hash, _) in chunk_indexes.iter() {
         let (chunk_hash_prefix, chunk_hash_rest) = chunk_hash.split_at(2);
@@ -61,9 +61,9 @@ pub async fn encrypt(matches: &ArgMatches) {
         files_to_encrypt.push(chunk_path);
     }
 
-    for commit_summary in commit_sumaries.iter() {
-        let commit_file_path = format!("{}/commits/{}", key, commit_summary.hash);
-        files_to_encrypt.push(commit_file_path);
+    for backup_summary in backup_summaries.iter() {
+        let backup_file_path = format!("{}/backups/{}", key, backup_summary.hash);
+        files_to_encrypt.push(backup_file_path);
     }
 
     pb.finish_and_clear();
@@ -194,7 +194,7 @@ async fn load_metadata(
     key: String,
     password: Option<String>,
     prev_not_encrypted_but_now_yes: Arc<Mutex<bool>>,
-) -> Result<(HashMap<String, ChunkIndex>, Vec<CommitSummary>), String> {
+) -> Result<(HashMap<String, ChunkIndex>, Vec<BackupSummary>), String> {
     let chunk_indexes_future = tokio::spawn(load_chunk_indexes(
         Arc::clone(&fs),
         key.clone(),
@@ -202,24 +202,24 @@ async fn load_metadata(
         Arc::clone(&prev_not_encrypted_but_now_yes),
     ));
 
-    let commit_sumaries_future = tokio::spawn(list_commit_summaries(
+    let backup_summaries_future = tokio::spawn(list_backup_summaries(
         Arc::clone(&fs),
         key.clone(),
         password.clone(),
     ));
 
-    let (chunk_indexes_result, commit_sumaries_result) =
-        tokio::join!(chunk_indexes_future, commit_sumaries_future);
+    let (chunk_indexes_result, backup_summaries_result) =
+        tokio::join!(chunk_indexes_future, backup_summaries_future);
 
     let chunk_indexes = chunk_indexes_result
         .map_err(|e| format!("Failed to load chunk indexes: {}", e))?
         .map_err(|e| format!("Failed to load chunk indexes: {}", e))?;
 
-    let commit_sumaries = commit_sumaries_result
-        .map_err(|e| format!("Failed to load commit summaries: {}", e))?
-        .map_err(|e| format!("Failed to load commit summaries: {}", e))?;
+    let backup_summaries = backup_summaries_result
+        .map_err(|e| format!("Failed to load backup summaries: {}", e))?
+        .map_err(|e| format!("Failed to load backup summaries: {}", e))?;
 
-    Ok((chunk_indexes, commit_sumaries))
+    Ok((chunk_indexes, backup_summaries))
 }
 
 fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), String> {

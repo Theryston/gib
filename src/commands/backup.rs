@@ -1,8 +1,8 @@
 use crate::commands::config::Config;
 use crate::core::crypto::get_password;
 use crate::core::crypto::write_file_maybe_encrypt;
-use crate::core::indexes::{create_new_commit, load_chunk_indexes};
-use crate::core::metadata::{ChunkIndex, Commit, CommitObject};
+use crate::core::indexes::{create_new_backup, load_chunk_indexes};
+use crate::core::metadata::{Backup, BackupObject, ChunkIndex};
 use crate::core::permissions::get_file_permissions_with_path;
 use crate::fs::FS;
 use crate::utils::{compress_bytes, get_fs, get_pwd_string, get_storage, handle_error, list_files};
@@ -64,7 +64,7 @@ pub async fn backup(matches: &ArgMatches) {
 
     let prev_not_encrypted_but_now_yes = Arc::new(Mutex::new(false));
 
-    let (new_commit, root_files, chunk_indexes) = match load_metadata(
+    let (new_backup, root_files, chunk_indexes) = match load_metadata(
         Arc::clone(&fs),
         key.clone(),
         message,
@@ -96,13 +96,13 @@ pub async fn backup(matches: &ArgMatches) {
 
     pb.set_message(format!(
         "Backing up files to {}...",
-        new_commit.hash[..8].to_string()
+        new_backup.hash[..8].to_string()
     ));
 
     let chunk_indexes: Arc<Mutex<HashMap<String, ChunkIndex>>> =
         Arc::new(Mutex::new(chunk_indexes));
 
-    let new_commit: Arc<Mutex<Commit>> = Arc::new(Mutex::new(new_commit));
+    let new_backup: Arc<Mutex<Backup>> = Arc::new(Mutex::new(new_backup));
 
     let mut files_set: JoinSet<Result<(), String>> = JoinSet::new();
     let written_bytes = Arc::new(Mutex::new(0));
@@ -114,7 +114,7 @@ pub async fn backup(matches: &ArgMatches) {
         let password_clone = password.clone();
         let key_clone = key.clone();
         let fs_clone = Arc::clone(&fs);
-        let new_commit_clone = Arc::clone(&new_commit);
+        let new_backup_clone = Arc::clone(&new_backup);
         let root_path_string_clone = root_path_string.clone();
         let written_bytes_clone = Arc::clone(&written_bytes);
         let deduplicated_bytes_clone = Arc::clone(&deduplicated_bytes);
@@ -208,11 +208,11 @@ pub async fn backup(matches: &ArgMatches) {
             let file_permissions = get_file_permissions_with_path(&file_metadata, &file_path);
 
             {
-                let mut new_commit_guard = new_commit_clone.lock().unwrap();
+                let mut new_backup_guard = new_backup_clone.lock().unwrap();
 
-                new_commit_guard.tree.insert(
+                new_backup_guard.tree.insert(
                     relative_path.to_string(),
-                    CommitObject {
+                    BackupObject {
                         hash: file_hash.clone(),
                         size: file_metadata.len(),
                         content_type: "application/octet-stream".to_string(),
@@ -266,28 +266,28 @@ pub async fn backup(matches: &ArgMatches) {
         password.as_deref(),
     );
 
-    let commit_file_bytes =
-        rmp_serde::to_vec(&*new_commit.lock().unwrap()).unwrap_or_else(|_| Vec::new());
+    let backup_file_bytes =
+        rmp_serde::to_vec(&*new_backup.lock().unwrap()).unwrap_or_else(|_| Vec::new());
 
-    let compressed_commit_file_bytes = compress_bytes(&commit_file_bytes, compress);
+    let compressed_backup_file_bytes = compress_bytes(&backup_file_bytes, compress);
 
-    let commit_file_path = format!("{}/commits/{}", key, new_commit.lock().unwrap().hash);
+    let backup_file_path = format!("{}/backups/{}", key, new_backup.lock().unwrap().hash);
 
-    let write_commit_file_future = write_file_maybe_encrypt(
+    let write_backup_file_future = write_file_maybe_encrypt(
         &fs,
-        &commit_file_path,
-        &compressed_commit_file_bytes,
+        &backup_file_path,
+        &compressed_backup_file_bytes,
         password.as_deref(),
     );
 
-    let (write_chunk_index_result, write_commit_file_result) =
-        tokio::join!(write_chunk_index_future, write_commit_file_future);
+    let (write_chunk_index_result, write_backup_file_result) =
+        tokio::join!(write_chunk_index_future, write_backup_file_future);
 
     if write_chunk_index_result.is_err() {
         handle_error("Failed to write chunk indexes".to_string(), Some(&pb));
     }
 
-    if write_commit_file_result.is_err() {
+    if write_backup_file_result.is_err() {
         handle_error("Failed to write backup file".to_string(), Some(&pb));
     }
 
@@ -314,8 +314,8 @@ async fn load_metadata(
     compress: i32,
     password: Option<String>,
     prev_not_encrypted_but_now_yes: Arc<Mutex<bool>>,
-) -> Result<(Commit, Vec<String>, HashMap<String, ChunkIndex>), String> {
-    let new_commit_future = tokio::spawn(create_new_commit(
+) -> Result<(Backup, Vec<String>, HashMap<String, ChunkIndex>), String> {
+    let new_backup_future = tokio::spawn(create_new_backup(
         Arc::clone(&fs),
         key.clone(),
         message.clone(),
@@ -333,10 +333,10 @@ async fn load_metadata(
         prev_not_encrypted_but_now_yes,
     ));
 
-    let (new_commit_result, root_files_result, chunk_indexes_result) =
-        tokio::join!(new_commit_future, root_files_future, chunk_indexes_future);
+    let (new_backup_result, root_files_result, chunk_indexes_result) =
+        tokio::join!(new_backup_future, root_files_future, chunk_indexes_future);
 
-    let new_commit = new_commit_result
+    let new_backup = new_backup_result
         .map_err(|e| format!("Failed to create new backup: {}", e))?
         .map_err(|e| format!("Failed to create new backup: {}", e))?;
 
@@ -346,7 +346,7 @@ async fn load_metadata(
         .map_err(|e| format!("Failed to load chunk indexes: {}", e))?
         .map_err(|e| format!("Failed to load chunk indexes: {}", e))?;
 
-    Ok((new_commit, root_files, chunk_indexes))
+    Ok((new_backup, root_files, chunk_indexes))
 }
 
 fn get_params(

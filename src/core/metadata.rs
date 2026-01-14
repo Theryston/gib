@@ -2,22 +2,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
-pub(crate) struct CommitSummary {
+pub(crate) struct BackupSummary {
     pub(crate) message: String,
     pub(crate) hash: String,
 }
 
 #[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
-pub(crate) struct Commit {
+pub(crate) struct Backup {
     pub(crate) message: String,
     pub(crate) hash: String,
     pub(crate) timestamp: u64,
     pub(crate) author: String,
-    pub(crate) tree: HashMap<String, CommitObject>,
+    pub(crate) tree: HashMap<String, BackupObject>,
 }
 
 #[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
-pub(crate) struct CommitObject {
+pub(crate) struct BackupObject {
     pub(crate) hash: String,
     pub(crate) size: u64,
     pub(crate) content_type: String,

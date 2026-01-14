@@ -1,5 +1,5 @@
 use crate::core::crypto::{read_file_maybe_decrypt, write_file_maybe_encrypt};
-use crate::core::metadata::{ChunkIndex, Commit, CommitSummary};
+use crate::core::metadata::{Backup, BackupSummary, ChunkIndex};
 use crate::fs::FS;
 use crate::utils::{compress_bytes, decompress_bytes};
 use sha2::{Digest, Sha256};
@@ -38,40 +38,40 @@ pub(crate) async fn load_chunk_indexes(
     Ok(chunk_indexes)
 }
 
-pub(crate) async fn list_commit_summaries(
+pub(crate) async fn list_backup_summaries(
     fs: Arc<dyn FS>,
     key: String,
     password: Option<String>,
-) -> Result<Vec<CommitSummary>, String> {
+) -> Result<Vec<BackupSummary>, String> {
     let read_result = read_file_maybe_decrypt(
         &fs,
-        format!("{}/indexes/commits", key).as_str(),
+        format!("{}/indexes/backups", key).as_str(),
         password.as_deref(),
         "Backup summaries are encrypted but no password provided",
     )
     .await?;
 
-    let commit_summaries: Vec<CommitSummary> = if read_result.bytes.is_empty() {
+    let backup_summaries: Vec<BackupSummary> = if read_result.bytes.is_empty() {
         Vec::new()
     } else {
-        let decompressed_commit_summaries_bytes = decompress_bytes(&read_result.bytes);
+        let decompressed_backup_summaries_bytes = decompress_bytes(&read_result.bytes);
 
-        rmp_serde::from_slice(&decompressed_commit_summaries_bytes)
+        rmp_serde::from_slice(&decompressed_backup_summaries_bytes)
             .map_err(|e| format!("Failed to deserialize backup summaries: {}", e))?
     };
 
-    Ok(commit_summaries)
+    Ok(backup_summaries)
 }
 
-pub(crate) async fn create_new_commit(
+pub(crate) async fn create_new_backup(
     fs: Arc<dyn FS>,
     key: String,
     message: String,
     author: String,
     compress: i32,
     password: Option<String>,
-) -> Result<Commit, String> {
-    let commit_hash = Sha256::digest(
+) -> Result<Backup, String> {
+    let backup_hash = Sha256::digest(
         format!(
             "{}:{}:{}",
             message,
@@ -84,7 +84,7 @@ pub(crate) async fn create_new_commit(
         .as_bytes(),
     );
 
-    let commit = Commit {
+    let backup = Backup {
         message: message.to_string(),
         author: author.to_string(),
         timestamp: std::time::SystemTime::now()
@@ -92,32 +92,32 @@ pub(crate) async fn create_new_commit(
             .unwrap()
             .as_secs(),
         tree: std::collections::HashMap::new(),
-        hash: format!("{:x}", commit_hash),
+        hash: format!("{:x}", backup_hash),
     };
 
-    let new_commit_summary = CommitSummary {
-        message: commit.message.clone(),
-        hash: commit.hash.clone(),
+    let new_backup_summary = BackupSummary {
+        message: backup.message.clone(),
+        hash: backup.hash.clone(),
     };
 
-    let mut commit_sumaries =
-        list_commit_summaries(Arc::clone(&fs), key.clone(), password.clone()).await?;
+    let mut backup_summaries =
+        list_backup_summaries(Arc::clone(&fs), key.clone(), password.clone()).await?;
 
-    commit_sumaries.insert(0, new_commit_summary);
+    backup_summaries.insert(0, new_backup_summary);
 
-    let commit_sumaries_bytes = rmp_serde::to_vec(&commit_sumaries)
+    let backup_summaries_bytes = rmp_serde::to_vec(&backup_summaries)
         .map_err(|e| format!("Failed to serialize backup summaries: {}", e))?;
-    let compressed_commit_sumaries_bytes = compress_bytes(&commit_sumaries_bytes, compress);
+    let compressed_backup_summaries_bytes = compress_bytes(&backup_summaries_bytes, compress);
 
-    let index_path = format!("{}/indexes/commits", key);
+    let index_path = format!("{}/indexes/backups", key);
     write_file_maybe_encrypt(
         &fs,
         &index_path,
-        &compressed_commit_sumaries_bytes,
+        &compressed_backup_summaries_bytes,
         password.as_deref(),
     )
     .await
     .map_err(|e| format!("Failed to write backup index: {}", e))?;
 
-    Ok(commit)
+    Ok(backup)
 }

@@ -66,9 +66,9 @@ fn cli() -> Command {
         )
         .subcommand(
             Command::new("restore")
-                .about("Restore files from a backup commit")
+                .about("Restore files from a backup")
                 .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
-                .arg(arg!(-c --commit <COMMIT> "The commit hash to restore (full hash or first 8 chars)").required(false))
+                .arg(arg!(-b --backup <BACKUP> "The backup hash to restore (full hash or first 8 chars)").required(false))
                 .arg(arg!(-s --storage <STORAGE> "The storage to use").required(false))
                 .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))
                 .arg(

@@ -1,7 +1,7 @@
 use crate::core::crypto::get_password;
 use crate::core::crypto::read_file_maybe_decrypt;
-use crate::core::indexes::list_commit_summaries;
-use crate::core::metadata::Commit;
+use crate::core::indexes::list_backup_summaries;
+use crate::core::metadata::Backup;
 use crate::core::permissions::set_file_permissions;
 use crate::fs::FS;
 use crate::utils::{decompress_bytes, get_fs, get_pwd_string, get_storage, handle_error};
@@ -19,7 +19,7 @@ use tokio::task::JoinSet;
 use walkdir::WalkDir;
 
 pub async fn restore(matches: &ArgMatches) {
-    let (key, storage, password, commit_hash, target_path) = match get_params(matches) {
+    let (key, storage, password, backup_hash, target_path) = match get_params(matches) {
         Ok(params) => params,
         Err(e) => handle_error(e, None),
     };
@@ -28,11 +28,11 @@ pub async fn restore(matches: &ArgMatches) {
 
     let fs = get_fs(&storage, None);
 
-    let full_commit_hash = match resolve_commit_hash(
+    let full_backup_hash = match resolve_backup_hash(
         Arc::clone(&fs),
         key.clone(),
         password.clone(),
-        commit_hash,
+        backup_hash,
     )
     .await
     {
@@ -43,23 +43,23 @@ pub async fn restore(matches: &ArgMatches) {
     let pb = ProgressBar::new(100);
     pb.enable_steady_tick(Duration::from_millis(100));
     pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
-    pb.set_message("Loading commit data...");
+    pb.set_message("Loading backup data...");
 
-    let commit = match load_commit(
+    let backup = match load_backup(
         Arc::clone(&fs),
         key.clone(),
         password.clone(),
-        &full_commit_hash,
+        &full_backup_hash,
     )
     .await
     {
-        Ok(commit) => commit,
+        Ok(backup) => backup,
         Err(e) => handle_error(e, Some(&pb)),
     };
 
     pb.finish_and_clear();
 
-    let pb = ProgressBar::new(commit.tree.len() as u64);
+    let pb = ProgressBar::new(backup.tree.len() as u64);
     pb.enable_steady_tick(Duration::from_millis(100));
     pb.set_style(
         ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
@@ -67,21 +67,21 @@ pub async fn restore(matches: &ArgMatches) {
     );
     pb.set_message(format!(
         "Restoring files from {}...",
-        full_commit_hash[..8.min(full_commit_hash.len())].to_string()
+        full_backup_hash[..8.min(full_backup_hash.len())].to_string()
     ));
 
     let mut files_set: JoinSet<Result<(), String>> = JoinSet::new();
     let restored_files = Arc::new(std::sync::Mutex::new(0u64));
     let skipped_files = Arc::new(std::sync::Mutex::new(0u64));
 
-    for (relative_path, commit_object) in commit.tree.iter() {
+    for (relative_path, backup_object) in backup.tree.iter() {
         let pb_clone = pb.clone();
         let fs_clone = Arc::clone(&fs);
         let key_clone = key.clone();
         let password_clone = password.clone();
         let target_path_clone = target_path.clone();
         let relative_path_clone = relative_path.clone();
-        let commit_object_clone = commit_object.clone();
+        let backup_object_clone = backup_object.clone();
         let restored_files_clone = Arc::clone(&restored_files);
         let skipped_files_clone = Arc::clone(&skipped_files);
 
@@ -90,7 +90,7 @@ pub async fn restore(matches: &ArgMatches) {
 
             let needs_restore = if local_path.exists() {
                 match calculate_file_hash(&local_path) {
-                    Ok(local_hash) => local_hash != commit_object_clone.hash,
+                    Ok(local_hash) => local_hash != backup_object_clone.hash,
                     Err(_) => true,
                 }
             } else {
@@ -118,7 +118,7 @@ pub async fn restore(matches: &ArgMatches) {
             let mut file = std::fs::File::create(&local_path)
                 .map_err(|e| format!("Failed to create file {}: {}", relative_path_clone, e))?;
 
-            for chunk_hash in &commit_object_clone.chunks {
+            for chunk_hash in &backup_object_clone.chunks {
                 let (prefix, rest) = chunk_hash.split_at(2);
                 let chunk_path = format!("{}/chunks/{}/{}", key_clone, prefix, rest);
 
@@ -141,7 +141,7 @@ pub async fn restore(matches: &ArgMatches) {
                 })?;
             }
 
-            set_file_permissions(&local_path, commit_object_clone.permissions).map_err(|e| {
+            set_file_permissions(&local_path, backup_object_clone.permissions).map_err(|e| {
                 format!(
                     "Failed to set permissions for {}: {}",
                     relative_path_clone, e
@@ -184,7 +184,7 @@ pub async fn restore(matches: &ArgMatches) {
     }
 
     pb.set_message("Cleaning up files not in backup...");
-    let deleted_count = match cleanup_extra_files(&target_path, &commit.tree) {
+    let deleted_count = match cleanup_extra_files(&target_path, &backup.tree) {
         Ok(count) => count,
         Err(e) => {
             eprintln!("Warning: Failed to clean up extra files: {}", e);
@@ -204,7 +204,7 @@ pub async fn restore(matches: &ArgMatches) {
     ));
 }
 
-async fn resolve_commit_hash(
+async fn resolve_backup_hash(
     fs: Arc<dyn FS>,
     key: String,
     password: Option<String>,
@@ -213,7 +213,7 @@ async fn resolve_commit_hash(
     match provided_hash {
         Some(hash) => {
             if hash.len() <= 8 {
-                let summaries = list_commit_summaries(fs, key, password).await?;
+                let summaries = list_backup_summaries(fs, key, password).await?;
 
                 for summary in summaries {
                     if summary.hash.starts_with(&hash) {
@@ -221,78 +221,78 @@ async fn resolve_commit_hash(
                     }
                 }
 
-                Err(format!("No commit found matching hash prefix: {}", hash))
+                Err(format!("No backup found matching hash prefix: {}", hash))
             } else {
                 Ok(hash)
             }
         }
         None => {
-            let summaries = list_commit_summaries(fs, key, password).await?;
+            let summaries = list_backup_summaries(fs, key, password).await?;
 
             if summaries.is_empty() {
-                return Err("No commits found in repository".to_string());
+                return Err("No backups found in repository".to_string());
             }
 
-            let recent_commits: Vec<CommitSummaryDisplay> = summaries
+            let recent_backups: Vec<BackupSummaryDisplay> = summaries
                 .iter()
                 .take(10)
-                .map(|s| CommitSummaryDisplay {
+                .map(|s| BackupSummaryDisplay {
                     hash: s.hash.clone(),
                     message: s.message.clone(),
                 })
                 .collect();
 
-            if recent_commits.is_empty() {
-                return Err("No commits found in repository".to_string());
+            if recent_backups.is_empty() {
+                return Err("No backups found in repository".to_string());
             }
 
-            let items: Vec<String> = recent_commits
+            let items: Vec<String> = recent_backups
                 .iter()
                 .map(|c| format!("{} {}", &c.hash[..8.min(c.hash.len())], &c.message))
                 .collect();
 
             let selected_index = Select::new()
-                .with_prompt("Select a commit to restore")
+                .with_prompt("Select a backup to restore")
                 .items(&items)
                 .interact()
-                .map_err(|e| format!("Failed to select commit: {}", e))?;
+                .map_err(|e| format!("Failed to select backup: {}", e))?;
 
-            Ok(recent_commits[selected_index].hash.clone())
+            Ok(recent_backups[selected_index].hash.clone())
         }
     }
 }
 
-struct CommitSummaryDisplay {
+struct BackupSummaryDisplay {
     hash: String,
     message: String,
 }
 
-async fn load_commit(
+async fn load_backup(
     fs: Arc<dyn FS>,
     key: String,
     password: Option<String>,
-    commit_hash: &str,
-) -> Result<Commit, String> {
-    let commit_path = format!("{}/commits/{}", key, commit_hash);
+    backup_hash: &str,
+) -> Result<Backup, String> {
+    let backup_path = format!("{}/backups/{}", key, backup_hash);
 
     let read_result = read_file_maybe_decrypt(
         &fs,
-        &commit_path,
+        &backup_path,
         password.as_deref(),
-        "Commit is encrypted but no password provided",
+        "Backup is encrypted but no password provided",
     )
     .await?;
 
     if read_result.bytes.is_empty() {
-        return Err(format!("Commit {} not found or is empty", commit_hash));
+        return Err(format!("Backup {} not found or is empty", backup_hash));
     }
 
     let decompressed_bytes = decompress_bytes(&read_result.bytes);
 
-    let commit: Commit = rmp_serde::from_slice(&decompressed_bytes)
-        .map_err(|e| format!("Failed to deserialize commit: {}", e))?;
+    let backup: Backup = rmp_serde::from_slice(&decompressed_bytes)
+        .map_err(|e| format!("Failed to deserialize backup: {}", e))?;
 
-    Ok(commit)
+    Ok(backup)
 }
 
 fn calculate_file_hash(path: &Path) -> Result<String, std::io::Error> {
@@ -313,7 +313,7 @@ fn calculate_file_hash(path: &Path) -> Result<String, std::io::Error> {
 
 fn cleanup_extra_files(
     target_path: &str,
-    commit_tree: &std::collections::HashMap<String, crate::core::metadata::CommitObject>,
+    backup_tree: &std::collections::HashMap<String, crate::core::metadata::BackupObject>,
 ) -> Result<u64, String> {
     let target_path_buf = PathBuf::from(target_path);
 
@@ -321,7 +321,7 @@ fn cleanup_extra_files(
         return Ok(0);
     }
 
-    let commit_paths: HashSet<String> = commit_tree.keys().map(|p| p.replace('\\', "/")).collect();
+    let backup_paths: HashSet<String> = backup_tree.keys().map(|p| p.replace('\\', "/")).collect();
 
     let mut deleted_count = 0u64;
     let mut dirs_to_check = HashSet::new();
@@ -340,7 +340,7 @@ fn cleanup_extra_files(
 
         let relative_path_str = relative_path.to_string_lossy().replace('\\', "/");
 
-        if !commit_paths.contains(&relative_path_str) {
+        if !backup_paths.contains(&relative_path_str) {
             match std::fs::remove_file(file_path) {
                 Ok(_) => {
                     deleted_count += 1;
@@ -460,7 +460,7 @@ fn get_params(
         return Err(format!("Storage '{}' not found", storage));
     }
 
-    let commit_hash = matches.get_one::<String>("commit").map(|s| s.to_string());
+    let backup_hash = matches.get_one::<String>("backup").map(|s| s.to_string());
 
-    Ok((key, storage, password, commit_hash, target_path))
+    Ok((key, storage, password, backup_hash, target_path))
 }

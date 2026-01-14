@@ -1,6 +1,6 @@
 use crate::core::crypto::get_password;
-use crate::core::indexes::list_commit_summaries;
-use crate::core::metadata::CommitSummary;
+use crate::core::indexes::list_backup_summaries;
+use crate::core::metadata::BackupSummary;
 use crate::utils::{get_fs, get_storage, handle_error};
 use clap::ArgMatches;
 use console::{Term, style};
@@ -22,13 +22,13 @@ pub async fn log(matches: &ArgMatches) {
 
     let fs = get_fs(&storage, None);
 
-    let commit_summaries =
-        match list_commit_summaries(Arc::clone(&fs), key.clone(), password.clone()).await {
+    let backup_summaries =
+        match list_backup_summaries(Arc::clone(&fs), key.clone(), password.clone()).await {
             Ok(summaries) => summaries,
             Err(e) => handle_error(e, None),
         };
 
-    if commit_summaries.is_empty() {
+    if backup_summaries.is_empty() {
         println!(
             "{}",
             style("No backups found for this repository.").yellow()
@@ -36,7 +36,7 @@ pub async fn log(matches: &ArgMatches) {
         return;
     }
 
-    display_paginated_commits(&commit_summaries);
+    display_paginated_backups(&backup_summaries);
 }
 
 fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), String> {
@@ -113,11 +113,11 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
     Ok((key, storage, password))
 }
 
-const COMMITS_PER_PAGE: usize = 10;
+const BACKUPS_PER_PAGE: usize = 10;
 
-fn display_paginated_commits(commit_summaries: &[CommitSummary]) {
-    let total_commits = commit_summaries.len();
-    let total_pages = (total_commits + COMMITS_PER_PAGE - 1) / COMMITS_PER_PAGE;
+fn display_paginated_backups(backup_summaries: &[BackupSummary]) {
+    let total_backups = backup_summaries.len();
+    let total_pages = (total_backups + BACKUPS_PER_PAGE - 1) / BACKUPS_PER_PAGE;
     let mut current_page = 0;
 
     let term = Term::stdout();
@@ -127,20 +127,20 @@ fn display_paginated_commits(commit_summaries: &[CommitSummary]) {
         execute!(io::stdout(), Clear(ClearType::All)).unwrap_or(());
         term.clear_screen().unwrap_or(());
 
-        let start_idx = current_page * COMMITS_PER_PAGE;
-        let end_idx = (start_idx + COMMITS_PER_PAGE).min(total_commits);
-        let page_commits = &commit_summaries[start_idx..end_idx];
+        let start_idx = current_page * BACKUPS_PER_PAGE;
+        let end_idx = (start_idx + BACKUPS_PER_PAGE).min(total_backups);
+        let page_backups = &backup_summaries[start_idx..end_idx];
 
-        for (idx, commit) in page_commits.iter().enumerate() {
-            let hash_short = &commit.hash[..8.min(commit.hash.len())];
+        for (idx, backup) in page_backups.iter().enumerate() {
+            let hash_short = &backup.hash[..8.min(backup.hash.len())];
             print!("\r");
             println!(
                 "{} {}",
-                style(format!("commit {}", hash_short)).cyan().bold(),
-                style(&commit.message).white()
+                style(format!("backup {}", hash_short)).cyan().bold(),
+                style(&backup.message).white()
             );
 
-            if idx < page_commits.len() - 1 {
+            if idx < page_backups.len() - 1 {
                 println!();
             }
         }
@@ -150,10 +150,10 @@ fn display_paginated_commits(commit_summaries: &[CommitSummary]) {
         println!(
             "{}",
             style(format!(
-                "Page {}/{} ({} commits) | Press 'n' for next, 'p' for previous, 'q' to quit",
+                "Page {}/{} ({} backups) | Press 'n' for next, 'p' for previous, 'q' to quit",
                 current_page + 1,
                 total_pages,
-                total_commits
+                total_backups
             ))
             .dim()
         );
