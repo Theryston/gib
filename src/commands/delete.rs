@@ -288,6 +288,7 @@ async fn resolve_backup_hash(
             let selected_index = Select::new()
                 .with_prompt("Select a backup to delete")
                 .items(&items)
+                .default(0)
                 .interact()
                 .map_err(|e| format!("Failed to select backup: {}", e))?;
 
@@ -384,6 +385,7 @@ fn get_params(
             let selected_index = Select::new()
                 .with_prompt("Select the storage to use")
                 .items(storages_names)
+                .default(0)
                 .interact()
                 .map_err(|e| format!("{}", e))?;
 

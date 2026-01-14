@@ -446,6 +446,7 @@ fn get_params(
             let selected_index = Select::new()
                 .with_prompt("Select the storage to use")
                 .items(storages_names)
+                .default(0)
                 .interact()
                 .map_err(|e| format!("{}", e))?;
 

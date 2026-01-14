@@ -28,6 +28,7 @@ pub fn remove(matches: &ArgMatches) {
             let selected_index = Select::new()
                 .with_prompt("Select the storage to remove")
                 .items(storages_names)
+                .default(0)
                 .interact()
                 .unwrap_or_else(|e| {
                     eprintln!("Error: {}", e);
