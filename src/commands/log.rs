@@ -133,6 +133,7 @@ fn display_paginated_commits(commit_summaries: &[CommitSummary]) {
 
         for (idx, commit) in page_commits.iter().enumerate() {
             let hash_short = &commit.hash[..8.min(commit.hash.len())];
+            print!("\r");
             println!(
                 "{} {}",
                 style(format!("commit {}", hash_short)).cyan().bold(),
@@ -145,6 +146,7 @@ fn display_paginated_commits(commit_summaries: &[CommitSummary]) {
         }
 
         println!();
+        print!("\r");
         println!(
             "{}",
             style(format!(
