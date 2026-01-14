@@ -1,6 +1,7 @@
 use clap::{Arg, Command, arg};
 
 mod commands;
+mod core;
 mod fs;
 mod utils;
 
