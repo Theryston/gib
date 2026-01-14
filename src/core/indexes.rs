@@ -20,7 +20,6 @@ pub(crate) async fn load_chunk_indexes(
     )
     .await?;
 
-    // Handle the case where password was provided but file was not encrypted
     if password.is_some() && !read_result.was_encrypted && !read_result.bytes.is_empty() {
         let mut prev_not_encrypted_guard = prev_not_encrypted_but_now_yes.lock().unwrap();
         *prev_not_encrypted_guard = true;
