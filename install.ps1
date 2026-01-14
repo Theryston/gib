@@ -37,11 +37,30 @@ Write-Host ""
 
 # Detect architecture
 function Get-Architecture {
-    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+    # Try using PROCESSOR_ARCHITECTURE environment variable (most compatible)
+    $arch = $env:PROCESSOR_ARCHITECTURE
+    
     switch ($arch) {
-        "X64" { return "x86_64" }
-        "Arm64" { return "aarch64" }
-        default { return "unknown" }
+        "AMD64" { return "x86_64" }
+        "x86" { return "x86_64" }  # 32-bit OS on 64-bit machine, use 64-bit binary
+        "ARM64" { return "aarch64" }
+        default {
+            # Fallback: try RuntimeInformation if available (.NET Core / PS 6+)
+            try {
+                $rtArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+                switch ($rtArch) {
+                    "X64" { return "x86_64" }
+                    "Arm64" { return "aarch64" }
+                }
+            } catch {}
+            
+            # Last resort: check if 64-bit OS
+            if ([System.Environment]::Is64BitOperatingSystem) {
+                return "x86_64"
+            }
+            
+            return "unknown"
+        }
     }
 }
 
