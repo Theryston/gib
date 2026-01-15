@@ -145,10 +145,9 @@ pub async fn backup(matches: &ArgMatches) {
             let files_set_clone = Arc::clone(&files_set);
 
             async move {
-                let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
-
                 let mut guard = files_set_clone.lock().await;
                 guard.spawn(async move {
+                    let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
                     backup_file(
                         file_path,
                         pb_clone,

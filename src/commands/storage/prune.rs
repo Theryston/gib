@@ -111,10 +111,9 @@ pub async fn prune(matches: &ArgMatches) {
             let chunks_set_clone = Arc::clone(&chunks_set);
 
             async move {
-                let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
-
                 let mut guard = chunks_set_clone.lock().await;
                 guard.spawn(async move {
+                    let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
                     let _ = fs_clone.delete_file(&chunk_clone).await;
                     pb_clone.inc(1);
                     Ok(())

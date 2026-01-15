@@ -114,10 +114,9 @@ pub async fn encrypt(matches: &ArgMatches) {
             let files_set_clone = Arc::clone(&files_set);
 
             async move {
-                let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
-
                 let mut guard = files_set_clone.lock().await;
                 guard.spawn(async move {
+                    let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
                     let read_result = read_file_maybe_decrypt(
                         &fs_clone,
                         &file_path_clone,

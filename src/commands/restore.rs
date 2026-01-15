@@ -101,10 +101,9 @@ pub async fn restore(matches: &ArgMatches) {
             let files_set_clone = Arc::clone(&files_set);
 
             async move {
-                let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
-
                 let mut guard = files_set_clone.lock().await;
                 guard.spawn(async move {
+                    let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
                     let local_path = Path::new(&target_path_clone).join(&relative_path_clone);
 
                     let needs_restore = if local_path.exists() {

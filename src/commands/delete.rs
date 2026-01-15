@@ -196,10 +196,9 @@ pub async fn delete(matches: &ArgMatches) {
                 let chunks_set_clone = Arc::clone(&chunks_set);
 
                 async move {
-                    let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
-
                     let mut guard = chunks_set_clone.lock().await;
                     guard.spawn(async move {
+                        let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
                         let (prefix, rest) = chunk_hash_clone.split_at(2);
                         let chunk_path = format!("{}/chunks/{}/{}", key_clone, prefix, rest);
 
