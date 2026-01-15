@@ -63,6 +63,15 @@ fn cli() -> Command {
                         .help("The root path to backup")
                         .required(false),
                 )
+                .arg(
+                    Arg::new("ignore")
+                        .short('i')
+                        .long("ignore")
+                        .value_name("IGNORE")
+                        .help("File or folder names to ignore (can be used multiple times)")
+                        .required(false)
+                        .action(clap::ArgAction::Append),
+                )
                 .subcommand(
                     Command::new("delete")
                         .about("Delete a backup and its orphaned chunks")

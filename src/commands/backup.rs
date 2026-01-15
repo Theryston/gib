@@ -26,7 +26,7 @@ use tokio::task::JoinSet;
 const MAX_CONCURRENT_FILES: usize = 100;
 
 pub async fn backup(matches: &ArgMatches) {
-    let (key, message, root_path_string, storage, compress, password, chunk_size) =
+    let (key, message, root_path_string, storage, compress, password, chunk_size, ignore_patterns) =
         match get_params(matches) {
             Ok(params) => params,
             Err(e) => handle_error(e, None),
@@ -88,6 +88,22 @@ pub async fn backup(matches: &ArgMatches) {
     if *prev_not_encrypted_but_now_yes.lock().unwrap() {
         println!("{}", style("The backup was not encrypted but you provided a password! Only new chunks will be encrypted, for old chunks run 'gib encrypt'").yellow());
     }
+
+    let root_files: Vec<String> = if ignore_patterns.is_empty() {
+        root_files
+    } else {
+        root_files
+            .into_iter()
+            .filter(|file_path| {
+                let normalized_path = file_path.replace('\\', "/");
+                !ignore_patterns.iter().any(|pattern| {
+                    normalized_path
+                        .split('/')
+                        .any(|component| component == pattern)
+                })
+            })
+            .collect()
+    };
 
     let pb = ProgressBar::new(root_files.len() as u64);
     pb.enable_steady_tick(Duration::from_millis(100));
@@ -420,7 +436,19 @@ async fn load_metadata(
 
 fn get_params(
     matches: &ArgMatches,
-) -> Result<(String, String, String, String, i32, Option<String>, u64), String> {
+) -> Result<
+    (
+        String,
+        String,
+        String,
+        String,
+        i32,
+        Option<String>,
+        u64,
+        Vec<String>,
+    ),
+    String,
+> {
     let password: Option<String> = matches
         .get_one::<String>("password")
         .map(|s| s.to_string())
@@ -516,6 +544,11 @@ fn get_params(
         return Err(format!("Storage '{}' not found", storage));
     }
 
+    let ignore_patterns: Vec<String> = matches
+        .get_many::<String>("ignore")
+        .map(|values| values.map(|s| s.to_string()).collect())
+        .unwrap_or_default();
+
     Ok((
         key,
         message,
@@ -524,5 +557,6 @@ fn get_params(
         compress,
         password,
         chunk_size,
+        ignore_patterns,
     ))
 }
