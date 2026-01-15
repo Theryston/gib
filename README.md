@@ -8,6 +8,7 @@
   <a href="#-installation">Installation</a> •
   <a href="#-features">Features</a> •
   <a href="#-quick-start">Quick Start</a> •
+  <a href="#-benchmarks">Benchmarks</a> •
   <a href="#-commands">Commands</a> •
   <a href="#-why-gib">Why gib?</a>
 </p>
@@ -169,6 +170,29 @@ gib restore
 
 # it will list all the backups, and you can restore to any point
 ```
+
+---
+
+## ⚡ Benchmarks
+
+**Real-world performance that speaks for itself.**
+
+In real-world scenarios, `gib backup` consistently outperforms traditional backup tools. Our benchmarks show that in some cases, `gib backup` can be **up to 3.29x faster** than `borg create` — that's more than three times the speed! 🚀
+
+### Performance Comparison
+
+See the benchmark results comparing `gib backup` against `borg create`:
+
+<img src="benchmarks/vs-borg.png" alt="Benchmark Comparison: gib vs borg" style="max-width: 600px; width: 100%;">
+
+**What this means for you:**
+
+- ⏱️ **Faster backups** = Less time waiting, more time working
+- 💰 **Lower costs** = Less compute time on cloud storage
+- ⚡ **Better experience** = Progress bars that actually move
+- 🎯 **Real performance** = Built with Rust and Tokio for maximum efficiency
+
+Don't just take our word for it — try it yourself and feel the speed difference!
 
 ---
 
