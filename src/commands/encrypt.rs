@@ -8,13 +8,16 @@ use clap::ArgMatches;
 use console::style;
 use dialoguer::Select;
 use dirs::home_dir;
+use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use tokio::task::JoinSet;
+
+const MAX_CONCURRENT_FILES: usize = 100;
 
 pub async fn encrypt(matches: &ArgMatches) {
     let (key, storage, password) = match get_params(matches) {
@@ -94,68 +97,76 @@ pub async fn encrypt(matches: &ArgMatches) {
 
     let encrypted_amount = Arc::new(Mutex::new(0));
     let already_encrypted_amount = Arc::new(Mutex::new(0));
-    let mut files_set: JoinSet<Result<(), String>> = JoinSet::new();
-    let semaphore = Arc::new(Semaphore::new(100));
+    let files_set = Arc::new(TokioMutex::new(JoinSet::new()));
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILES));
 
-    for file_path in files_to_encrypt {
-        let semaphore_clone = Arc::clone(&semaphore);
-        let pb_clone = pb.clone();
-        let password_clone = password.clone();
-        let fs_clone = Arc::clone(&fs);
-        let file_path_clone = file_path.clone();
-        let already_encrypted_amount_clone = Arc::clone(&already_encrypted_amount);
-        let encrypted_amount_clone = Arc::clone(&encrypted_amount);
+    let files_stream = stream::iter(files_to_encrypt);
 
-        files_set.spawn(async move {
-            let _permit = semaphore_clone
-                .acquire()
-                .await
-                .map_err(|e| format!("Semaphore error: {}", e))?;
+    files_stream
+        .for_each_concurrent(MAX_CONCURRENT_FILES, |file_path| {
+            let pb_clone = pb.clone();
+            let password_clone = password.clone();
+            let fs_clone = Arc::clone(&fs);
+            let file_path_clone = file_path.clone();
+            let already_encrypted_amount_clone = Arc::clone(&already_encrypted_amount);
+            let encrypted_amount_clone = Arc::clone(&encrypted_amount);
+            let semaphore_clone = Arc::clone(&semaphore);
+            let files_set_clone = Arc::clone(&files_set);
 
-            let read_result = read_file_maybe_decrypt(
-                &fs_clone,
-                &file_path_clone,
-                password_clone.as_deref(),
-                "File is encrypted but no password provided",
-            )
-            .await?;
+            async move {
+                let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
 
-            if read_result.was_encrypted {
-                {
-                    let mut already_encrypted_amount_guard =
-                        already_encrypted_amount_clone.lock().unwrap();
-                    *already_encrypted_amount_guard += 1;
-                }
+                let mut guard = files_set_clone.lock().await;
+                guard.spawn(async move {
+                    let read_result = read_file_maybe_decrypt(
+                        &fs_clone,
+                        &file_path_clone,
+                        password_clone.as_deref(),
+                        "File is encrypted but no password provided",
+                    )
+                    .await?;
 
-                pb_clone.inc(1);
-                return Ok(());
+                    if read_result.was_encrypted {
+                        {
+                            let mut already_encrypted_amount_guard =
+                                already_encrypted_amount_clone.lock().unwrap();
+                            *already_encrypted_amount_guard += 1;
+                        }
+
+                        pb_clone.inc(1);
+                        return Ok(());
+                    }
+
+                    write_file_maybe_encrypt(
+                        &fs_clone,
+                        &file_path_clone,
+                        &read_result.bytes,
+                        password_clone.as_deref(),
+                    )
+                    .await?;
+
+                    {
+                        let mut encrypted_amount_guard = encrypted_amount_clone.lock().unwrap();
+                        *encrypted_amount_guard += 1;
+                    }
+
+                    pb_clone.inc(1);
+                    Ok(())
+                });
             }
-
-            write_file_maybe_encrypt(
-                &fs_clone,
-                &file_path_clone,
-                &read_result.bytes,
-                password_clone.as_deref(),
-            )
-            .await?;
-
-            {
-                let mut encrypted_amount_guard = encrypted_amount_clone.lock().unwrap();
-                *encrypted_amount_guard += 1;
-            }
-
-            pb_clone.inc(1);
-            Ok(())
-        });
-    }
+        })
+        .await;
 
     let mut failed_files = Vec::new();
 
-    while let Some(file_process_result) = files_set.join_next().await {
-        match file_process_result {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => failed_files.push(e),
-            Err(e) => failed_files.push(e.to_string()),
+    {
+        let mut guard = files_set.lock().await;
+        while let Some(file_process_result) = guard.join_next().await {
+            match file_process_result {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => failed_files.push(e),
+                Err(e) => failed_files.push(e.to_string()),
+            }
         }
     }
 
