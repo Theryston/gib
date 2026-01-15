@@ -10,11 +10,15 @@ use crate::utils::{
 use clap::ArgMatches;
 use dialoguer::Select;
 use dirs::home_dir;
+use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use tokio::task::JoinSet;
+
+const MAX_CONCURRENT_CHUNKS: usize = 100;
 
 pub async fn delete(matches: &ArgMatches) {
     let (key, storage, password, backup_hash) = match get_params(matches) {
@@ -178,37 +182,51 @@ pub async fn delete(matches: &ArgMatches) {
         );
         pb.set_message("Deleting orphaned chunks...");
 
-        let mut chunks_set: JoinSet<Result<(), String>> = JoinSet::new();
+        let chunks_set = Arc::new(TokioMutex::new(JoinSet::new()));
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CHUNKS));
+        let chunks_stream = stream::iter(&chunks_to_delete_vec);
 
-        for chunk_hash in &chunks_to_delete_vec {
-            let pb_clone = pb.clone();
-            let fs_clone = Arc::clone(&fs);
-            let key_clone = key.clone();
-            let chunk_hash_clone = chunk_hash.clone();
+        chunks_stream
+            .for_each_concurrent(MAX_CONCURRENT_CHUNKS, |chunk_hash| {
+                let pb_clone = pb.clone();
+                let fs_clone = Arc::clone(&fs);
+                let key_clone = key.clone();
+                let chunk_hash_clone = chunk_hash.clone();
+                let semaphore_clone = Arc::clone(&semaphore);
+                let chunks_set_clone = Arc::clone(&chunks_set);
 
-            chunks_set.spawn(async move {
-                let (prefix, rest) = chunk_hash_clone.split_at(2);
-                let chunk_path = format!("{}/chunks/{}/{}", key_clone, prefix, rest);
+                async move {
+                    let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
 
-                if let Err(e) = fs_clone.delete_file(&chunk_path).await {
-                    return Err(format!(
-                        "Failed to delete chunk {}: {}",
-                        chunk_hash_clone, e
-                    ));
+                    let mut guard = chunks_set_clone.lock().await;
+                    guard.spawn(async move {
+                        let (prefix, rest) = chunk_hash_clone.split_at(2);
+                        let chunk_path = format!("{}/chunks/{}/{}", key_clone, prefix, rest);
+
+                        if let Err(e) = fs_clone.delete_file(&chunk_path).await {
+                            return Err(format!(
+                                "Failed to delete chunk {}: {}",
+                                chunk_hash_clone, e
+                            ));
+                        }
+
+                        pb_clone.inc(1);
+                        Ok(())
+                    });
                 }
-
-                pb_clone.inc(1);
-                Ok(())
-            });
-        }
+            })
+            .await;
 
         let mut failed_chunks = Vec::new();
 
-        while let Some(chunk_process_result) = chunks_set.join_next().await {
-            match chunk_process_result {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => failed_chunks.push(e),
-                Err(e) => failed_chunks.push(e.to_string()),
+        {
+            let mut guard = chunks_set.lock().await;
+            while let Some(chunk_process_result) = guard.join_next().await {
+                match chunk_process_result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => failed_chunks.push(e),
+                    Err(e) => failed_chunks.push(e.to_string()),
+                }
             }
         }
 
