@@ -97,6 +97,14 @@ fn cli() -> Command {
                         .help("The target directory to restore files to (default: current directory)")
                         .required(false),
                 )
+                .arg(
+                    Arg::new("delete-local")
+                        .short('d')
+                        .long("delete-local")
+                        .help("Delete local files that are not in the backup")
+                        .action(clap::ArgAction::SetTrue)
+                        .required(false),
+                )
         )
         .subcommand(
             Command::new("storage")

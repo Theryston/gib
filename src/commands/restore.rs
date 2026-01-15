@@ -23,7 +23,8 @@ use walkdir::WalkDir;
 const MAX_CONCURRENT_FILES: usize = 100;
 
 pub async fn restore(matches: &ArgMatches) {
-    let (key, storage, password, backup_hash, target_path) = match get_params(matches) {
+    let (key, storage, password, backup_hash, target_path, delete_local) = match get_params(matches)
+    {
         Ok(params) => params,
         Err(e) => handle_error(e, None),
     };
@@ -207,13 +208,17 @@ pub async fn restore(matches: &ArgMatches) {
         );
     }
 
-    pb.set_message("Cleaning up files not in backup...");
-    let deleted_count = match cleanup_extra_files(&target_path, &backup.tree) {
-        Ok(count) => count,
-        Err(e) => {
-            eprintln!("Warning: Failed to clean up extra files: {}", e);
-            0
+    let deleted_count = if delete_local {
+        pb.set_message("Cleaning up files not in backup...");
+        match cleanup_extra_files(&target_path, &backup.tree) {
+            Ok(count) => count,
+            Err(e) => {
+                eprintln!("Warning: Failed to clean up extra files: {}", e);
+                0
+            }
         }
+    } else {
+        0
     };
 
     let restored_count = *restored_files.lock().unwrap();
@@ -222,10 +227,18 @@ pub async fn restore(matches: &ArgMatches) {
     let elapsed = pb.elapsed();
     pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
     pb.set_prefix("✓");
-    pb.finish_with_message(format!(
-        "Restored {} files, skipped {} files, deleted {} files ({:.2?})",
-        restored_count, skipped_count, deleted_count, elapsed
-    ));
+
+    if deleted_count > 0 {
+        pb.finish_with_message(format!(
+            "Restored {} files, skipped {} files, deleted {} files ({:.2?})",
+            restored_count, skipped_count, deleted_count, elapsed
+        ));
+    } else {
+        pb.finish_with_message(format!(
+            "Restored {} files, skipped {} files ({:.2?})",
+            restored_count, skipped_count, elapsed
+        ));
+    }
 }
 
 async fn resolve_backup_hash(
@@ -402,7 +415,7 @@ fn cleanup_extra_files(
 
 fn get_params(
     matches: &ArgMatches,
-) -> Result<(String, String, Option<String>, Option<String>, String), String> {
+) -> Result<(String, String, Option<String>, Option<String>, String, bool), String> {
     let password: Option<String> = matches
         .get_one::<String>("password")
         .map(|s| s.to_string())
@@ -483,5 +496,14 @@ fn get_params(
 
     let backup_hash = matches.get_one::<String>("backup").map(|s| s.to_string());
 
-    Ok((key, storage, password, backup_hash, target_path))
+    let delete_local = matches.get_flag("delete-local");
+
+    Ok((
+        key,
+        storage,
+        password,
+        backup_hash,
+        target_path,
+        delete_local,
+    ))
 }
