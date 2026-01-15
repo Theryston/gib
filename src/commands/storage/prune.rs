@@ -6,10 +6,14 @@ use crate::utils::{get_fs, get_pwd_string, get_storage, handle_error};
 use clap::ArgMatches;
 use dialoguer::Select;
 use dirs::home_dir;
+use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::Path;
 use std::time::Duration;
+use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use tokio::task::JoinSet;
+
+const MAX_CONCURRENT_CHUNKS: usize = 100;
 
 pub async fn prune(matches: &ArgMatches) {
     let (key, storage, password) = match get_params(matches) {
@@ -93,27 +97,42 @@ pub async fn prune(matches: &ArgMatches) {
 
     pb.set_message("Deleting chunks...");
 
-    let mut chunks_set: JoinSet<Result<(), String>> = JoinSet::new();
+    let chunks_set = Arc::new(TokioMutex::new(JoinSet::new()));
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CHUNKS));
 
-    for chunk in &chunks_to_prune {
-        let pb_clone = pb.clone();
-        let fs_clone = Arc::clone(&fs);
-        let chunk_clone = chunk.clone();
+    let chunks_stream = stream::iter(&chunks_to_prune);
 
-        chunks_set.spawn(async move {
-            let _ = fs_clone.delete_file(&chunk_clone).await;
-            pb_clone.inc(1);
-            Ok(())
-        });
-    }
+    chunks_stream
+        .for_each_concurrent(MAX_CONCURRENT_CHUNKS, |chunk| {
+            let pb_clone = pb.clone();
+            let fs_clone = Arc::clone(&fs);
+            let chunk_clone = chunk.clone();
+            let semaphore_clone = Arc::clone(&semaphore);
+            let chunks_set_clone = Arc::clone(&chunks_set);
+
+            async move {
+                let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
+
+                let mut guard = chunks_set_clone.lock().await;
+                guard.spawn(async move {
+                    let _ = fs_clone.delete_file(&chunk_clone).await;
+                    pb_clone.inc(1);
+                    Ok(())
+                });
+            }
+        })
+        .await;
 
     let mut failed_chunks = Vec::new();
 
-    while let Some(file_process_result) = chunks_set.join_next().await {
-        match file_process_result {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => failed_chunks.push(e),
-            Err(e) => failed_chunks.push(e.to_string()),
+    {
+        let mut guard = chunks_set.lock().await;
+        while let Some(file_process_result) = guard.join_next().await {
+            match file_process_result {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => failed_chunks.push(e),
+                Err(e) => failed_chunks.push(e.to_string()),
+            }
         }
     }
 
