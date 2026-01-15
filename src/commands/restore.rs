@@ -8,6 +8,7 @@ use crate::utils::{decompress_bytes, get_fs, get_pwd_string, get_storage, handle
 use clap::ArgMatches;
 use dialoguer::Select;
 use dirs::home_dir;
+use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -15,8 +16,11 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use tokio::task::JoinSet;
 use walkdir::WalkDir;
+
+const MAX_CONCURRENT_FILES: usize = 100;
 
 pub async fn restore(matches: &ArgMatches) {
     let (key, storage, password, backup_hash, target_path) = match get_params(matches) {
@@ -70,101 +74,122 @@ pub async fn restore(matches: &ArgMatches) {
         full_backup_hash[..8.min(full_backup_hash.len())].to_string()
     ));
 
-    let mut files_set: JoinSet<Result<(), String>> = JoinSet::new();
+    let files_set = Arc::new(TokioMutex::new(JoinSet::new()));
     let restored_files = Arc::new(std::sync::Mutex::new(0u64));
     let skipped_files = Arc::new(std::sync::Mutex::new(0u64));
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILES));
 
-    for (relative_path, backup_object) in backup.tree.iter() {
-        let pb_clone = pb.clone();
-        let fs_clone = Arc::clone(&fs);
-        let key_clone = key.clone();
-        let password_clone = password.clone();
-        let target_path_clone = target_path.clone();
-        let relative_path_clone = relative_path.clone();
-        let backup_object_clone = backup_object.clone();
-        let restored_files_clone = Arc::clone(&restored_files);
-        let skipped_files_clone = Arc::clone(&skipped_files);
+    let files_to_restore: Vec<(String, crate::core::metadata::BackupObject)> = backup
+        .tree
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
-        files_set.spawn(async move {
-            let local_path = Path::new(&target_path_clone).join(&relative_path_clone);
+    let files_stream = stream::iter(files_to_restore);
 
-            let needs_restore = if local_path.exists() {
-                match calculate_file_hash(&local_path) {
-                    Ok(local_hash) => local_hash != backup_object_clone.hash,
-                    Err(_) => true,
-                }
-            } else {
-                true
-            };
+    files_stream
+        .for_each_concurrent(MAX_CONCURRENT_FILES, |(relative_path, backup_object)| {
+            let pb_clone = pb.clone();
+            let fs_clone = Arc::clone(&fs);
+            let key_clone = key.clone();
+            let password_clone = password.clone();
+            let target_path_clone = target_path.clone();
+            let relative_path_clone = relative_path.clone();
+            let restored_files_clone = Arc::clone(&restored_files);
+            let skipped_files_clone = Arc::clone(&skipped_files);
+            let semaphore_clone = Arc::clone(&semaphore);
+            let files_set_clone = Arc::clone(&files_set);
 
-            if !needs_restore {
-                {
-                    let mut skipped = skipped_files_clone.lock().unwrap();
-                    *skipped += 1;
-                }
-                pb_clone.inc(1);
-                return Ok(());
+            async move {
+                let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
+
+                let mut guard = files_set_clone.lock().await;
+                guard.spawn(async move {
+                    let local_path = Path::new(&target_path_clone).join(&relative_path_clone);
+
+                    let needs_restore = if local_path.exists() {
+                        match calculate_file_hash(&local_path) {
+                            Ok(local_hash) => local_hash != backup_object.hash,
+                            Err(_) => true,
+                        }
+                    } else {
+                        true
+                    };
+
+                    if !needs_restore {
+                        {
+                            let mut skipped = skipped_files_clone.lock().unwrap();
+                            *skipped += 1;
+                        }
+                        pb_clone.inc(1);
+                        return Ok(());
+                    }
+
+                    if let Some(parent) = local_path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            format!(
+                                "Failed to create parent directory for {}: {}",
+                                relative_path_clone, e
+                            )
+                        })?;
+                    }
+
+                    let mut file = std::fs::File::create(&local_path).map_err(|e| {
+                        format!("Failed to create file {}: {}", relative_path_clone, e)
+                    })?;
+
+                    for chunk_hash in &backup_object.chunks {
+                        let (prefix, rest) = chunk_hash.split_at(2);
+                        let chunk_path = format!("{}/chunks/{}/{}", key_clone, prefix, rest);
+
+                        let chunk_data = read_file_maybe_decrypt(
+                            &fs_clone,
+                            &chunk_path,
+                            password_clone.as_deref(),
+                            "Chunk is encrypted but no password provided",
+                        )
+                        .await
+                        .map_err(|e| format!("Failed to read chunk {}: {}", chunk_hash, e))?;
+
+                        let decompressed = decompress_bytes(&chunk_data.bytes);
+
+                        file.write_all(&decompressed).map_err(|e| {
+                            format!(
+                                "Failed to write chunk {} to file {}: {}",
+                                chunk_hash, relative_path_clone, e
+                            )
+                        })?;
+                    }
+
+                    set_file_permissions(&local_path, backup_object.permissions).map_err(|e| {
+                        format!(
+                            "Failed to set permissions for {}: {}",
+                            relative_path_clone, e
+                        )
+                    })?;
+
+                    {
+                        let mut restored = restored_files_clone.lock().unwrap();
+                        *restored += 1;
+                    }
+
+                    pb_clone.inc(1);
+                    Ok(())
+                });
             }
-
-            if let Some(parent) = local_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    format!(
-                        "Failed to create parent directory for {}: {}",
-                        relative_path_clone, e
-                    )
-                })?;
-            }
-
-            let mut file = std::fs::File::create(&local_path)
-                .map_err(|e| format!("Failed to create file {}: {}", relative_path_clone, e))?;
-
-            for chunk_hash in &backup_object_clone.chunks {
-                let (prefix, rest) = chunk_hash.split_at(2);
-                let chunk_path = format!("{}/chunks/{}/{}", key_clone, prefix, rest);
-
-                let chunk_data = read_file_maybe_decrypt(
-                    &fs_clone,
-                    &chunk_path,
-                    password_clone.as_deref(),
-                    "Chunk is encrypted but no password provided",
-                )
-                .await
-                .map_err(|e| format!("Failed to read chunk {}: {}", chunk_hash, e))?;
-
-                let decompressed = decompress_bytes(&chunk_data.bytes);
-
-                file.write_all(&decompressed).map_err(|e| {
-                    format!(
-                        "Failed to write chunk {} to file {}: {}",
-                        chunk_hash, relative_path_clone, e
-                    )
-                })?;
-            }
-
-            set_file_permissions(&local_path, backup_object_clone.permissions).map_err(|e| {
-                format!(
-                    "Failed to set permissions for {}: {}",
-                    relative_path_clone, e
-                )
-            })?;
-
-            {
-                let mut restored = restored_files_clone.lock().unwrap();
-                *restored += 1;
-            }
-
-            pb_clone.inc(1);
-            Ok(())
-        });
-    }
+        })
+        .await;
 
     let mut failed_files = Vec::new();
 
-    while let Some(file_process_result) = files_set.join_next().await {
-        match file_process_result {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => failed_files.push(e),
-            Err(e) => failed_files.push(e.to_string()),
+    {
+        let mut guard = files_set.lock().await;
+        while let Some(file_process_result) = guard.join_next().await {
+            match file_process_result {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => failed_files.push(e),
+                Err(e) => failed_files.push(e.to_string()),
+            }
         }
     }
 
