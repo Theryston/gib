@@ -10,7 +10,6 @@ use dirs::home_dir;
 use indicatif::ProgressBar;
 use rand_core::{OsRng, TryRngCore};
 use std::sync::Arc;
-use walkdir;
 
 const MAGIC: &[u8; 4] = b"GIB1";
 
@@ -102,20 +101,6 @@ pub fn get_storage(name: &str) -> Storage {
     let contents = std::fs::read(storage_path).unwrap();
 
     rmp_serde::from_slice(&contents).unwrap()
-}
-
-pub fn list_files(path: &str) -> Vec<String> {
-    let mut files = Vec::new();
-    let walker = walkdir::WalkDir::new(path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file());
-
-    for entry in walker {
-        files.push(entry.path().display().to_string());
-    }
-
-    files
 }
 
 pub fn handle_error(error: String, pb: Option<&ProgressBar>) -> ! {

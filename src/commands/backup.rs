@@ -5,7 +5,7 @@ use crate::core::indexes::{add_backup_summary, create_new_backup, load_chunk_ind
 use crate::core::metadata::{Backup, BackupObject, ChunkIndex};
 use crate::core::permissions::get_file_permissions_with_path;
 use crate::fs::FS;
-use crate::utils::{compress_bytes, get_fs, get_pwd_string, get_storage, handle_error, list_files};
+use crate::utils::{compress_bytes, get_fs, get_pwd_string, get_storage, handle_error};
 use bytesize::ByteSize;
 use clap::ArgMatches;
 use console::style;
@@ -76,6 +76,7 @@ pub async fn backup(matches: &ArgMatches) {
         root_path_string.clone(),
         password.clone(),
         Arc::clone(&prev_not_encrypted_but_now_yes),
+        ignore_patterns,
     )
     .await
     {
@@ -88,22 +89,6 @@ pub async fn backup(matches: &ArgMatches) {
     if *prev_not_encrypted_but_now_yes.lock().unwrap() {
         println!("{}", style("The backup was not encrypted but you provided a password! Only new chunks will be encrypted, for old chunks run 'gib encrypt'").yellow());
     }
-
-    let root_files: Vec<String> = if ignore_patterns.is_empty() {
-        root_files
-    } else {
-        root_files
-            .into_iter()
-            .filter(|file_path| {
-                let normalized_path = file_path.replace('\\', "/");
-                !ignore_patterns.iter().any(|pattern| {
-                    normalized_path
-                        .split('/')
-                        .any(|component| component == pattern)
-                })
-            })
-            .collect()
-    };
 
     let pb = ProgressBar::new(root_files.len() as u64);
     pb.enable_steady_tick(Duration::from_millis(100));
@@ -401,6 +386,28 @@ async fn backup_file(
     Ok(())
 }
 
+fn list_files(path: &str, ignore_patterns: &[String]) -> Vec<String> {
+    let mut files = Vec::new();
+
+    let walker = walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_entry(|entry| {
+            if ignore_patterns.is_empty() {
+                return true;
+            }
+
+            let file_name = entry.file_name().to_string_lossy();
+
+            !ignore_patterns.iter().any(|pattern| file_name == *pattern)
+        });
+
+    for entry in walker.filter_map(|e| e.ok()).filter(|e| e.path().is_file()) {
+        files.push(entry.path().display().to_string());
+    }
+
+    files
+}
+
 async fn load_metadata(
     fs: Arc<dyn FS>,
     key: String,
@@ -409,10 +416,12 @@ async fn load_metadata(
     root_path_string: String,
     password: Option<String>,
     prev_not_encrypted_but_now_yes: Arc<Mutex<bool>>,
+    ignore_patterns: Vec<String>,
 ) -> Result<(Backup, Vec<String>, HashMap<String, ChunkIndex>), String> {
     let new_backup = create_new_backup(message, config.author);
 
-    let root_files_future = tokio::spawn(async move { list_files(&root_path_string) });
+    let root_files_future =
+        tokio::spawn(async move { list_files(&root_path_string, &ignore_patterns) });
 
     let chunk_indexes_future = tokio::spawn(load_chunk_indexes(
         Arc::clone(&fs),
