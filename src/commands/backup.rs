@@ -182,7 +182,7 @@ pub async fn backup(matches: &ArgMatches) {
     }
 
     let chunk_indexes_bytes =
-        rmp_serde::to_vec(&*chunk_indexes.lock().unwrap()).unwrap_or_else(|_| Vec::new());
+        rmp_serde::to_vec_named(&*chunk_indexes.lock().unwrap()).unwrap_or_else(|_| Vec::new());
 
     let compressed_chunk_indexes_bytes = compress_bytes(&chunk_indexes_bytes, compress);
 
@@ -196,7 +196,7 @@ pub async fn backup(matches: &ArgMatches) {
     );
 
     let backup_file_bytes =
-        rmp_serde::to_vec(&*new_backup.lock().unwrap()).unwrap_or_else(|_| Vec::new());
+        rmp_serde::to_vec_named(&*new_backup.lock().unwrap()).unwrap_or_else(|_| Vec::new());
 
     let compressed_backup_file_bytes = compress_bytes(&backup_file_bytes, compress);
 
@@ -220,6 +220,9 @@ pub async fn backup(matches: &ArgMatches) {
         handle_error("Failed to write backup file".to_string(), Some(&pb));
     }
 
+    let written_bytes = *written_bytes.lock().unwrap();
+    let deduplicated_bytes = *deduplicated_bytes.lock().unwrap();
+
     {
         let backup_guard = new_backup.lock().unwrap();
         if let Err(e) = add_backup_summary(
@@ -228,15 +231,13 @@ pub async fn backup(matches: &ArgMatches) {
             &backup_guard,
             compress,
             password.clone(),
+            &written_bytes,
         )
         .await
         {
             handle_error(format!("Failed to save backup summary: {}", e), Some(&pb));
         }
     }
-
-    let written_bytes = *written_bytes.lock().unwrap();
-    let deduplicated_bytes = *deduplicated_bytes.lock().unwrap();
 
     let elapsed = pb.elapsed();
     pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());

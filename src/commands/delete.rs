@@ -117,7 +117,7 @@ pub async fn delete(matches: &ArgMatches) {
 
     pb.set_message("Writing updated indexes...");
 
-    let chunk_indexes_bytes = match rmp_serde::to_vec(&chunk_indexes) {
+    let chunk_indexes_bytes = match rmp_serde::to_vec_named(&chunk_indexes) {
         Ok(bytes) => bytes,
         Err(e) => handle_error(
             format!("Failed to serialize chunk indexes: {}", e),
@@ -134,7 +134,7 @@ pub async fn delete(matches: &ArgMatches) {
         password.as_deref(),
     );
 
-    let backup_summaries_bytes = match rmp_serde::to_vec(&backup_summaries) {
+    let backup_summaries_bytes = match rmp_serde::to_vec_named(&backup_summaries) {
         Ok(bytes) => bytes,
         Err(e) => handle_error(
             format!("Failed to serialize backup summaries: {}", e),

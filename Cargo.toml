@@ -31,6 +31,7 @@ tokio = { version = "1.49.0", features = ["full"] }
 walkdir = "2.5.0"
 zstd = "0.13.3"
 futures = "0.3.31"
+chrono = "0.4.43"
 
 [profile.release]
 opt-level = 3

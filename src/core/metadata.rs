@@ -5,6 +5,10 @@ use std::collections::HashMap;
 pub(crate) struct BackupSummary {
     pub(crate) message: String,
     pub(crate) hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) timestamp: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) size: Option<u64>,
 }
 
 #[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]

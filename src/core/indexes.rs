@@ -94,10 +94,13 @@ pub(crate) async fn add_backup_summary(
     backup: &Backup,
     compress: i32,
     password: Option<String>,
+    written_bytes: &u64,
 ) -> Result<(), String> {
     let new_backup_summary = BackupSummary {
         message: backup.message.clone(),
         hash: backup.hash.clone(),
+        timestamp: Some(backup.timestamp),
+        size: Some(*written_bytes),
     };
 
     let mut backup_summaries =
@@ -105,7 +108,7 @@ pub(crate) async fn add_backup_summary(
 
     backup_summaries.insert(0, new_backup_summary);
 
-    let backup_summaries_bytes = rmp_serde::to_vec(&backup_summaries)
+    let backup_summaries_bytes = rmp_serde::to_vec_named(&backup_summaries)
         .map_err(|e| format!("Failed to serialize backup summaries: {}", e))?;
     let compressed_backup_summaries_bytes = compress_bytes(&backup_summaries_bytes, compress);
 

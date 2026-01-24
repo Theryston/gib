@@ -2,6 +2,8 @@ use crate::core::crypto::get_password;
 use crate::core::indexes::list_backup_summaries;
 use crate::core::metadata::BackupSummary;
 use crate::utils::{get_fs, get_pwd_string, get_storage, handle_error};
+use bytesize::ByteSize;
+use chrono::{DateTime, Local, Utc};
 use clap::ArgMatches;
 use console::{Term, style};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -133,11 +135,29 @@ fn display_paginated_backups(backup_summaries: &[BackupSummary]) {
         for (idx, backup) in page_backups.iter().enumerate() {
             let hash_short = &backup.hash[..8.min(backup.hash.len())];
             print!("\r");
-            println!(
-                "{} {}",
-                style(format!("backup {}", hash_short)).cyan().bold(),
-                style(&backup.message).white()
-            );
+
+            let mut parts = vec![
+                style(format!("{}", hash_short)).cyan().bold(),
+                style(backup.message.clone()).white(),
+            ];
+
+            if let Some(timestamp) = backup.timestamp {
+                let timestamp = DateTime::<Utc>::from_timestamp_secs(timestamp as i64)
+                    .expect("Error parsing timestamp");
+                let timestamp = timestamp.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S");
+                parts.push(style(format!("\nCreated at: {}", timestamp)).dim());
+            }
+
+            if let Some(size) = backup.size {
+                parts.push(style(format!("Size: {}", ByteSize(size))).dim());
+            }
+
+            let line = parts
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<String>>()
+                .join(" ");
+            println!("{}", line);
 
             if idx < page_backups.len() - 1 {
                 println!();
