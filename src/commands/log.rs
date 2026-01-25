@@ -145,7 +145,7 @@ fn display_paginated_backups(backup_summaries: &[BackupSummary]) {
                 let timestamp = DateTime::<Utc>::from_timestamp_secs(timestamp as i64)
                     .expect("Error parsing timestamp");
                 let timestamp = timestamp.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S");
-                parts.push(style(format!("\nCreated at: {}", timestamp)).dim());
+                parts.push(style(format!("\r\nCreated at: {}", timestamp)).dim());
             }
 
             if let Some(size) = backup.size {
