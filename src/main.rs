@@ -1,10 +1,15 @@
 use clap::{Arg, Command, arg};
 
+use crate::output::{
+    detect_mode_from_args, emit_error, emit_help, emit_version, init_panic_hook_if_json,
+    is_json_mode, set_output_mode,
+};
 use crate::utils::handle_error;
 
 mod commands;
 mod core;
 mod fs;
+mod output;
 mod utils;
 
 fn cli() -> Command {
@@ -14,6 +19,15 @@ fn cli() -> Command {
         .subcommand_required(true)
         .arg_required_else_help(true)
         .allow_external_subcommands(true)
+        .arg(
+            Arg::new("mode")
+                .long("mode")
+                .value_name("MODE")
+                .help("Output mode")
+                .default_value("interactive")
+                .value_parser(["interactive", "json"])
+                .global(true),
+        )
         .subcommand(
             Command::new("config")
                 .about("Configure your backup tool")
@@ -154,13 +168,46 @@ fn cli() -> Command {
                         .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
                         .arg(arg!(-s --storage <STORAGE> "The storage to use").required(false))
                         .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))
+                        .arg(
+                            Arg::new("yes")
+                                .short('y')
+                                .long("yes")
+                                .help("Skip confirmation prompt")
+                                .action(clap::ArgAction::SetTrue)
+                                .required(false),
+                        )
                 )
         )
 }
 
 #[tokio::main]
 async fn main() {
-    let matches = cli().get_matches();
+    let args: Vec<String> = std::env::args().collect();
+    let detected_mode = detect_mode_from_args(&args);
+    set_output_mode(detected_mode);
+    init_panic_hook_if_json();
+
+    let matches = match cli().try_get_matches_from(args) {
+        Ok(matches) => matches,
+        Err(e) => {
+            if is_json_mode() {
+                use clap::error::ErrorKind;
+                match e.kind() {
+                    ErrorKind::DisplayHelp => {
+                        emit_help(e.to_string());
+                        std::process::exit(0);
+                    }
+                    ErrorKind::DisplayVersion => {
+                        emit_version(e.to_string());
+                        std::process::exit(0);
+                    }
+                    _ => emit_error(&e.to_string(), "cli_error"),
+                }
+            } else {
+                e.exit();
+            }
+        }
+    };
 
     match matches.subcommand() {
         Some(("config", matches)) => commands::config(matches),

@@ -5,6 +5,7 @@ use crate::core::indexes::{add_backup_summary, create_new_backup, load_chunk_ind
 use crate::core::metadata::{Backup, BackupObject, ChunkIndex};
 use crate::core::permissions::get_file_permissions_with_path;
 use crate::fs::FS;
+use crate::output::{emit_output, emit_progress_message, emit_warning, is_json_mode, JsonProgress};
 use crate::utils::{compress_bytes, get_fs, get_pwd_string, get_storage, handle_error};
 use bytesize::ByteSize;
 use clap::ArgMatches;
@@ -53,18 +54,28 @@ pub async fn backup(matches: &ArgMatches) {
         Err(e) => handle_error(format!("Failed to deserialize config: {}", e), None),
     };
 
-    let pb = ProgressBar::new(100);
+    let pb = if is_json_mode() {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(100);
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+        pb.set_message("Loading metadata from the repository key...");
+        pb
+    };
 
-    pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
-
-    pb.set_message("Loading metadata from the repository key...");
+    if is_json_mode() {
+        emit_progress_message("Loading metadata from the repository key...");
+    }
 
     let storage = get_storage(&storage);
 
     let fs = get_fs(&storage, Some(&pb));
 
     pb.set_message("Generating new backup...");
+    if is_json_mode() {
+        emit_progress_message("Generating new backup...");
+    }
 
     let prev_not_encrypted_but_now_yes = Arc::new(Mutex::new(false));
 
@@ -84,24 +95,47 @@ pub async fn backup(matches: &ArgMatches) {
         Err(e) => handle_error(e, Some(&pb)),
     };
 
+    let total_files = root_files.len();
+
     pb.finish_and_clear();
 
     if *prev_not_encrypted_but_now_yes.lock().unwrap() {
-        println!("{}", style("The backup was not encrypted but you provided a password! Only new chunks will be encrypted, for old chunks run 'gib encrypt'").yellow());
+        let warning = "The backup was not encrypted but you provided a password. Only new chunks will be encrypted; run 'gib encrypt' to encrypt existing chunks.";
+        if is_json_mode() {
+            emit_warning(warning, "unencrypted_chunks");
+        } else {
+            println!("{}", style(warning).yellow());
+        }
     }
 
-    let pb = ProgressBar::new(root_files.len() as u64);
-    pb.enable_steady_tick(Duration::from_millis(100));
+    let json_progress = if is_json_mode() {
+        let progress = JsonProgress::new(root_files.len() as u64);
+        progress.set_message(&format!(
+            "Backing up files to {}...",
+            new_backup.hash[..8].to_string()
+        ));
+        Some(progress)
+    } else {
+        None
+    };
 
-    pb.set_style(
-        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+    let pb = if is_json_mode() {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(root_files.len() as u64);
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+            )
             .unwrap(),
-    );
-
-    pb.set_message(format!(
-        "Backing up files to {}...",
-        new_backup.hash[..8].to_string()
-    ));
+        );
+        pb.set_message(format!(
+            "Backing up files to {}...",
+            new_backup.hash[..8].to_string()
+        ));
+        pb
+    };
 
     let chunk_indexes: Arc<Mutex<HashMap<String, ChunkIndex>>> =
         Arc::new(Mutex::new(chunk_indexes));
@@ -128,6 +162,7 @@ pub async fn backup(matches: &ArgMatches) {
             let deduplicated_bytes_clone = Arc::clone(&deduplicated_bytes);
             let semaphore_clone = Arc::clone(&semaphore);
             let files_set_clone = Arc::clone(&files_set);
+            let json_progress_clone = json_progress.clone();
 
             async move {
                 let mut guard = files_set_clone.lock().await;
@@ -146,6 +181,7 @@ pub async fn backup(matches: &ArgMatches) {
                         deduplicated_bytes_clone,
                         chunk_size,
                         compress,
+                        json_progress_clone,
                     )
                     .await
                 });
@@ -239,15 +275,45 @@ pub async fn backup(matches: &ArgMatches) {
         }
     }
 
-    let elapsed = pb.elapsed();
-    pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
-    pb.set_prefix("✓");
-    pb.finish_with_message(format!(
-        "Backed up files ({:.2?}) - {} written, {} deduplicated",
-        elapsed,
-        ByteSize(written_bytes),
-        ByteSize(deduplicated_bytes),
-    ));
+    if is_json_mode() {
+        #[derive(serde::Serialize)]
+        struct BackupOutput {
+            backup: String,
+            backup_short: String,
+            message: String,
+            author: String,
+            timestamp_unix: u64,
+            files_total: usize,
+            written_bytes: u64,
+            deduplicated_bytes: u64,
+            elapsed_ms: u64,
+        }
+
+        let backup_guard = new_backup.lock().unwrap();
+        let elapsed_ms = pb.elapsed().as_millis() as u64;
+        let payload = BackupOutput {
+            backup: backup_guard.hash.clone(),
+            backup_short: backup_guard.hash[..8.min(backup_guard.hash.len())].to_string(),
+            message: backup_guard.message.clone(),
+            author: backup_guard.author.clone(),
+            timestamp_unix: backup_guard.timestamp,
+            files_total: total_files,
+            written_bytes,
+            deduplicated_bytes,
+            elapsed_ms,
+        };
+        emit_output(&payload);
+    } else {
+        let elapsed = pb.elapsed();
+        pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
+        pb.set_prefix("OK");
+        pb.finish_with_message(format!(
+            "Backed up files ({:.2?}) - {} written, {} deduplicated",
+            elapsed,
+            ByteSize(written_bytes),
+            ByteSize(deduplicated_bytes),
+        ));
+    }
 }
 
 async fn backup_file(
@@ -263,6 +329,7 @@ async fn backup_file(
     deduplicated_bytes: Arc<Mutex<u64>>,
     chunk_size: u64,
     compress: i32,
+    json_progress: Option<Arc<JsonProgress>>,
 ) -> Result<(), String> {
     let mut file = std::fs::File::open(file_path.clone())
         .map_err(|e| format!("Failed to open file: {}", e))?;
@@ -383,7 +450,11 @@ async fn backup_file(
         );
     }
 
-    pb.inc(1);
+    if let Some(progress) = &json_progress {
+        progress.inc_by(1);
+    } else {
+        pb.inc(1);
+    }
     Ok(())
 }
 
@@ -490,10 +561,17 @@ fn get_params(
 
     let message = match matches.get_one::<String>("message") {
         Some(message) => message.to_string(),
-        None => Input::<String>::new()
-            .with_prompt("Enter the backup message")
-            .interact_text()
-            .map_err(|e| format!("{}", e))?,
+        None => {
+            if is_json_mode() {
+                return Err(
+                    "Missing required argument: --message (required in --mode json)".to_string(),
+                );
+            }
+            Input::<String>::new()
+                .with_prompt("Enter the backup message")
+                .interact_text()
+                .map_err(|e| format!("{}", e))?
+        }
     };
 
     let home_dir = home_dir().unwrap();
@@ -503,20 +581,23 @@ fn get_params(
         return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
-    let files = std::fs::read_dir(&storage_path).unwrap();
+    let files =
+        std::fs::read_dir(&storage_path).map_err(|e| format!("Failed to read storages: {}", e))?;
 
     let storages_names = &files
         .map(|file| {
-            file.unwrap()
-                .file_name()
-                .to_string_lossy()
-                .to_string()
-                .split('.')
-                .next()
-                .unwrap()
-                .to_string()
+            file.map_err(|e| format!("Failed to read storage entry: {}", e))
+                .map(|file| {
+                    file.file_name()
+                        .to_string_lossy()
+                        .to_string()
+                        .split('.')
+                        .next()
+                        .unwrap()
+                        .to_string()
+                })
         })
-        .collect::<Vec<String>>();
+        .collect::<Result<Vec<String>, String>>()?;
 
     if storages_names.is_empty() {
         return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
@@ -525,6 +606,11 @@ fn get_params(
     let storage = match matches.get_one::<String>("storage") {
         Some(storage) => storage.to_string(),
         None => {
+            if is_json_mode() {
+                return Err(
+                    "Missing required argument: --storage (required in --mode json)".to_string(),
+                );
+            }
             let selected_index = Select::new()
                 .with_prompt("Select the storage to use")
                 .items(storages_names)

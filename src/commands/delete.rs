@@ -4,6 +4,7 @@ use crate::core::crypto::write_file_maybe_encrypt;
 use crate::core::indexes::{list_backup_summaries, load_chunk_indexes};
 use crate::core::metadata::Backup;
 use crate::fs::FS;
+use crate::output::{emit_output, emit_progress_message, is_json_mode, JsonProgress};
 use crate::utils::{
     compress_bytes, decompress_bytes, get_fs, get_pwd_string, get_storage, handle_error,
 };
@@ -14,7 +15,7 @@ use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use tokio::task::JoinSet;
 
@@ -25,6 +26,8 @@ pub async fn delete(matches: &ArgMatches) {
         Ok(params) => params,
         Err(e) => handle_error(e, None),
     };
+
+    let started_at = Instant::now();
 
     let storage = get_storage(&storage);
 
@@ -42,11 +45,19 @@ pub async fn delete(matches: &ArgMatches) {
         Err(e) => handle_error(e, None),
     };
 
-    let pb = ProgressBar::new(100);
-    pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+    let pb = if is_json_mode() {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(100);
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+        pb.set_message("Loading backup data and indexes...");
+        pb
+    };
 
-    pb.set_message("Loading backup data and indexes...");
+    if is_json_mode() {
+        emit_progress_message("Loading backup data and indexes...");
+    }
 
     let full_backup_hash_clone = full_backup_hash.clone();
     let backup_future = tokio::spawn(load_backup(
@@ -91,6 +102,9 @@ pub async fn delete(matches: &ArgMatches) {
     };
 
     pb.set_message("Processing chunks...");
+    if is_json_mode() {
+        emit_progress_message("Processing chunks...");
+    }
 
     backup_summaries.retain(|summary| summary.hash != full_backup_hash);
 
@@ -116,6 +130,9 @@ pub async fn delete(matches: &ArgMatches) {
     }
 
     pb.set_message("Writing updated indexes...");
+    if is_json_mode() {
+        emit_progress_message("Writing updated indexes...");
+    }
 
     let chunk_indexes_bytes = match rmp_serde::to_vec_named(&chunk_indexes) {
         Ok(bytes) => bytes,
@@ -163,6 +180,9 @@ pub async fn delete(matches: &ArgMatches) {
     }
 
     pb.set_message("Deleting backup file...");
+    if is_json_mode() {
+        emit_progress_message("Deleting backup file...");
+    }
 
     let backup_file_path = format!("{}/backups/{}", key, full_backup_hash);
     if let Err(e) = fs.delete_file(&backup_file_path).await {
@@ -172,15 +192,28 @@ pub async fn delete(matches: &ArgMatches) {
     pb.finish_and_clear();
 
     if !chunks_to_delete_vec.is_empty() {
-        let pb = ProgressBar::new(chunks_to_delete_vec.len() as u64);
-        pb.enable_steady_tick(Duration::from_millis(100));
-        pb.set_style(
-            ProgressStyle::with_template(
-                "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
-            )
-            .unwrap(),
-        );
-        pb.set_message("Deleting orphaned chunks...");
+        let json_progress = if is_json_mode() {
+            let progress = JsonProgress::new(chunks_to_delete_vec.len() as u64);
+            progress.set_message("Deleting orphaned chunks...");
+            Some(progress)
+        } else {
+            None
+        };
+
+        let pb = if is_json_mode() {
+            ProgressBar::hidden()
+        } else {
+            let pb = ProgressBar::new(chunks_to_delete_vec.len() as u64);
+            pb.enable_steady_tick(Duration::from_millis(100));
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+                )
+                .unwrap(),
+            );
+            pb.set_message("Deleting orphaned chunks...");
+            pb
+        };
 
         let chunks_set = Arc::new(TokioMutex::new(JoinSet::new()));
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CHUNKS));
@@ -194,6 +227,7 @@ pub async fn delete(matches: &ArgMatches) {
                 let chunk_hash_clone = chunk_hash.clone();
                 let semaphore_clone = Arc::clone(&semaphore);
                 let chunks_set_clone = Arc::clone(&chunks_set);
+                let json_progress_clone = json_progress.clone();
 
                 async move {
                     let mut guard = chunks_set_clone.lock().await;
@@ -209,7 +243,11 @@ pub async fn delete(matches: &ArgMatches) {
                             ));
                         }
 
-                        pb_clone.inc(1);
+                        if let Some(progress) = &json_progress_clone {
+                            progress.inc_by(1);
+                        } else {
+                            pb_clone.inc(1);
+                        }
                         Ok(())
                     });
                 }
@@ -244,14 +282,34 @@ pub async fn delete(matches: &ArgMatches) {
             );
         }
 
-        let elapsed = pb.elapsed();
-        pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
-        pb.set_prefix("✓");
-        pb.finish_with_message(format!(
-            "Deleted {} chunks ({:.2?})",
-            chunks_to_delete_vec.len(),
-            elapsed
-        ));
+        if !is_json_mode() {
+            let elapsed = pb.elapsed();
+            pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
+            pb.set_prefix("OK");
+            pb.finish_with_message(format!(
+                "Deleted {} chunks ({:.2?})",
+                chunks_to_delete_vec.len(),
+                elapsed
+            ));
+        }
+    }
+
+    if is_json_mode() {
+        #[derive(serde::Serialize)]
+        struct DeleteOutput {
+            backup: String,
+            backup_short: String,
+            deleted_chunks: usize,
+            elapsed_ms: u64,
+        }
+
+        let payload = DeleteOutput {
+            backup: full_backup_hash.clone(),
+            backup_short: full_backup_hash[..8.min(full_backup_hash.len())].to_string(),
+            deleted_chunks: chunks_to_delete_vec.len(),
+            elapsed_ms: started_at.elapsed().as_millis() as u64,
+        };
+        emit_output(&payload);
     }
 }
 
@@ -278,6 +336,11 @@ async fn resolve_backup_hash(
             }
         }
         None => {
+            if is_json_mode() {
+                return Err(
+                    "Missing required argument: --backup (required in --mode json)".to_string(),
+                );
+            }
             let summaries = list_backup_summaries(fs, key, password).await?;
 
             if summaries.is_empty() {
@@ -377,20 +440,23 @@ fn get_params(
         return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
-    let files = std::fs::read_dir(&storage_path).unwrap();
+    let files = std::fs::read_dir(&storage_path)
+        .map_err(|e| format!("Failed to read storages: {}", e))?;
 
     let storages_names = &files
         .map(|file| {
-            file.unwrap()
-                .file_name()
-                .to_string_lossy()
-                .to_string()
-                .split('.')
-                .next()
-                .unwrap()
-                .to_string()
+            file.map_err(|e| format!("Failed to read storage entry: {}", e))
+                .map(|file| {
+                    file.file_name()
+                        .to_string_lossy()
+                        .to_string()
+                        .split('.')
+                        .next()
+                        .unwrap()
+                        .to_string()
+                })
         })
-        .collect::<Vec<String>>();
+        .collect::<Result<Vec<String>, String>>()?;
 
     if storages_names.is_empty() {
         return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
@@ -399,6 +465,11 @@ fn get_params(
     let storage = match matches.get_one::<String>("storage") {
         Some(storage) => storage.to_string(),
         None => {
+            if is_json_mode() {
+                return Err(
+                    "Missing required argument: --storage (required in --mode json)".to_string(),
+                );
+            }
             let selected_index = Select::new()
                 .with_prompt("Select the storage to use")
                 .items(storages_names)

@@ -1,9 +1,10 @@
 use crate::core::crypto::get_password;
 use crate::core::indexes::list_backup_summaries;
 use crate::core::metadata::BackupSummary;
+use crate::output::{emit_output, is_json_mode};
 use crate::utils::{get_fs, get_pwd_string, get_storage, handle_error};
 use bytesize::ByteSize;
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local, SecondsFormat, Utc};
 use clap::ArgMatches;
 use console::{Term, style};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -32,14 +33,27 @@ pub async fn log(matches: &ArgMatches) {
         };
 
     if backup_summaries.is_empty() {
-        println!(
-            "{}",
-            style("No backups found for this repository.").yellow()
-        );
+        if is_json_mode() {
+            let empty: Vec<LogEntry> = Vec::new();
+            emit_output(&empty);
+        } else {
+            println!(
+                "{}",
+                style("No backups found for this repository.").yellow()
+            );
+        }
         return;
     }
 
-    display_paginated_backups(&backup_summaries);
+    if is_json_mode() {
+        let entries = backup_summaries
+            .iter()
+            .map(|backup| LogEntry::from_summary(backup))
+            .collect::<Vec<LogEntry>>();
+        emit_output(&entries);
+    } else {
+        display_paginated_backups(&backup_summaries);
+    }
 }
 
 fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), String> {
@@ -70,20 +84,23 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
         return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
-    let files = std::fs::read_dir(&storage_path).unwrap();
+    let files = std::fs::read_dir(&storage_path)
+        .map_err(|e| format!("Failed to read storages: {}", e))?;
 
     let storages_names = &files
         .map(|file| {
-            file.unwrap()
-                .file_name()
-                .to_string_lossy()
-                .to_string()
-                .split('.')
-                .next()
-                .unwrap()
-                .to_string()
+            file.map_err(|e| format!("Failed to read storage entry: {}", e))
+                .map(|file| {
+                    file.file_name()
+                        .to_string_lossy()
+                        .to_string()
+                        .split('.')
+                        .next()
+                        .unwrap()
+                        .to_string()
+                })
         })
-        .collect::<Vec<String>>();
+        .collect::<Result<Vec<String>, String>>()?;
 
     if storages_names.is_empty() {
         return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
@@ -92,6 +109,11 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
     let storage = match matches.get_one::<String>("storage") {
         Some(storage) => storage.to_string(),
         None => {
+            if is_json_mode() {
+                return Err(
+                    "Missing required argument: --storage (required in --mode json)".to_string(),
+                );
+            }
             let selected_index = Select::new()
                 .with_prompt("Select the storage to use")
                 .items(storages_names)
@@ -115,6 +137,38 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
 }
 
 const BACKUPS_PER_PAGE: usize = 10;
+
+#[derive(serde::Serialize)]
+struct LogEntry {
+    backup: String,
+    backup_short: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamp_unix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+}
+
+impl LogEntry {
+    fn from_summary(summary: &BackupSummary) -> Self {
+        let timestamp = summary.timestamp.and_then(|ts| {
+            DateTime::<Utc>::from_timestamp_secs(ts as i64).map(|dt| {
+                dt.to_rfc3339_opts(SecondsFormat::Secs, true)
+            })
+        });
+
+        LogEntry {
+            backup: summary.hash.clone(),
+            backup_short: summary.hash[..8.min(summary.hash.len())].to_string(),
+            message: summary.message.clone(),
+            timestamp,
+            timestamp_unix: summary.timestamp,
+            size_bytes: summary.size,
+        }
+    }
+}
 
 fn display_paginated_backups(backup_summaries: &[BackupSummary]) {
     let total_backups = backup_summaries.len();

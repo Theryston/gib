@@ -4,6 +4,7 @@ use crate::core::indexes::list_backup_summaries;
 use crate::core::metadata::Backup;
 use crate::core::permissions::set_file_permissions;
 use crate::fs::FS;
+use crate::output::{emit_output, emit_progress_message, emit_warning, is_json_mode, JsonProgress};
 use crate::utils::{decompress_bytes, get_fs, get_pwd_string, get_storage, handle_error};
 use clap::ArgMatches;
 use dialoguer::Select;
@@ -15,7 +16,7 @@ use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use tokio::task::JoinSet;
 use walkdir::WalkDir;
@@ -28,6 +29,8 @@ pub async fn restore(matches: &ArgMatches) {
         Ok(params) => params,
         Err(e) => handle_error(e, None),
     };
+
+    let started_at = Instant::now();
 
     let storage = get_storage(&storage);
 
@@ -45,10 +48,19 @@ pub async fn restore(matches: &ArgMatches) {
         Err(e) => handle_error(e, None),
     };
 
-    let pb = ProgressBar::new(100);
-    pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
-    pb.set_message("Loading backup data...");
+    let pb = if is_json_mode() {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(100);
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+        pb.set_message("Loading backup data...");
+        pb
+    };
+
+    if is_json_mode() {
+        emit_progress_message("Loading backup data...");
+    }
 
     let backup = match load_backup(
         Arc::clone(&fs),
@@ -64,16 +76,34 @@ pub async fn restore(matches: &ArgMatches) {
 
     pb.finish_and_clear();
 
-    let pb = ProgressBar::new(backup.tree.len() as u64);
-    pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_style(
-        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+    let json_progress = if is_json_mode() {
+        let progress = JsonProgress::new(backup.tree.len() as u64);
+        progress.set_message(&format!(
+            "Restoring files from {}...",
+            full_backup_hash[..8.min(full_backup_hash.len())].to_string()
+        ));
+        Some(progress)
+    } else {
+        None
+    };
+
+    let pb = if is_json_mode() {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(backup.tree.len() as u64);
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+            )
             .unwrap(),
-    );
-    pb.set_message(format!(
-        "Restoring files from {}...",
-        full_backup_hash[..8.min(full_backup_hash.len())].to_string()
-    ));
+        );
+        pb.set_message(format!(
+            "Restoring files from {}...",
+            full_backup_hash[..8.min(full_backup_hash.len())].to_string()
+        ));
+        pb
+    };
 
     let files_set = Arc::new(TokioMutex::new(JoinSet::new()));
     let restored_files = Arc::new(std::sync::Mutex::new(0u64));
@@ -100,6 +130,7 @@ pub async fn restore(matches: &ArgMatches) {
             let skipped_files_clone = Arc::clone(&skipped_files);
             let semaphore_clone = Arc::clone(&semaphore);
             let files_set_clone = Arc::clone(&files_set);
+            let json_progress_clone = json_progress.clone();
 
             async move {
                 let mut guard = files_set_clone.lock().await;
@@ -121,7 +152,11 @@ pub async fn restore(matches: &ArgMatches) {
                             let mut skipped = skipped_files_clone.lock().unwrap();
                             *skipped += 1;
                         }
-                        pb_clone.inc(1);
+                        if let Some(progress) = &json_progress_clone {
+                            progress.inc_by(1);
+                        } else {
+                            pb_clone.inc(1);
+                        }
                         return Ok(());
                     }
 
@@ -173,7 +208,11 @@ pub async fn restore(matches: &ArgMatches) {
                         *restored += 1;
                     }
 
-                    pb_clone.inc(1);
+                    if let Some(progress) = &json_progress_clone {
+                        progress.inc_by(1);
+                    } else {
+                        pb_clone.inc(1);
+                    }
                     Ok(())
                 });
             }
@@ -210,10 +249,16 @@ pub async fn restore(matches: &ArgMatches) {
 
     let deleted_count = if delete_local {
         pb.set_message("Cleaning up files not in backup...");
+        if is_json_mode() {
+            emit_progress_message("Cleaning up files not in backup...");
+        }
         match cleanup_extra_files(&target_path, &backup.tree) {
             Ok(count) => count,
             Err(e) => {
-                eprintln!("Warning: Failed to clean up extra files: {}", e);
+                emit_warning(
+                    &format!("Failed to clean up extra files: {}", e),
+                    "cleanup_failed",
+                );
                 0
             }
         }
@@ -224,20 +269,44 @@ pub async fn restore(matches: &ArgMatches) {
     let restored_count = *restored_files.lock().unwrap();
     let skipped_count = *skipped_files.lock().unwrap();
 
-    let elapsed = pb.elapsed();
-    pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
-    pb.set_prefix("✓");
+    if is_json_mode() {
+        #[derive(serde::Serialize)]
+        struct RestoreOutput {
+            backup: String,
+            backup_short: String,
+            restored: u64,
+            skipped: u64,
+            deleted_local: u64,
+            target_path: String,
+            elapsed_ms: u64,
+        }
 
-    if deleted_count > 0 {
-        pb.finish_with_message(format!(
-            "Restored {} files, skipped {} files, deleted {} files ({:.2?})",
-            restored_count, skipped_count, deleted_count, elapsed
-        ));
+        let payload = RestoreOutput {
+            backup: full_backup_hash.clone(),
+            backup_short: full_backup_hash[..8.min(full_backup_hash.len())].to_string(),
+            restored: restored_count,
+            skipped: skipped_count,
+            deleted_local: deleted_count,
+            target_path: target_path.clone(),
+            elapsed_ms: started_at.elapsed().as_millis() as u64,
+        };
+        emit_output(&payload);
     } else {
-        pb.finish_with_message(format!(
-            "Restored {} files, skipped {} files ({:.2?})",
-            restored_count, skipped_count, elapsed
-        ));
+        let elapsed = pb.elapsed();
+        pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
+        pb.set_prefix("OK");
+
+        if deleted_count > 0 {
+            pb.finish_with_message(format!(
+                "Restored {} files, skipped {} files, deleted {} files ({:.2?})",
+                restored_count, skipped_count, deleted_count, elapsed
+            ));
+        } else {
+            pb.finish_with_message(format!(
+                "Restored {} files, skipped {} files ({:.2?})",
+                restored_count, skipped_count, elapsed
+            ));
+        }
     }
 }
 
@@ -264,6 +333,11 @@ async fn resolve_backup_hash(
             }
         }
         None => {
+            if is_json_mode() {
+                return Err(
+                    "Missing required argument: --backup (required in --mode json)".to_string(),
+                );
+            }
             let summaries = list_backup_summaries(fs, key, password).await?;
 
             if summaries.is_empty() {
@@ -391,7 +465,10 @@ fn cleanup_extra_files(
                     }
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to delete {}: {}", relative_path_str, e);
+                    emit_warning(
+                        &format!("Failed to delete {}: {}", relative_path_str, e),
+                        "delete_failed",
+                    );
                 }
             }
         }
@@ -453,20 +530,23 @@ fn get_params(
         return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
-    let files = std::fs::read_dir(&storage_path).unwrap();
+    let files = std::fs::read_dir(&storage_path)
+        .map_err(|e| format!("Failed to read storages: {}", e))?;
 
     let storages_names = &files
         .map(|file| {
-            file.unwrap()
-                .file_name()
-                .to_string_lossy()
-                .to_string()
-                .split('.')
-                .next()
-                .unwrap()
-                .to_string()
+            file.map_err(|e| format!("Failed to read storage entry: {}", e))
+                .map(|file| {
+                    file.file_name()
+                        .to_string_lossy()
+                        .to_string()
+                        .split('.')
+                        .next()
+                        .unwrap()
+                        .to_string()
+                })
         })
-        .collect::<Vec<String>>();
+        .collect::<Result<Vec<String>, String>>()?;
 
     if storages_names.is_empty() {
         return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
@@ -475,6 +555,11 @@ fn get_params(
     let storage = match matches.get_one::<String>("storage") {
         Some(storage) => storage.to_string(),
         None => {
+            if is_json_mode() {
+                return Err(
+                    "Missing required argument: --storage (required in --mode json)".to_string(),
+                );
+            }
             let selected_index = Select::new()
                 .with_prompt("Select the storage to use")
                 .items(storages_names)

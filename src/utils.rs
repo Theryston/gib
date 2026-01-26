@@ -11,6 +11,7 @@ use indicatif::ProgressBar;
 use rand_core::{OsRng, TryRngCore};
 use std::sync::Arc;
 
+use crate::output::{emit_error, is_json_mode};
 const MAGIC: &[u8; 4] = b"GIB1";
 
 pub fn compress_bytes(data: &[u8], level: i32) -> Vec<u8> {
@@ -98,17 +99,23 @@ pub fn get_storage(name: &str) -> Storage {
         .join(".gib")
         .join("storages")
         .join(format!("{}.msgpack", name));
-    let contents = std::fs::read(storage_path).unwrap();
+    let contents = std::fs::read(&storage_path)
+        .unwrap_or_else(|e| handle_error(format!("Failed to read storage '{}': {}", name, e), None));
 
-    rmp_serde::from_slice(&contents).unwrap()
+    rmp_serde::from_slice(&contents)
+        .unwrap_or_else(|e| handle_error(format!("Failed to parse storage '{}': {}", name, e), None))
 }
 
 pub fn handle_error(error: String, pb: Option<&ProgressBar>) -> ! {
     if let Some(pb) = pb {
         pb.finish_and_clear();
     }
-    eprintln!("{}", style(error).red());
-    std::process::exit(1);
+    if is_json_mode() {
+        emit_error(&error, "error");
+    } else {
+        eprintln!("{}", style(error).red());
+        std::process::exit(1);
+    }
 }
 
 pub fn get_fs(storage: &Storage, pb: Option<&ProgressBar>) -> Arc<dyn FS> {
