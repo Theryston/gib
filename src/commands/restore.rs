@@ -4,7 +4,7 @@ use crate::core::indexes::list_backup_summaries;
 use crate::core::metadata::Backup;
 use crate::core::permissions::set_file_permissions;
 use crate::fs::FS;
-use crate::output::{emit_output, emit_progress_message, emit_warning, is_json_mode, JsonProgress};
+use crate::output::{JsonProgress, emit_output, emit_progress_message, emit_warning, is_json_mode};
 use crate::utils::{decompress_bytes, get_fs, get_pwd_string, get_storage, handle_error};
 use clap::ArgMatches;
 use dialoguer::Select;
@@ -24,7 +24,7 @@ use walkdir::WalkDir;
 const MAX_CONCURRENT_FILES: usize = 100;
 
 pub async fn restore(matches: &ArgMatches) {
-    let (key, storage, password, backup_hash, target_path, delete_local) = match get_params(matches)
+    let (key, storage, password, backup_hash, target_path, prune_local) = match get_params(matches)
     {
         Ok(params) => params,
         Err(e) => handle_error(e, None),
@@ -247,7 +247,7 @@ pub async fn restore(matches: &ArgMatches) {
         );
     }
 
-    let deleted_count = if delete_local {
+    let deleted_count = if prune_local {
         pb.set_message("Cleaning up files not in backup...");
         if is_json_mode() {
             emit_progress_message("Cleaning up files not in backup...");
@@ -530,8 +530,8 @@ fn get_params(
         return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
-    let files = std::fs::read_dir(&storage_path)
-        .map_err(|e| format!("Failed to read storages: {}", e))?;
+    let files =
+        std::fs::read_dir(&storage_path).map_err(|e| format!("Failed to read storages: {}", e))?;
 
     let storages_names = &files
         .map(|file| {
@@ -581,7 +581,7 @@ fn get_params(
 
     let backup_hash = matches.get_one::<String>("backup").map(|s| s.to_string());
 
-    let delete_local = matches.get_flag("delete-local");
+    let prune_local = matches.get_flag("prune-local");
 
     Ok((
         key,
@@ -589,6 +589,6 @@ fn get_params(
         password,
         backup_hash,
         target_path,
-        delete_local,
+        prune_local,
     ))
 }

@@ -112,10 +112,10 @@ fn cli() -> Command {
                         .required(false),
                 )
                 .arg(
-                    Arg::new("delete-local")
+                    Arg::new("prune-local")
                         .short('d')
-                        .long("delete-local")
-                        .help("Delete local files that are not in the backup")
+                        .long("prune-local")
+                        .help("Delete local files that are not in the backup tree")
                         .action(clap::ArgAction::SetTrue)
                         .required(false),
                 )
