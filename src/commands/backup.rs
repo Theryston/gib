@@ -56,7 +56,7 @@ pub async fn backup(matches: &ArgMatches) {
     let config_path = home_dir.join(".gib").join("config.msgpack");
 
     if !config_path.exists() {
-        handle_error("Seams like you didn't configure your backup tool yet. Run 'gib config' to configure your backup tool.".to_string(), None);
+        handle_error("Seems like you didn't configure your backup tool yet. Run 'gib config' to configure your backup tool.".to_string(), None);
     }
 
     let config_bytes = match std::fs::read(&config_path) {
@@ -748,7 +748,7 @@ async fn get_params(
     let storage_path = home_dir.join(".gib").join("storages");
 
     if !storage_path.exists() {
-        return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
+        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
     let files =
@@ -770,7 +770,7 @@ async fn get_params(
         .collect::<Result<Vec<String>, String>>()?;
 
     if storages_names.is_empty() {
-        return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
+        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
     let storage = match matches.get_one::<String>("storage") {
@@ -851,7 +851,7 @@ async fn get_params(
                 3
             }
         },
-        |compress| compress.parse().unwrap(),
+        |compress| compress.parse().unwrap_or(3),
     );
 
     let chunk_size: u64 = matches.get_one::<String>("chunk-size").map_or_else(

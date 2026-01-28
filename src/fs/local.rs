@@ -56,14 +56,17 @@ impl FS for LocalFS {
 
     async fn delete_file(&self, path: &str) -> Result<(), std::io::Error> {
         let full_path = self.path.join(path);
-        let result = std::fs::remove_file(&full_path);
 
-        let folder = full_path.parent().unwrap();
+        std::fs::remove_file(&full_path)?;
 
-        if folder.read_dir()?.next().is_none() {
-            std::fs::remove_dir(folder)?;
+        if let Some(folder) = full_path.parent() {
+            if let Ok(mut it) = folder.read_dir() {
+                if it.next().is_none() {
+                    let _ = std::fs::remove_dir(folder);
+                }
+            }
         }
 
-        result
+        Ok(())
     }
 }

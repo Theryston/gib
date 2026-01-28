@@ -108,12 +108,12 @@ pub async fn prune(matches: &ArgMatches) {
         if is_json_mode() {
             #[derive(serde::Serialize)]
             struct PruneOutput {
-                deleted_chunks: usize,
+                deleted_items: usize,
                 elapsed_ms: u64,
             }
 
             let payload = PruneOutput {
-                deleted_chunks: 0,
+                deleted_items: 0,
                 elapsed_ms: started_at.elapsed().as_millis() as u64,
             };
             emit_output(&payload);
@@ -136,7 +136,7 @@ pub async fn prune(matches: &ArgMatches) {
     } else {
         dialoguer::Confirm::new()
             .with_prompt(format!(
-                "Seams like you have {} items to prune (not used chunks and pending backups). Are you sure you want to DELETE them?",
+                "Seems like you have {} items to prune (not used chunks and pending backups). Are you sure you want to DELETE them?",
                 items_to_prune.len()
             ))
             .interact()
@@ -147,12 +147,12 @@ pub async fn prune(matches: &ArgMatches) {
         if is_json_mode() {
             #[derive(serde::Serialize)]
             struct PruneOutput {
-                deleted_chunks: usize,
+                deleted_items: usize,
                 aborted: bool,
             }
 
             let payload = PruneOutput {
-                deleted_chunks: 0,
+                deleted_items: 0,
                 aborted: true,
             };
             emit_output(&payload);
@@ -246,12 +246,12 @@ pub async fn prune(matches: &ArgMatches) {
     if is_json_mode() {
         #[derive(serde::Serialize)]
         struct PruneOutput {
-            deleted_chunks: usize,
+            deleted_items: usize,
             elapsed_ms: u64,
         }
 
         let payload = PruneOutput {
-            deleted_chunks: items_to_prune.len(),
+            deleted_items: items_to_prune.len(),
             elapsed_ms: started_at.elapsed().as_millis() as u64,
         };
         emit_output(&payload);
@@ -260,7 +260,7 @@ pub async fn prune(matches: &ArgMatches) {
         pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
         pb.set_prefix("OK");
         pb.finish_with_message(format!(
-            "Deleted {} chunks ({:.2?})",
+            "Deleted {} items ({:.2?})",
             items_to_prune.len(),
             elapsed,
         ));
@@ -292,7 +292,7 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
     let storage_path = home_dir.join(".gib").join("storages");
 
     if !storage_path.exists() {
-        return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
+        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
     let files =
@@ -314,7 +314,7 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
         .collect::<Result<Vec<String>, String>>()?;
 
     if storages_names.is_empty() {
-        return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
+        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
     let storage = match matches.get_one::<String>("storage") {
