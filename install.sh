@@ -126,7 +126,6 @@ else
     chmod +x "$INSTALL_DIR/$BINARY_NAME"
 fi
 
-# Verify installation
 if command -v $BINARY_NAME &> /dev/null; then
     echo ""
     echo -e "${GREEN}✓ ${BINARY_NAME} installed successfully!${NC}"
