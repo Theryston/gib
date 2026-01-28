@@ -171,7 +171,7 @@ fn cli() -> Command {
                 )
                 .subcommand(
                     Command::new("prune")
-                        .about("Prune not used chunks")
+                        .about("Prune not used chunks and incomplete backup")
                         .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
                         .arg(arg!(-s --storage <STORAGE> "The storage to use").required(false))
                         .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))

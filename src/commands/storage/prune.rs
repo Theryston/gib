@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::crypto::get_password;
 use crate::core::indexes::load_chunk_indexes;
-use crate::output::{emit_output, emit_progress_message, is_json_mode, JsonProgress};
+use crate::output::{JsonProgress, emit_output, emit_progress_message, is_json_mode};
 use crate::utils::{get_fs, get_pwd_string, get_storage, handle_error};
 use clap::ArgMatches;
 use dialoguer::Select;
@@ -61,26 +61,46 @@ pub async fn prune(matches: &ArgMatches) {
     }
 
     let chunks_folder = format!("{}/chunks", key);
+    let indexes_folder = format!("{}/indexes", key);
 
     let chunks = match fs.list_files(&chunks_folder).await {
         Ok(chunks) => chunks,
         Err(e) => handle_error(e.to_string(), Some(&pb)),
     };
 
-    let chunks_to_prune = chunks
-        .iter()
-        .filter(|chunk| {
-            let parts: Vec<&str> = chunk.split('/').collect();
-            let key = if parts.len() >= 2 {
-                format!("{}{}", parts[parts.len() - 2], parts[parts.len() - 1])
-            } else {
-                chunk.to_string()
-            };
+    let pending_backups = match fs.list_files(&indexes_folder).await {
+        Ok(indexes) => indexes
+            .iter()
+            .filter(|index| {
+                let last_part: &str = index.split('/').last().unwrap_or(&"");
 
-            !chunk_indexes.contains_key(&key)
-        })
-        .cloned()
-        .collect::<Vec<String>>();
+                last_part.starts_with("pending_")
+            })
+            .cloned()
+            .collect::<Vec<String>>(),
+        Err(e) => handle_error(e.to_string(), Some(&pb)),
+    };
+
+    let chunks_to_prune = {
+        let mut chunks_to_prune = chunks
+            .iter()
+            .filter(|chunk| {
+                let parts: Vec<&str> = chunk.split('/').collect();
+                let key = if parts.len() >= 2 {
+                    format!("{}{}", parts[parts.len() - 2], parts[parts.len() - 1])
+                } else {
+                    chunk.to_string()
+                };
+
+                !chunk_indexes.contains_key(&key)
+            })
+            .cloned()
+            .collect::<Vec<String>>();
+
+        chunks_to_prune.extend(pending_backups);
+
+        chunks_to_prune
+    };
 
     pb.finish_and_clear();
 
@@ -275,8 +295,8 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
         return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
-    let files = std::fs::read_dir(&storage_path)
-        .map_err(|e| format!("Failed to read storages: {}", e))?;
+    let files =
+        std::fs::read_dir(&storage_path).map_err(|e| format!("Failed to read storages: {}", e))?;
 
     let storages_names = &files
         .map(|file| {
