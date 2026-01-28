@@ -1,4 +1,5 @@
 use crate::fs::FS;
+use crate::output::is_json_mode;
 use crate::utils::handle_error;
 use crate::utils::{decrypt_bytes, encrypt_bytes, is_encrypted};
 use dialoguer::Password;
@@ -68,6 +69,16 @@ pub(crate) async fn write_file_maybe_encrypt(
 }
 
 pub(crate) fn get_password(is_required: bool, is_readonly: bool) -> Option<String> {
+    if is_json_mode() {
+        if is_required {
+            handle_error(
+                "Password is required in --mode json. Provide --password.".to_string(),
+                None,
+            );
+        }
+        return None;
+    }
+
     let password = Password::new()
         .allow_empty_password(!is_required)
         .with_prompt("Enter your repository password (leave empty to skip encryption)")
