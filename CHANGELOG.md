@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/Theryston/gib/compare/v0.0.11...v0.0.12) - 2026-01-28
+
+### Other
+
+- remove redundant comment in install.sh
+
 ## [0.0.11](https://github.com/Theryston/gib/compare/v0.0.10...v0.0.11) - 2026-01-28
 
 ### Other
