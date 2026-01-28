@@ -1,5 +1,6 @@
 use crate::commands::config::Config;
 use crate::core::crypto::get_password;
+use crate::core::crypto::read_file_maybe_decrypt;
 use crate::core::crypto::write_file_maybe_encrypt;
 use crate::core::indexes::{add_backup_summary, create_new_backup, load_chunk_indexes};
 use crate::core::metadata::PendingBackup;
@@ -7,6 +8,7 @@ use crate::core::metadata::{Backup, BackupObject, ChunkIndex};
 use crate::core::permissions::get_file_permissions_with_path;
 use crate::fs::FS;
 use crate::output::{JsonProgress, emit_output, emit_progress_message, emit_warning, is_json_mode};
+use crate::utils::decompress_bytes;
 use crate::utils::{compress_bytes, get_fs, get_pwd_string, get_storage, handle_error};
 use bytesize::ByteSize;
 use clap::ArgMatches;
@@ -186,6 +188,7 @@ pub async fn backup(matches: &ArgMatches) {
         let pending_backup_clone = Arc::clone(&pending_backup);
         let pending_backup_path_clone = pending_backup_path.clone();
         let pending_backup_watcher_stop_clone = pending_backup_watcher_stop.clone();
+        let password_clone = password.clone();
 
         thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -194,6 +197,7 @@ pub async fn backup(matches: &ArgMatches) {
                 pending_backup_path_clone,
                 fs_clone,
                 pending_backup_watcher_stop_clone,
+                password_clone,
             ));
         });
     };
@@ -405,6 +409,7 @@ async fn watch_pending_backup(
     pending_backup_path: Arc<String>,
     fs: Arc<dyn FS>,
     pending_backup_watcher_stop: Arc<AtomicBool>,
+    password: Option<String>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
 
@@ -420,9 +425,15 @@ async fn watch_pending_backup(
             rmp_serde::to_vec_named(&*pending_backup_guard).unwrap_or_else(|_| Vec::new())
         };
 
-        let _ = fs
-            .write_file(pending_backup_path.as_str(), &bytes_to_write)
-            .await;
+        let compressed_bytes = compress_bytes(&bytes_to_write, 3);
+
+        let _ = write_file_maybe_encrypt(
+            &fs,
+            pending_backup_path.as_str(),
+            &compressed_bytes,
+            password.as_deref(),
+        )
+        .await;
     }
 }
 
@@ -657,6 +668,7 @@ async fn load_pending_backup(
     fs: Arc<dyn FS>,
     key: &str,
     continue_prefix: &str,
+    password: &Option<String>,
 ) -> Result<PendingBackupMatch, String> {
     let indexes_path = format!("{}/indexes", key);
     let files = fs
@@ -680,17 +692,24 @@ async fn load_pending_backup(
     let pending_path = matches
         .pop()
         .ok_or_else(|| "Pending backup match missing".to_string())?;
-    let pending_bytes = fs
-        .read_file(&pending_path)
-        .await
-        .map_err(|e| format!("Failed to read pending backup '{}': {}", pending_path, e))?;
 
-    let pending_backup: PendingBackup = rmp_serde::from_slice(&pending_bytes).map_err(|e| {
-        format!(
-            "Failed to deserialize pending backup '{}': {}",
-            pending_path, e
-        )
-    })?;
+    let pending_result = read_file_maybe_decrypt(
+        &fs,
+        &pending_path,
+        password.as_deref(),
+        "The pending backup is encrypted. Please enter the password to decrypt it.",
+    )
+    .await?;
+
+    let decompressed_bytes = decompress_bytes(&pending_result.bytes);
+
+    let pending_backup: PendingBackup =
+        rmp_serde::from_slice(&decompressed_bytes).map_err(|e| {
+            format!(
+                "Failed to deserialize pending backup '{}': {}",
+                pending_path, e
+            )
+        })?;
 
     Ok(PendingBackupMatch {
         backup: pending_backup,
@@ -804,7 +823,7 @@ async fn get_params(
         Some(continue_prefix) => {
             let storage_config = get_storage(&storage);
             let fs = get_fs(&storage_config, None);
-            Some(load_pending_backup(fs, &key, continue_prefix).await?)
+            Some(load_pending_backup(fs, &key, continue_prefix, &password).await?)
         }
         None => None,
     };
