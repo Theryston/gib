@@ -1,0 +1,7 @@
+[workspace]
+git_only = true
+release_always = false
+git_release_enable = false
+git_tag_name = "v{{version}}"
+publish = false
+release_commits = "^(feat|fix|perf|refactor|docs)(\\(.+\\))?:"
