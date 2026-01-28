@@ -2,10 +2,11 @@ use crate::commands::config::Config;
 use crate::core::crypto::get_password;
 use crate::core::crypto::write_file_maybe_encrypt;
 use crate::core::indexes::{add_backup_summary, create_new_backup, load_chunk_indexes};
+use crate::core::metadata::PendingBackup;
 use crate::core::metadata::{Backup, BackupObject, ChunkIndex};
 use crate::core::permissions::get_file_permissions_with_path;
 use crate::fs::FS;
-use crate::output::{emit_output, emit_progress_message, emit_warning, is_json_mode, JsonProgress};
+use crate::output::{JsonProgress, emit_output, emit_progress_message, emit_warning, is_json_mode};
 use crate::utils::{compress_bytes, get_fs, get_pwd_string, get_storage, handle_error};
 use bytesize::ByteSize;
 use clap::ArgMatches;
@@ -19,7 +20,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use tokio::task::JoinSet;
@@ -87,13 +91,18 @@ pub async fn backup(matches: &ArgMatches) {
         root_path_string.clone(),
         password.clone(),
         Arc::clone(&prev_not_encrypted_but_now_yes),
-        ignore_patterns,
+        ignore_patterns.clone(),
     )
     .await
     {
         Ok(result) => result,
         Err(e) => handle_error(e, Some(&pb)),
     };
+
+    let continue_error_message = format!(
+        "Continue from the place where the backup was interrupted by running: gib backup --continue {}",
+        new_backup.hash[..8].to_string()
+    );
 
     let total_files = root_files.len();
 
@@ -146,6 +155,37 @@ pub async fn backup(matches: &ArgMatches) {
     let written_bytes = Arc::new(Mutex::new(0));
     let deduplicated_bytes = Arc::new(Mutex::new(0));
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILES));
+    let pending_backup = Arc::new(Mutex::new(PendingBackup {
+        message: new_backup.lock().unwrap().message.clone(),
+        compress,
+        chunk_size,
+        ignore_patterns: ignore_patterns.clone(),
+        processed_chunks: Vec::new(),
+    }));
+    let pending_backup_path = Arc::new(format!(
+        "{}/indexes/pending_{}",
+        key,
+        new_backup.lock().unwrap().hash
+    ));
+
+    let pending_backup_watcher_stop = Arc::new(AtomicBool::new(false));
+
+    {
+        let fs_clone = Arc::clone(&fs);
+        let pending_backup_clone = Arc::clone(&pending_backup);
+        let pending_backup_path_clone = pending_backup_path.clone();
+        let pending_backup_watcher_stop_clone = pending_backup_watcher_stop.clone();
+
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(watch_pending_backup(
+                pending_backup_clone,
+                pending_backup_path_clone,
+                fs_clone,
+                pending_backup_watcher_stop_clone,
+            ));
+        });
+    };
 
     let files_stream = stream::iter(root_files);
 
@@ -163,6 +203,7 @@ pub async fn backup(matches: &ArgMatches) {
             let semaphore_clone = Arc::clone(&semaphore);
             let files_set_clone = Arc::clone(&files_set);
             let json_progress_clone = json_progress.clone();
+            let pending_backup_clone = Arc::clone(&pending_backup);
 
             async move {
                 let mut guard = files_set_clone.lock().await;
@@ -182,6 +223,7 @@ pub async fn backup(matches: &ArgMatches) {
                         chunk_size,
                         compress,
                         json_progress_clone,
+                        pending_backup_clone,
                     )
                     .await
                 });
@@ -202,16 +244,19 @@ pub async fn backup(matches: &ArgMatches) {
         }
     }
 
+    pending_backup_watcher_stop.store(true, Ordering::SeqCst);
+
     if !failed_files.is_empty() {
         handle_error(
             format!(
-                "Failed to process {} files:\n{}",
+                "Failed to process {} files:\n{}\n\n{}",
                 failed_files.len(),
                 failed_files
                     .iter()
                     .map(|f| format!("  - {}", f))
                     .collect::<Vec<String>>()
-                    .join("\n")
+                    .join("\n"),
+                &continue_error_message
             ),
             Some(&pb),
         );
@@ -249,11 +294,20 @@ pub async fn backup(matches: &ArgMatches) {
         tokio::join!(write_chunk_index_future, write_backup_file_future);
 
     if write_chunk_index_result.is_err() {
-        handle_error("Failed to write chunk indexes".to_string(), Some(&pb));
+        handle_error(
+            format!(
+                "Failed to write chunk indexes\n\n{}",
+                &continue_error_message
+            ),
+            Some(&pb),
+        );
     }
 
     if write_backup_file_result.is_err() {
-        handle_error("Failed to write backup file".to_string(), Some(&pb));
+        handle_error(
+            format!("Failed to write backup file\n\n{}", &continue_error_message),
+            Some(&pb),
+        );
     }
 
     let written_bytes = *written_bytes.lock().unwrap();
@@ -271,9 +325,17 @@ pub async fn backup(matches: &ArgMatches) {
         )
         .await
         {
-            handle_error(format!("Failed to save backup summary: {}", e), Some(&pb));
+            handle_error(
+                format!(
+                    "Failed to save backup summary: {}\n\n{}",
+                    &e, &continue_error_message
+                ),
+                Some(&pb),
+            );
         }
     }
+
+    let _ = fs.delete_file(&pending_backup_path).await;
 
     if is_json_mode() {
         #[derive(serde::Serialize)]
@@ -316,6 +378,32 @@ pub async fn backup(matches: &ArgMatches) {
     }
 }
 
+async fn watch_pending_backup(
+    pending_backup: Arc<Mutex<PendingBackup>>,
+    pending_backup_path: Arc<String>,
+    fs: Arc<dyn FS>,
+    pending_backup_watcher_stop: Arc<AtomicBool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+
+    loop {
+        interval.tick().await;
+
+        if pending_backup_watcher_stop.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let bytes_to_write = {
+            let pending_backup_guard = pending_backup.lock().unwrap();
+            rmp_serde::to_vec_named(&*pending_backup_guard).unwrap_or_else(|_| Vec::new())
+        };
+
+        let _ = fs
+            .write_file(pending_backup_path.as_str(), &bytes_to_write)
+            .await;
+    }
+}
+
 async fn backup_file(
     file_path: String,
     pb: ProgressBar,
@@ -330,6 +418,7 @@ async fn backup_file(
     chunk_size: u64,
     compress: i32,
     json_progress: Option<Arc<JsonProgress>>,
+    pending_backup: Arc<Mutex<PendingBackup>>,
 ) -> Result<(), String> {
     let mut file = std::fs::File::open(file_path.clone())
         .map_err(|e| format!("Failed to open file: {}", e))?;
@@ -414,6 +503,13 @@ async fn backup_file(
         {
             let mut written_bytes_guard = written_bytes.lock().unwrap();
             *written_bytes_guard += chunk_bytes.len() as u64;
+        }
+
+        {
+            let mut pending_backup_guard = pending_backup.lock().unwrap();
+            pending_backup_guard
+                .processed_chunks
+                .push(chunk_hash.clone());
         }
     }
 

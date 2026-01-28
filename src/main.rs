@@ -87,6 +87,13 @@ fn cli() -> Command {
                         .required(false)
                         .action(clap::ArgAction::Append),
                 )
+                .arg(
+                    Arg::new("continue")
+                        .long("continue")
+                        .help("Continue the backup from an impleted backup")
+                        .action(clap::ArgAction::Append)
+                        .required(false),
+                )
                 .subcommand(
                     Command::new("delete")
                         .about("Delete a backup and its orphaned chunks")
