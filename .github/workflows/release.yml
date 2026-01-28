@@ -17,7 +17,6 @@ env:
 
 jobs:
   prepare:
-    # segurança extra contra loop (mesmo com a limitação do GITHUB_TOKEN)
     if: ${{ github.actor != 'github-actions[bot]' }}
     runs-on: ubuntu-latest
 
@@ -36,7 +35,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # instala binário pré-compilado do release-plz (bem mais rápido que cargo install)
       - name: Install release-plz
         uses: taiki-e/install-action@release-plz
 
@@ -49,7 +47,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Se não mudou nada, não tem release
           if git diff --quiet; then
             echo "released=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -73,10 +70,8 @@ jobs:
           git add -A
           git commit -m "chore(release): ${TAG}"
 
-          # push do commit para main
           git push origin HEAD:main
 
-          # cria/pusha tag
           if git rev-parse "${TAG}" >/dev/null 2>&1; then
             echo "Tag ${TAG} already exists; aborting."
             exit 1
@@ -179,6 +174,12 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout (to provide .git for gh)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -193,12 +194,14 @@ jobs:
           cd release
           sha256sum * > checksums-sha256.txt
 
-      - name: Create/Update GitHub Release and upload assets
+      - name: Create/Update GitHub Release and upload assets (gh)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare.outputs.tag }}
           VERSION: ${{ needs.prepare.outputs.version }}
           SHA: ${{ needs.prepare.outputs.sha }}
+          REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
@@ -208,12 +211,14 @@ jobs:
             prerelease_flag="--prerelease"
           fi
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" release/* --clobber
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber -R "$REPO"
           else
             gh release create "$TAG" release/* \
               --title "Release $TAG" \
               --generate-notes \
+              --verify-tag \
               --target "$SHA" \
+              -R "$REPO" \
               $prerelease_flag
           fi
