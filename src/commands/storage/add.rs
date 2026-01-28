@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
 
-use crate::output::{emit_output, is_json_mode, JsonProgress};
+use crate::output::{JsonProgress, emit_output, is_json_mode};
 use crate::utils::handle_error;
 
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
@@ -75,10 +75,7 @@ pub fn add(matches: &ArgMatches) {
             "local" => 0u8,
             "s3" => 1u8,
             _ => {
-                handle_error(
-                    format!("Unknown storage type '{}'", storage_type),
-                    None,
-                );
+                handle_error(format!("Unknown storage type '{}'", storage_type), None);
             }
         },
     );
@@ -124,8 +121,7 @@ pub fn add(matches: &ArgMatches) {
             || {
                 if is_json_mode() {
                     handle_error(
-                        "Missing required argument: --region (required in --mode json)"
-                            .to_string(),
+                        "Missing required argument: --region (required in --mode json)".to_string(),
                         None,
                     );
                 }
@@ -144,8 +140,7 @@ pub fn add(matches: &ArgMatches) {
             || {
                 if is_json_mode() {
                     handle_error(
-                        "Missing required argument: --bucket (required in --mode json)"
-                            .to_string(),
+                        "Missing required argument: --bucket (required in --mode json)".to_string(),
                         None,
                     );
                 }
@@ -248,8 +243,9 @@ pub fn add(matches: &ArgMatches) {
     let mut storage_path = home_dir.join(".gib").join("storages");
 
     if !storage_path.exists() {
-        std::fs::create_dir_all(&storage_path)
-            .unwrap_or_else(|e| handle_error(format!("Failed to create storage directory: {}", e), None));
+        std::fs::create_dir_all(&storage_path).unwrap_or_else(|e| {
+            handle_error(format!("Failed to create storage directory: {}", e), None)
+        });
     }
 
     storage_path.push(format!("{}.msgpack", name));

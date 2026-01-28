@@ -87,6 +87,13 @@ fn cli() -> Command {
                         .required(false)
                         .action(clap::ArgAction::Append),
                 )
+                .arg(
+                    Arg::new("continue")
+                        .long("continue")
+                        .value_name("BACKUP")
+                        .help("Continue the backup from an incomplete backup")
+                        .required(false),
+                )
                 .subcommand(
                     Command::new("delete")
                         .about("Delete a backup and its orphaned chunks")
@@ -164,7 +171,7 @@ fn cli() -> Command {
                 )
                 .subcommand(
                     Command::new("prune")
-                        .about("Prune not used chunks")
+                        .about("Prune unused chunks and incomplete backups")
                         .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
                         .arg(arg!(-s --storage <STORAGE> "The storage to use").required(false))
                         .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))

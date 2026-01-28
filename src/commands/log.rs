@@ -81,11 +81,11 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
     let storage_path = home_dir.join(".gib").join("storages");
 
     if !storage_path.exists() {
-        return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
+        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
-    let files = std::fs::read_dir(&storage_path)
-        .map_err(|e| format!("Failed to read storages: {}", e))?;
+    let files =
+        std::fs::read_dir(&storage_path).map_err(|e| format!("Failed to read storages: {}", e))?;
 
     let storages_names = &files
         .map(|file| {
@@ -103,7 +103,7 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
         .collect::<Result<Vec<String>, String>>()?;
 
     if storages_names.is_empty() {
-        return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
+        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
     let storage = match matches.get_one::<String>("storage") {
@@ -154,9 +154,8 @@ struct LogEntry {
 impl LogEntry {
     fn from_summary(summary: &BackupSummary) -> Self {
         let timestamp = summary.timestamp.and_then(|ts| {
-            DateTime::<Utc>::from_timestamp_secs(ts as i64).map(|dt| {
-                dt.to_rfc3339_opts(SecondsFormat::Secs, true)
-            })
+            DateTime::<Utc>::from_timestamp_secs(ts as i64)
+                .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
         });
 
         LogEntry {

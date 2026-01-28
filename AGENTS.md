@@ -2,6 +2,8 @@
 
 ## General rules
 - After making changes to the codebase, run `cargo check` to ensure there are no errors, if you find errors please fix them.
+- All the code, texts, anything should be written in English.
+- Make sure that all logs, errors, progress bars, etc... Will be handled correctly in the JSON and Interactive modes.
 
 ## Project Structure & Module Organization
 - `src/main.rs` defines the CLI entry point and subcommand wiring.

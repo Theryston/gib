@@ -3,7 +3,7 @@ use crate::core::indexes::list_backup_summaries;
 use crate::core::metadata::{BackupSummary, ChunkIndex};
 use crate::core::{crypto::get_password, indexes::load_chunk_indexes};
 use crate::fs::FS;
-use crate::output::{emit_output, emit_progress_message, is_json_mode, JsonProgress};
+use crate::output::{JsonProgress, emit_output, emit_progress_message, is_json_mode};
 use crate::utils::{get_fs, get_pwd_string, get_storage, handle_error};
 use clap::ArgMatches;
 use console::style;
@@ -304,11 +304,11 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
     let storage_path = home_dir.join(".gib").join("storages");
 
     if !storage_path.exists() {
-        return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
+        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
-    let files = std::fs::read_dir(&storage_path)
-        .map_err(|e| format!("Failed to read storages: {}", e))?;
+    let files =
+        std::fs::read_dir(&storage_path).map_err(|e| format!("Failed to read storages: {}", e))?;
 
     let storages_names = &files
         .map(|file| {
@@ -326,7 +326,7 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
         .collect::<Result<Vec<String>, String>>()?;
 
     if storages_names.is_empty() {
-        return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
+        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
     let storage = match matches.get_one::<String>("storage") {

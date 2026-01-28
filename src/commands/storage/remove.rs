@@ -4,7 +4,7 @@ use dirs::home_dir;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
 
-use crate::output::{emit_output, is_json_mode, JsonProgress};
+use crate::output::{JsonProgress, emit_output, is_json_mode};
 use crate::utils::handle_error;
 
 pub fn remove(matches: &ArgMatches) {
@@ -20,17 +20,16 @@ pub fn remove(matches: &ArgMatches) {
 
     let storages_names = &files
         .map(|file| {
-            file
-                .unwrap_or_else(|e| {
-                    handle_error(format!("Failed to read storage entry: {}", e), None)
-                })
-                .file_name()
-                .to_string_lossy()
-                .to_string()
-                .split('.')
-                .next()
-                .unwrap()
-                .to_string()
+            file.unwrap_or_else(|e| {
+                handle_error(format!("Failed to read storage entry: {}", e), None)
+            })
+            .file_name()
+            .to_string_lossy()
+            .to_string()
+            .split('.')
+            .next()
+            .unwrap()
+            .to_string()
         })
         .collect::<Vec<String>>();
 

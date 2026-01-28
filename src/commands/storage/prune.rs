@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::crypto::get_password;
 use crate::core::indexes::load_chunk_indexes;
-use crate::output::{emit_output, emit_progress_message, is_json_mode, JsonProgress};
+use crate::output::{JsonProgress, emit_output, emit_progress_message, is_json_mode};
 use crate::utils::{get_fs, get_pwd_string, get_storage, handle_error};
 use clap::ArgMatches;
 use dialoguer::Select;
@@ -61,39 +61,59 @@ pub async fn prune(matches: &ArgMatches) {
     }
 
     let chunks_folder = format!("{}/chunks", key);
+    let indexes_folder = format!("{}/indexes", key);
 
     let chunks = match fs.list_files(&chunks_folder).await {
         Ok(chunks) => chunks,
         Err(e) => handle_error(e.to_string(), Some(&pb)),
     };
 
-    let chunks_to_prune = chunks
-        .iter()
-        .filter(|chunk| {
-            let parts: Vec<&str> = chunk.split('/').collect();
-            let key = if parts.len() >= 2 {
-                format!("{}{}", parts[parts.len() - 2], parts[parts.len() - 1])
-            } else {
-                chunk.to_string()
-            };
+    let pending_backups = match fs.list_files(&indexes_folder).await {
+        Ok(indexes) => indexes
+            .iter()
+            .filter(|index| {
+                let last_part: &str = index.split('/').last().unwrap_or(&"");
 
-            !chunk_indexes.contains_key(&key)
-        })
-        .cloned()
-        .collect::<Vec<String>>();
+                last_part.starts_with("pending_")
+            })
+            .cloned()
+            .collect::<Vec<String>>(),
+        Err(e) => handle_error(e.to_string(), Some(&pb)),
+    };
+
+    let items_to_prune = {
+        let mut items_to_prune = chunks
+            .iter()
+            .filter(|chunk| {
+                let parts: Vec<&str> = chunk.split('/').collect();
+                let key = if parts.len() >= 2 {
+                    format!("{}{}", parts[parts.len() - 2], parts[parts.len() - 1])
+                } else {
+                    chunk.to_string()
+                };
+
+                !chunk_indexes.contains_key(&key)
+            })
+            .cloned()
+            .collect::<Vec<String>>();
+
+        items_to_prune.extend(pending_backups);
+
+        items_to_prune
+    };
 
     pb.finish_and_clear();
 
-    if chunks_to_prune.is_empty() {
+    if items_to_prune.is_empty() {
         if is_json_mode() {
             #[derive(serde::Serialize)]
             struct PruneOutput {
-                deleted_chunks: usize,
+                deleted_items: usize,
                 elapsed_ms: u64,
             }
 
             let payload = PruneOutput {
-                deleted_chunks: 0,
+                deleted_items: 0,
                 elapsed_ms: started_at.elapsed().as_millis() as u64,
             };
             emit_output(&payload);
@@ -116,8 +136,8 @@ pub async fn prune(matches: &ArgMatches) {
     } else {
         dialoguer::Confirm::new()
             .with_prompt(format!(
-                "Seams like you have {} chunks that are not used in the repository. Are you sure you want to DELETE them?",
-                chunks_to_prune.len()
+                "Seems like you have {} items to prune (not used chunks and pending backups). Are you sure you want to DELETE them?",
+                items_to_prune.len()
             ))
             .interact()
             .unwrap_or_else(|e| handle_error(format!("Error: {}", e), None))
@@ -127,12 +147,12 @@ pub async fn prune(matches: &ArgMatches) {
         if is_json_mode() {
             #[derive(serde::Serialize)]
             struct PruneOutput {
-                deleted_chunks: usize,
+                deleted_items: usize,
                 aborted: bool,
             }
 
             let payload = PruneOutput {
-                deleted_chunks: 0,
+                deleted_items: 0,
                 aborted: true,
             };
             emit_output(&payload);
@@ -143,7 +163,7 @@ pub async fn prune(matches: &ArgMatches) {
     }
 
     let json_progress = if is_json_mode() {
-        let progress = JsonProgress::new(chunks_to_prune.len() as u64);
+        let progress = JsonProgress::new(items_to_prune.len() as u64);
         progress.set_message("Deleting chunks...");
         Some(progress)
     } else {
@@ -153,7 +173,7 @@ pub async fn prune(matches: &ArgMatches) {
     let pb = if is_json_mode() {
         ProgressBar::hidden()
     } else {
-        let pb = ProgressBar::new(chunks_to_prune.len() as u64);
+        let pb = ProgressBar::new(items_to_prune.len() as u64);
         pb.enable_steady_tick(Duration::from_millis(100));
         pb.set_style(
             ProgressStyle::with_template(
@@ -168,7 +188,7 @@ pub async fn prune(matches: &ArgMatches) {
     let chunks_set = Arc::new(TokioMutex::new(JoinSet::new()));
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CHUNKS));
 
-    let chunks_stream = stream::iter(&chunks_to_prune);
+    let chunks_stream = stream::iter(&items_to_prune);
 
     chunks_stream
         .for_each_concurrent(MAX_CONCURRENT_CHUNKS, |chunk| {
@@ -226,12 +246,12 @@ pub async fn prune(matches: &ArgMatches) {
     if is_json_mode() {
         #[derive(serde::Serialize)]
         struct PruneOutput {
-            deleted_chunks: usize,
+            deleted_items: usize,
             elapsed_ms: u64,
         }
 
         let payload = PruneOutput {
-            deleted_chunks: chunks_to_prune.len(),
+            deleted_items: items_to_prune.len(),
             elapsed_ms: started_at.elapsed().as_millis() as u64,
         };
         emit_output(&payload);
@@ -240,8 +260,8 @@ pub async fn prune(matches: &ArgMatches) {
         pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
         pb.set_prefix("OK");
         pb.finish_with_message(format!(
-            "Deleted {} chunks ({:.2?})",
-            chunks_to_prune.len(),
+            "Deleted {} items ({:.2?})",
+            items_to_prune.len(),
             elapsed,
         ));
     }
@@ -272,11 +292,11 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
     let storage_path = home_dir.join(".gib").join("storages");
 
     if !storage_path.exists() {
-        return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
+        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
-    let files = std::fs::read_dir(&storage_path)
-        .map_err(|e| format!("Failed to read storages: {}", e))?;
+    let files =
+        std::fs::read_dir(&storage_path).map_err(|e| format!("Failed to read storages: {}", e))?;
 
     let storages_names = &files
         .map(|file| {
@@ -294,7 +314,7 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
         .collect::<Result<Vec<String>, String>>()?;
 
     if storages_names.is_empty() {
-        return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
+        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
     let storage = match matches.get_one::<String>("storage") {

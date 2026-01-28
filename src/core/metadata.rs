@@ -33,3 +33,12 @@ pub(crate) struct BackupObject {
 pub(crate) struct ChunkIndex {
     pub(crate) refcount: u32,
 }
+
+#[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
+pub(crate) struct PendingBackup {
+    pub(crate) message: String,
+    pub(crate) compress: i32,
+    pub(crate) chunk_size: u64,
+    pub(crate) ignore_patterns: Vec<String>,
+    pub(crate) processed_chunks: Vec<String>,
+}

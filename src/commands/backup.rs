@@ -1,11 +1,14 @@
 use crate::commands::config::Config;
 use crate::core::crypto::get_password;
+use crate::core::crypto::read_file_maybe_decrypt;
 use crate::core::crypto::write_file_maybe_encrypt;
 use crate::core::indexes::{add_backup_summary, create_new_backup, load_chunk_indexes};
+use crate::core::metadata::PendingBackup;
 use crate::core::metadata::{Backup, BackupObject, ChunkIndex};
 use crate::core::permissions::get_file_permissions_with_path;
 use crate::fs::FS;
-use crate::output::{emit_output, emit_progress_message, emit_warning, is_json_mode, JsonProgress};
+use crate::output::{JsonProgress, emit_output, emit_progress_message, emit_warning, is_json_mode};
+use crate::utils::decompress_bytes;
 use crate::utils::{compress_bytes, get_fs, get_pwd_string, get_storage, handle_error};
 use bytesize::ByteSize;
 use clap::ArgMatches;
@@ -19,7 +22,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use tokio::task::JoinSet;
@@ -27,11 +33,22 @@ use tokio::task::JoinSet;
 const MAX_CONCURRENT_FILES: usize = 100;
 
 pub async fn backup(matches: &ArgMatches) {
-    let (key, message, root_path_string, storage, compress, password, chunk_size, ignore_patterns) =
-        match get_params(matches) {
-            Ok(params) => params,
-            Err(e) => handle_error(e, None),
-        };
+    let (
+        key,
+        message,
+        root_path_string,
+        storage,
+        compress,
+        password,
+        chunk_size,
+        ignore_patterns,
+        received_pending_backup,
+    ) = match get_params(matches).await {
+        Ok(params) => params,
+        Err(e) => handle_error(e, None),
+    };
+
+    let received_pending_backup = Arc::new(Mutex::new(received_pending_backup));
 
     let home_dir = match home_dir() {
         Some(dir) => dir,
@@ -41,7 +58,7 @@ pub async fn backup(matches: &ArgMatches) {
     let config_path = home_dir.join(".gib").join("config.msgpack");
 
     if !config_path.exists() {
-        handle_error("Seams like you didn't configure your backup tool yet. Run 'gib config' to configure your backup tool.".to_string(), None);
+        handle_error("Seems like you didn't configure your backup tool yet. Run 'gib config' to configure your backup tool.".to_string(), None);
     }
 
     let config_bytes = match std::fs::read(&config_path) {
@@ -87,13 +104,18 @@ pub async fn backup(matches: &ArgMatches) {
         root_path_string.clone(),
         password.clone(),
         Arc::clone(&prev_not_encrypted_but_now_yes),
-        ignore_patterns,
+        ignore_patterns.clone(),
     )
     .await
     {
         Ok(result) => result,
         Err(e) => handle_error(e, Some(&pb)),
     };
+
+    let continue_error_message = format!(
+        "Continue from the place where the backup was interrupted by running: gib backup --continue {}",
+        new_backup.hash[..8].to_string()
+    );
 
     let total_files = root_files.len();
 
@@ -146,6 +168,39 @@ pub async fn backup(matches: &ArgMatches) {
     let written_bytes = Arc::new(Mutex::new(0));
     let deduplicated_bytes = Arc::new(Mutex::new(0));
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILES));
+    let pending_backup = Arc::new(Mutex::new(PendingBackup {
+        message: new_backup.lock().unwrap().message.clone(),
+        compress,
+        chunk_size,
+        ignore_patterns: ignore_patterns.clone(),
+        processed_chunks: Vec::new(),
+    }));
+    let pending_backup_path = Arc::new(format!(
+        "{}/indexes/pending_{}",
+        key,
+        new_backup.lock().unwrap().hash
+    ));
+
+    let pending_backup_watcher_stop = Arc::new(AtomicBool::new(false));
+
+    {
+        let fs_clone = Arc::clone(&fs);
+        let pending_backup_clone = Arc::clone(&pending_backup);
+        let pending_backup_path_clone = pending_backup_path.clone();
+        let pending_backup_watcher_stop_clone = pending_backup_watcher_stop.clone();
+        let password_clone = password.clone();
+
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(watch_pending_backup(
+                pending_backup_clone,
+                pending_backup_path_clone,
+                fs_clone,
+                pending_backup_watcher_stop_clone,
+                password_clone,
+            ));
+        });
+    };
 
     let files_stream = stream::iter(root_files);
 
@@ -163,6 +218,8 @@ pub async fn backup(matches: &ArgMatches) {
             let semaphore_clone = Arc::clone(&semaphore);
             let files_set_clone = Arc::clone(&files_set);
             let json_progress_clone = json_progress.clone();
+            let pending_backup_clone = Arc::clone(&pending_backup);
+            let received_pending_backup_clone = Arc::clone(&received_pending_backup);
 
             async move {
                 let mut guard = files_set_clone.lock().await;
@@ -182,6 +239,8 @@ pub async fn backup(matches: &ArgMatches) {
                         chunk_size,
                         compress,
                         json_progress_clone,
+                        pending_backup_clone,
+                        received_pending_backup_clone,
                     )
                     .await
                 });
@@ -202,16 +261,19 @@ pub async fn backup(matches: &ArgMatches) {
         }
     }
 
+    pending_backup_watcher_stop.store(true, Ordering::SeqCst);
+
     if !failed_files.is_empty() {
         handle_error(
             format!(
-                "Failed to process {} files:\n{}",
+                "Failed to process {} files:\n{}\n\n{}",
                 failed_files.len(),
                 failed_files
                     .iter()
                     .map(|f| format!("  - {}", f))
                     .collect::<Vec<String>>()
-                    .join("\n")
+                    .join("\n"),
+                &continue_error_message
             ),
             Some(&pb),
         );
@@ -249,11 +311,20 @@ pub async fn backup(matches: &ArgMatches) {
         tokio::join!(write_chunk_index_future, write_backup_file_future);
 
     if write_chunk_index_result.is_err() {
-        handle_error("Failed to write chunk indexes".to_string(), Some(&pb));
+        handle_error(
+            format!(
+                "Failed to write chunk indexes\n\n{}",
+                &continue_error_message
+            ),
+            Some(&pb),
+        );
     }
 
     if write_backup_file_result.is_err() {
-        handle_error("Failed to write backup file".to_string(), Some(&pb));
+        handle_error(
+            format!("Failed to write backup file\n\n{}", &continue_error_message),
+            Some(&pb),
+        );
     }
 
     let written_bytes = *written_bytes.lock().unwrap();
@@ -271,8 +342,25 @@ pub async fn backup(matches: &ArgMatches) {
         )
         .await
         {
-            handle_error(format!("Failed to save backup summary: {}", e), Some(&pb));
+            handle_error(
+                format!(
+                    "Failed to save backup summary: {}\n\n{}",
+                    &e, &continue_error_message
+                ),
+                Some(&pb),
+            );
         }
+    }
+
+    let _ = fs.delete_file(&pending_backup_path).await;
+
+    {
+        match received_pending_backup.lock().unwrap().take() {
+            Some(pending_backup) => {
+                let _ = fs.delete_file(&pending_backup.path).await;
+            }
+            None => {}
+        };
     }
 
     if is_json_mode() {
@@ -316,6 +404,39 @@ pub async fn backup(matches: &ArgMatches) {
     }
 }
 
+async fn watch_pending_backup(
+    pending_backup: Arc<Mutex<PendingBackup>>,
+    pending_backup_path: Arc<String>,
+    fs: Arc<dyn FS>,
+    pending_backup_watcher_stop: Arc<AtomicBool>,
+    password: Option<String>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+
+    loop {
+        interval.tick().await;
+
+        if pending_backup_watcher_stop.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let bytes_to_write = {
+            let pending_backup_guard = pending_backup.lock().unwrap();
+            rmp_serde::to_vec_named(&*pending_backup_guard).unwrap_or_else(|_| Vec::new())
+        };
+
+        let compressed_bytes = compress_bytes(&bytes_to_write, 3);
+
+        let _ = write_file_maybe_encrypt(
+            &fs,
+            pending_backup_path.as_str(),
+            &compressed_bytes,
+            password.as_deref(),
+        )
+        .await;
+    }
+}
+
 async fn backup_file(
     file_path: String,
     pb: ProgressBar,
@@ -330,6 +451,8 @@ async fn backup_file(
     chunk_size: u64,
     compress: i32,
     json_progress: Option<Arc<JsonProgress>>,
+    pending_backup: Arc<Mutex<PendingBackup>>,
+    received_pending_backup: Arc<Mutex<Option<PendingBackupMatch>>>,
 ) -> Result<(), String> {
     let mut file = std::fs::File::open(file_path.clone())
         .map_err(|e| format!("Failed to open file: {}", e))?;
@@ -370,11 +493,26 @@ async fn backup_file(
         };
 
         if is_in_chunk_indexes {
-            {
-                let mut deduplicated_bytes_guard = deduplicated_bytes.lock().unwrap();
-                *deduplicated_bytes_guard += chunk_bytes.len() as u64;
-            }
+            let mut deduplicated_bytes_guard = deduplicated_bytes.lock().unwrap();
+            *deduplicated_bytes_guard += chunk_bytes.len() as u64;
             continue;
+        }
+
+        {
+            let received_pending_backup_guard = received_pending_backup.lock().unwrap();
+
+            let exists = match received_pending_backup_guard.as_ref() {
+                Some(pending_backup) => {
+                    pending_backup.backup.processed_chunks.contains(&chunk_hash)
+                }
+                None => false,
+            };
+
+            if exists {
+                let mut written_bytes_guard = written_bytes.lock().unwrap();
+                *written_bytes_guard += chunk_bytes.len() as u64;
+                continue;
+            }
         }
 
         let compressed_chunk_bytes = compress_bytes(chunk_bytes, compress);
@@ -414,6 +552,13 @@ async fn backup_file(
         {
             let mut written_bytes_guard = written_bytes.lock().unwrap();
             *written_bytes_guard += chunk_bytes.len() as u64;
+        }
+
+        {
+            let mut pending_backup_guard = pending_backup.lock().unwrap();
+            pending_backup_guard
+                .processed_chunks
+                .push(chunk_hash.clone());
         }
     }
 
@@ -514,7 +659,65 @@ async fn load_metadata(
     Ok((new_backup, root_files, chunk_indexes))
 }
 
-fn get_params(
+struct PendingBackupMatch {
+    backup: PendingBackup,
+    path: String,
+}
+
+async fn load_pending_backup(
+    fs: Arc<dyn FS>,
+    key: &str,
+    continue_prefix: &str,
+    password: &Option<String>,
+) -> Result<PendingBackupMatch, String> {
+    let indexes_path = format!("{}/indexes", key);
+    let files = fs
+        .list_files(&indexes_path)
+        .await
+        .map_err(|e| format!("Failed to list indexes in '{}': {}", indexes_path, e))?;
+
+    let pending_prefix = format!("{}/indexes/pending_{}", key, continue_prefix);
+    let mut matches: Vec<String> = files
+        .into_iter()
+        .filter(|path| path.starts_with(&pending_prefix))
+        .collect();
+
+    matches.sort();
+    matches.dedup();
+
+    if matches.is_empty() {
+        return Err(format!("No pending backup found for '{}'", continue_prefix));
+    }
+
+    let pending_path = matches
+        .pop()
+        .ok_or_else(|| "Pending backup match missing".to_string())?;
+
+    let pending_result = read_file_maybe_decrypt(
+        &fs,
+        &pending_path,
+        password.as_deref(),
+        "The pending backup is encrypted. Please enter the password to decrypt it.",
+    )
+    .await?;
+
+    let decompressed_bytes = decompress_bytes(&pending_result.bytes);
+
+    let pending_backup: PendingBackup =
+        rmp_serde::from_slice(&decompressed_bytes).map_err(|e| {
+            format!(
+                "Failed to deserialize pending backup '{}': {}",
+                pending_path, e
+            )
+        })?;
+
+    Ok(PendingBackupMatch {
+        backup: pending_backup,
+        path: pending_path,
+    })
+}
+
+async fn get_params(
     matches: &ArgMatches,
 ) -> Result<
     (
@@ -526,6 +729,7 @@ fn get_params(
         Option<String>,
         u64,
         Vec<String>,
+        Option<PendingBackupMatch>,
     ),
     String,
 > {
@@ -559,26 +763,11 @@ fn get_params(
         .get_one::<String>("key")
         .map_or_else(|| default_key, |key| key.to_string());
 
-    let message = match matches.get_one::<String>("message") {
-        Some(message) => message.to_string(),
-        None => {
-            if is_json_mode() {
-                return Err(
-                    "Missing required argument: --message (required in --mode json)".to_string(),
-                );
-            }
-            Input::<String>::new()
-                .with_prompt("Enter the backup message")
-                .interact_text()
-                .map_err(|e| format!("{}", e))?
-        }
-    };
-
     let home_dir = home_dir().unwrap();
     let storage_path = home_dir.join(".gib").join("storages");
 
     if !storage_path.exists() {
-        return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
+        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
     let files =
@@ -600,7 +789,7 @@ fn get_params(
         .collect::<Result<Vec<String>, String>>()?;
 
     if storages_names.is_empty() {
-        return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
+        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
     let storage = match matches.get_one::<String>("storage") {
@@ -622,15 +811,6 @@ fn get_params(
         }
     };
 
-    let compress: i32 = matches
-        .get_one::<String>("compress")
-        .map_or_else(|| 3, |compress| compress.parse().unwrap());
-
-    let chunk_size: u64 = matches.get_one::<String>("chunk-size").map_or_else(
-        || parse_size("5 MB").unwrap(),
-        |chunk_size| parse_size(chunk_size).unwrap(),
-    );
-
     let exists = storages_names
         .iter()
         .any(|storage_name| storage_name == &storage);
@@ -639,10 +819,104 @@ fn get_params(
         return Err(format!("Storage '{}' not found", storage));
     }
 
+    let pending_backup = match matches.get_one::<String>("continue") {
+        Some(continue_prefix) => {
+            let storage_config = get_storage(&storage);
+            let fs = get_fs(&storage_config, None);
+            Some(load_pending_backup(fs, &key, continue_prefix, &password).await?)
+        }
+        None => None,
+    };
+
+    let mut reused_data = Vec::new();
+
+    if let Some(pending) = &pending_backup
+        && !pending.backup.processed_chunks.is_empty()
+    {
+        reused_data.push("uploaded chunks".to_string());
+    }
+
+    let message = match matches.get_one::<String>("message") {
+        Some(message) => message.to_string(),
+        None => {
+            if let Some(pending) = &pending_backup
+                && !pending.backup.message.is_empty()
+            {
+                reused_data.push("message".to_string());
+                pending.backup.message.clone()
+            } else {
+                if is_json_mode() {
+                    return Err(
+                        "Missing required argument: --message (required in --mode json)"
+                            .to_string(),
+                    );
+                }
+                Input::<String>::new()
+                    .with_prompt("Enter the backup message")
+                    .interact_text()
+                    .map_err(|e| format!("{}", e))?
+            }
+        }
+    };
+
+    let compress: i32 = matches.get_one::<String>("compress").map_or_else(
+        || {
+            if let Some(pending) = &pending_backup
+                && pending.backup.compress != 3
+            {
+                reused_data.push("compress".to_string());
+                pending.backup.compress
+            } else {
+                3
+            }
+        },
+        |compress| compress.parse().unwrap_or(3),
+    );
+
+    let chunk_size: u64 = matches.get_one::<String>("chunk-size").map_or_else(
+        || {
+            if let Some(pending) = &pending_backup
+                && pending.backup.chunk_size != parse_size("5 MB").unwrap()
+            {
+                reused_data.push("chunk size".to_string());
+                pending.backup.chunk_size
+            } else {
+                parse_size("5 MB").unwrap()
+            }
+        },
+        |chunk_size| parse_size(chunk_size).unwrap(),
+    );
+
     let ignore_patterns: Vec<String> = matches
         .get_many::<String>("ignore")
         .map(|values| values.map(|s| s.to_string()).collect())
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            if let Some(pending) = &pending_backup
+                && !pending.backup.ignore_patterns.is_empty()
+            {
+                reused_data.push("ignored files".to_string());
+                pending.backup.ignore_patterns.clone()
+            } else {
+                Vec::new()
+            }
+        });
+
+    if !reused_data.is_empty() {
+        let pending_name = pending_backup
+            .as_ref()
+            .and_then(|pending| pending.path.rsplit('/').next())
+            .map_or("pending backup".to_string(), |pending| {
+                let hash = pending.replace("pending_", "");
+                hash[..8].to_string()
+            });
+        let warning = format!("Reusing from {}: {}", pending_name, reused_data.join(", "));
+
+        if is_json_mode() {
+            emit_warning(&warning, "pending_backup_reuse");
+        } else {
+            println!("{}", style(warning).yellow());
+        }
+    }
 
     Ok((
         key,
@@ -653,5 +927,6 @@ fn get_params(
         password,
         chunk_size,
         ignore_patterns,
+        pending_backup,
     ))
 }

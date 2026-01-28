@@ -99,11 +99,13 @@ pub fn get_storage(name: &str) -> Storage {
         .join(".gib")
         .join("storages")
         .join(format!("{}.msgpack", name));
-    let contents = std::fs::read(&storage_path)
-        .unwrap_or_else(|e| handle_error(format!("Failed to read storage '{}': {}", name, e), None));
+    let contents = std::fs::read(&storage_path).unwrap_or_else(|e| {
+        handle_error(format!("Failed to read storage '{}': {}", name, e), None)
+    });
 
-    rmp_serde::from_slice(&contents)
-        .unwrap_or_else(|e| handle_error(format!("Failed to parse storage '{}': {}", name, e), None))
+    rmp_serde::from_slice(&contents).unwrap_or_else(|e| {
+        handle_error(format!("Failed to parse storage '{}': {}", name, e), None)
+    })
 }
 
 pub fn handle_error(error: String, pb: Option<&ProgressBar>) -> ! {

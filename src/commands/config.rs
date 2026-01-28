@@ -6,7 +6,7 @@ use rmp_serde::Serializer;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use crate::output::{emit_output, is_json_mode, JsonProgress};
+use crate::output::{JsonProgress, emit_output, is_json_mode};
 use crate::utils::handle_error;
 
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
@@ -19,8 +19,7 @@ pub fn config(matches: &ArgMatches) {
         || {
             if is_json_mode() {
                 handle_error(
-                    "Missing required argument: --author (required in --mode json)"
-                        .to_string(),
+                    "Missing required argument: --author (required in --mode json)".to_string(),
                     None,
                 );
             }
@@ -76,8 +75,9 @@ pub fn config(matches: &ArgMatches) {
     let mut config_path = home_dir.join(".gib");
 
     if !config_path.exists() {
-        std::fs::create_dir_all(&config_path)
-            .unwrap_or_else(|e| handle_error(format!("Failed to create config directory: {}", e), None));
+        std::fs::create_dir_all(&config_path).unwrap_or_else(|e| {
+            handle_error(format!("Failed to create config directory: {}", e), None)
+        });
     }
 
     config_path.push("config.msgpack");
