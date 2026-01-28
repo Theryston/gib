@@ -81,8 +81,8 @@ pub async fn prune(matches: &ArgMatches) {
         Err(e) => handle_error(e.to_string(), Some(&pb)),
     };
 
-    let chunks_to_prune = {
-        let mut chunks_to_prune = chunks
+    let items_to_prune = {
+        let mut items_to_prune = chunks
             .iter()
             .filter(|chunk| {
                 let parts: Vec<&str> = chunk.split('/').collect();
@@ -97,14 +97,14 @@ pub async fn prune(matches: &ArgMatches) {
             .cloned()
             .collect::<Vec<String>>();
 
-        chunks_to_prune.extend(pending_backups);
+        items_to_prune.extend(pending_backups);
 
-        chunks_to_prune
+        items_to_prune
     };
 
     pb.finish_and_clear();
 
-    if chunks_to_prune.is_empty() {
+    if items_to_prune.is_empty() {
         if is_json_mode() {
             #[derive(serde::Serialize)]
             struct PruneOutput {
@@ -136,8 +136,8 @@ pub async fn prune(matches: &ArgMatches) {
     } else {
         dialoguer::Confirm::new()
             .with_prompt(format!(
-                "Seams like you have {} chunks that are not used in the repository. Are you sure you want to DELETE them?",
-                chunks_to_prune.len()
+                "Seams like you have {} items to prune (not used chunks and pending backups). Are you sure you want to DELETE them?",
+                items_to_prune.len()
             ))
             .interact()
             .unwrap_or_else(|e| handle_error(format!("Error: {}", e), None))
@@ -163,7 +163,7 @@ pub async fn prune(matches: &ArgMatches) {
     }
 
     let json_progress = if is_json_mode() {
-        let progress = JsonProgress::new(chunks_to_prune.len() as u64);
+        let progress = JsonProgress::new(items_to_prune.len() as u64);
         progress.set_message("Deleting chunks...");
         Some(progress)
     } else {
@@ -173,7 +173,7 @@ pub async fn prune(matches: &ArgMatches) {
     let pb = if is_json_mode() {
         ProgressBar::hidden()
     } else {
-        let pb = ProgressBar::new(chunks_to_prune.len() as u64);
+        let pb = ProgressBar::new(items_to_prune.len() as u64);
         pb.enable_steady_tick(Duration::from_millis(100));
         pb.set_style(
             ProgressStyle::with_template(
@@ -188,7 +188,7 @@ pub async fn prune(matches: &ArgMatches) {
     let chunks_set = Arc::new(TokioMutex::new(JoinSet::new()));
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CHUNKS));
 
-    let chunks_stream = stream::iter(&chunks_to_prune);
+    let chunks_stream = stream::iter(&items_to_prune);
 
     chunks_stream
         .for_each_concurrent(MAX_CONCURRENT_CHUNKS, |chunk| {
@@ -251,7 +251,7 @@ pub async fn prune(matches: &ArgMatches) {
         }
 
         let payload = PruneOutput {
-            deleted_chunks: chunks_to_prune.len(),
+            deleted_chunks: items_to_prune.len(),
             elapsed_ms: started_at.elapsed().as_millis() as u64,
         };
         emit_output(&payload);
@@ -261,7 +261,7 @@ pub async fn prune(matches: &ArgMatches) {
         pb.set_prefix("OK");
         pb.finish_with_message(format!(
             "Deleted {} chunks ({:.2?})",
-            chunks_to_prune.len(),
+            items_to_prune.len(),
             elapsed,
         ));
     }

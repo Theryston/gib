@@ -46,6 +46,8 @@ pub async fn backup(matches: &ArgMatches) {
         Err(e) => handle_error(e, None),
     };
 
+    let received_pending_backup = Arc::new(Mutex::new(received_pending_backup));
+
     let home_dir = match home_dir() {
         Some(dir) => dir,
         None => handle_error("Failed to get home directory".to_string(), None),
@@ -213,6 +215,7 @@ pub async fn backup(matches: &ArgMatches) {
             let files_set_clone = Arc::clone(&files_set);
             let json_progress_clone = json_progress.clone();
             let pending_backup_clone = Arc::clone(&pending_backup);
+            let received_pending_backup_clone = Arc::clone(&received_pending_backup);
 
             async move {
                 let mut guard = files_set_clone.lock().await;
@@ -233,6 +236,7 @@ pub async fn backup(matches: &ArgMatches) {
                         compress,
                         json_progress_clone,
                         pending_backup_clone,
+                        received_pending_backup_clone,
                     )
                     .await
                 });
@@ -346,12 +350,14 @@ pub async fn backup(matches: &ArgMatches) {
 
     let _ = fs.delete_file(&pending_backup_path).await;
 
-    match received_pending_backup {
-        Some(pending_backup) => {
-            let _ = fs.delete_file(&pending_backup.path).await;
-        }
-        None => {}
-    };
+    {
+        match received_pending_backup.lock().unwrap().take() {
+            Some(pending_backup) => {
+                let _ = fs.delete_file(&pending_backup.path).await;
+            }
+            None => {}
+        };
+    }
 
     if is_json_mode() {
         #[derive(serde::Serialize)]
@@ -435,6 +441,7 @@ async fn backup_file(
     compress: i32,
     json_progress: Option<Arc<JsonProgress>>,
     pending_backup: Arc<Mutex<PendingBackup>>,
+    received_pending_backup: Arc<Mutex<Option<PendingBackupMatch>>>,
 ) -> Result<(), String> {
     let mut file = std::fs::File::open(file_path.clone())
         .map_err(|e| format!("Failed to open file: {}", e))?;
@@ -475,11 +482,26 @@ async fn backup_file(
         };
 
         if is_in_chunk_indexes {
-            {
-                let mut deduplicated_bytes_guard = deduplicated_bytes.lock().unwrap();
-                *deduplicated_bytes_guard += chunk_bytes.len() as u64;
-            }
+            let mut deduplicated_bytes_guard = deduplicated_bytes.lock().unwrap();
+            *deduplicated_bytes_guard += chunk_bytes.len() as u64;
             continue;
+        }
+
+        {
+            let received_pending_backup_guard = received_pending_backup.lock().unwrap();
+
+            let exists = match received_pending_backup_guard.as_ref() {
+                Some(pending_backup) => {
+                    pending_backup.backup.processed_chunks.contains(&chunk_hash)
+                }
+                None => false,
+            };
+
+            if exists {
+                let mut written_bytes_guard = written_bytes.lock().unwrap();
+                *written_bytes_guard += chunk_bytes.len() as u64;
+                continue;
+            }
         }
 
         let compressed_chunk_bytes = compress_bytes(chunk_bytes, compress);
@@ -652,10 +674,7 @@ async fn load_pending_backup(
     matches.dedup();
 
     if matches.is_empty() {
-        return Err(format!(
-            "No pending backup found starting with '{}'",
-            pending_prefix
-        ));
+        return Err(format!("No pending backup found for '{}'", continue_prefix));
     }
 
     let pending_path = matches
@@ -790,7 +809,13 @@ async fn get_params(
         None => None,
     };
 
-    let mut reused_fields = Vec::new();
+    let mut reused_data = Vec::new();
+
+    if let Some(pending) = &pending_backup
+        && !pending.backup.processed_chunks.is_empty()
+    {
+        reused_data.push("uploaded chunks".to_string());
+    }
 
     let message = match matches.get_one::<String>("message") {
         Some(message) => message.to_string(),
@@ -798,7 +823,7 @@ async fn get_params(
             if let Some(pending) = &pending_backup
                 && !pending.backup.message.is_empty()
             {
-                reused_fields.push("message".to_string());
+                reused_data.push("message".to_string());
                 pending.backup.message.clone()
             } else {
                 if is_json_mode() {
@@ -820,7 +845,7 @@ async fn get_params(
             if let Some(pending) = &pending_backup
                 && pending.backup.compress != 3
             {
-                reused_fields.push("compress".to_string());
+                reused_data.push("compress".to_string());
                 pending.backup.compress
             } else {
                 3
@@ -834,7 +859,7 @@ async fn get_params(
             if let Some(pending) = &pending_backup
                 && pending.backup.chunk_size != parse_size("5 MB").unwrap()
             {
-                reused_fields.push("chunk_size".to_string());
+                reused_data.push("chunk size".to_string());
                 pending.backup.chunk_size
             } else {
                 parse_size("5 MB").unwrap()
@@ -850,14 +875,14 @@ async fn get_params(
             if let Some(pending) = &pending_backup
                 && !pending.backup.ignore_patterns.is_empty()
             {
-                reused_fields.push("ignore_patterns".to_string());
+                reused_data.push("ignored files".to_string());
                 pending.backup.ignore_patterns.clone()
             } else {
                 Vec::new()
             }
         });
 
-    if !reused_fields.is_empty() {
+    if !reused_data.is_empty() {
         let pending_name = pending_backup
             .as_ref()
             .and_then(|pending| pending.path.rsplit('/').next())
@@ -865,11 +890,7 @@ async fn get_params(
                 let hash = pending.replace("pending_", "");
                 hash[..8].to_string()
             });
-        let warning = format!(
-            "Reusing metadata from {}: {}",
-            pending_name,
-            reused_fields.join(", ")
-        );
+        let warning = format!("Reusing from {}: {}", pending_name, reused_data.join(", "));
 
         if is_json_mode() {
             emit_warning(&warning, "pending_backup_reuse");
