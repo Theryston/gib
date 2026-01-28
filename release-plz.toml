@@ -4,5 +4,4 @@ release_always = false
 git_release_enable = false
 git_tag_name = "v{{version}}"
 publish = false
-pr_labels = ["release"]
 release_commits = "^(feat|fix|perf|refactor|docs)(\\(.+\\))?:"

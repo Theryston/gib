@@ -1,22 +1,100 @@
-name: Build and Release
+name: Release (auto bump + build + GitHub Release)
 
 on:
-  pull_request:
+  push:
     branches: [main]
-    types: [closed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   BINARY_NAME: gib
 
-permissions:
-  contents: write
-
 jobs:
+  prepare:
+    # segurança extra contra loop (mesmo com a limitação do GITHUB_TOKEN)
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+
+    outputs:
+      released: ${{ steps.out.outputs.released }}
+      version: ${{ steps.out.outputs.version }}
+      tag: ${{ steps.out.outputs.tag }}
+      sha: ${{ steps.out.outputs.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # instala binário pré-compilado do release-plz (bem mais rápido que cargo install)
+      - name: Install release-plz
+        uses: taiki-e/install-action@release-plz
+
+      - name: Run release-plz update (bump + changelog)
+        run: release-plz update
+
+      - name: Commit + push + tag (only if changed)
+        id: out
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Se não mudou nada, não tem release
+          if git diff --quiet; then
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          VERSION="$(python - <<'PY'
+          import tomllib, pathlib
+          data = tomllib.loads(pathlib.Path("Cargo.toml").read_text("utf-8"))
+          print(data["package"]["version"])
+          PY
+          )"
+
+          TAG="v${VERSION}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"       >> "$GITHUB_OUTPUT"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          git commit -m "chore(release): ${TAG}"
+
+          # push do commit para main
+          git push origin HEAD:main
+
+          # cria/pusha tag
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists; aborting."
+            exit 1
+          fi
+
+          git tag -a "${TAG}" -m "${TAG}"
+          git push origin "${TAG}"
+
+          SHA="$(git rev-parse HEAD)"
+          echo "sha=${SHA}"       >> "$GITHUB_OUTPUT"
+          echo "released=true"    >> "$GITHUB_OUTPUT"
+
   build:
-    if: ${{ github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release-plz-') }}
+    needs: prepare
+    if: ${{ needs.prepare.outputs.released == 'true' }}
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+
     strategy:
       fail-fast: false
       matrix:
@@ -47,10 +125,10 @@ jobs:
             archive: tar.gz
 
     steps:
-      - name: Checkout repository (merge commit)
+      - name: Checkout release commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
 
       - name: Install Rust toolchain
@@ -94,66 +172,36 @@ jobs:
           retention-days: 1
 
   release:
-    if: ${{ github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release-plz-') }}
-    name: Tag + GitHub Release + Assets
-    needs: build
+    needs: [prepare, build]
+    if: ${{ needs.prepare.outputs.released == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
-      - name: Checkout repository (merge commit)
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
-          fetch-depth: 0
-
-      - name: Get version from Cargo.toml
-        id: version
-        run: |
-          python - <<'PY'
-          import os, pathlib
-          import tomllib
-          data = tomllib.loads(pathlib.Path("Cargo.toml").read_text("utf-8"))
-          version = data["package"]["version"]
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
-            f.write(f"version={version}\n")
-          PY
-
-      - name: Create and push git tag
-        id: tag
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          TAG="v${VERSION}"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG already exists. Skipping tag creation."
-            exit 0
-          fi
-
-          git tag -a "$TAG" -m "$TAG"
-          git push origin "$TAG"
-
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
       - name: Prepare release files + checksums
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p release
           find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} release/ \;
           cd release
           sha256sum * > checksums-sha256.txt
 
-      - name: Create/Update GitHub Release and upload assets (gh)
+      - name: Create/Update GitHub Release and upload assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        shell: bash
         run: |
-          TAG="${{ steps.tag.outputs.tag }}"
-          VERSION="${{ steps.version.outputs.version }}"
+          set -euo pipefail
 
           prerelease_flag=""
           if [[ "$VERSION" == *-* ]]; then
@@ -166,5 +214,6 @@ jobs:
             gh release create "$TAG" release/* \
               --title "Release $TAG" \
               --generate-notes \
+              --target "$SHA" \
               $prerelease_flag
           fi
