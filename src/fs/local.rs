@@ -32,7 +32,13 @@ impl FS for LocalFS {
     async fn list_files(&self, path: &str) -> Result<Vec<String>, std::io::Error> {
         let mut files = Vec::new();
 
-        for entry in WalkDir::new(self.path.join(path)) {
+        let full_path = self.path.join(path);
+
+        if !full_path.exists() {
+            return Ok(files);
+        }
+
+        for entry in WalkDir::new(full_path) {
             let entry = entry?;
             if entry.file_type().is_file() {
                 let path_str = entry
@@ -49,6 +55,15 @@ impl FS for LocalFS {
     }
 
     async fn delete_file(&self, path: &str) -> Result<(), std::io::Error> {
-        std::fs::remove_file(self.path.join(path))
+        let full_path = self.path.join(path);
+        let result = std::fs::remove_file(&full_path);
+
+        let folder = full_path.parent().unwrap();
+
+        if folder.read_dir()?.next().is_none() {
+            std::fs::remove_dir(folder)?;
+        }
+
+        result
     }
 }
