@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
 
+use crate::output::{JsonProgress, emit_output, is_json_mode};
+use crate::utils::handle_error;
+
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
 pub struct Storage {
     pub storage_type: u8,
@@ -21,13 +24,18 @@ pub struct Storage {
 pub fn add(matches: &ArgMatches) {
     let name = matches.get_one::<String>("name").map_or_else(
         || {
+            if is_json_mode() {
+                handle_error(
+                    "Missing required argument: --name (required in --mode json)".to_string(),
+                    None,
+                );
+            }
             let typed_name: String = Input::<String>::new()
                 .with_prompt("Enter the name of the storage")
                 .default("default".to_string())
                 .interact_text()
                 .unwrap_or_else(|e| {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
+                    handle_error(format!("Error: {}", e), None);
                 });
             typed_name
         },
@@ -38,22 +46,28 @@ pub fn add(matches: &ArgMatches) {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
-        eprintln!(
-            "Error: The storage name can only contain letters, numbers, underscores (_), or hyphens (-)."
+        handle_error(
+            "The storage name can only contain letters, numbers, underscores (_), or hyphens (-)."
+                .to_string(),
+            None,
         );
-        std::process::exit(1);
     }
 
     let storage_type: u8 = matches.get_one::<String>("type").map_or_else(
         || {
+            if is_json_mode() {
+                handle_error(
+                    "Missing required argument: --type (required in --mode json)".to_string(),
+                    None,
+                );
+            }
             let selected_storage_type: u8 = Select::new()
                 .with_prompt("Enter the type of the storage")
                 .default(0)
                 .items(&["local", "s3"])
                 .interact()
                 .unwrap_or_else(|e| {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
+                    handle_error(format!("Error: {}", e), None);
                 }) as u8;
             selected_storage_type
         },
@@ -61,8 +75,7 @@ pub fn add(matches: &ArgMatches) {
             "local" => 0u8,
             "s3" => 1u8,
             _ => {
-                eprintln!("Error: Unknown storage type '{}'", storage_type);
-                std::process::exit(1);
+                handle_error(format!("Unknown storage type '{}'", storage_type), None);
             }
         },
     );
@@ -80,12 +93,17 @@ pub fn add(matches: &ArgMatches) {
     if storage_type == 0 {
         let path = matches.get_one::<String>("path").map_or_else(
             || {
+                if is_json_mode() {
+                    handle_error(
+                        "Missing required argument: --path (required in --mode json)".to_string(),
+                        None,
+                    );
+                }
                 let typed_path: String = Input::<String>::new()
                     .with_prompt("Enter the path for local storage")
                     .interact_text()
                     .unwrap_or_else(|e| {
-                        eprintln!("Error: {}", e);
-                        std::process::exit(1);
+                        handle_error(format!("Error: {}", e), None);
                     });
                 typed_path
             },
@@ -93,19 +111,25 @@ pub fn add(matches: &ArgMatches) {
         );
 
         if !Path::new(&path).exists() {
-            std::fs::create_dir_all(&path).unwrap();
+            std::fs::create_dir_all(&path)
+                .unwrap_or_else(|e| handle_error(format!("Failed to create path: {}", e), None));
         }
 
         storage.path = Some(path);
     } else {
         let region = matches.get_one::<String>("region").map_or_else(
             || {
+                if is_json_mode() {
+                    handle_error(
+                        "Missing required argument: --region (required in --mode json)".to_string(),
+                        None,
+                    );
+                }
                 let typed_region: String = Input::<String>::new()
                     .with_prompt("Enter the S3 region")
                     .interact_text()
                     .unwrap_or_else(|e| {
-                        eprintln!("Error: {}", e);
-                        std::process::exit(1);
+                        handle_error(format!("Error: {}", e), None);
                     });
                 typed_region
             },
@@ -114,12 +138,17 @@ pub fn add(matches: &ArgMatches) {
 
         let bucket = matches.get_one::<String>("bucket").map_or_else(
             || {
+                if is_json_mode() {
+                    handle_error(
+                        "Missing required argument: --bucket (required in --mode json)".to_string(),
+                        None,
+                    );
+                }
                 let typed_bucket: String = Input::<String>::new()
                     .with_prompt("Enter the S3 bucket")
                     .interact_text()
                     .unwrap_or_else(|e| {
-                        eprintln!("Error: {}", e);
-                        std::process::exit(1);
+                        handle_error(format!("Error: {}", e), None);
                     });
                 typed_bucket
             },
@@ -128,12 +157,18 @@ pub fn add(matches: &ArgMatches) {
 
         let access_key = matches.get_one::<String>("access-key").map_or_else(
             || {
+                if is_json_mode() {
+                    handle_error(
+                        "Missing required argument: --access-key (required in --mode json)"
+                            .to_string(),
+                        None,
+                    );
+                }
                 let typed_access_key: String = Input::<String>::new()
                     .with_prompt("Enter the S3 access key")
                     .interact_text()
                     .unwrap_or_else(|e| {
-                        eprintln!("Error: {}", e);
-                        std::process::exit(1);
+                        handle_error(format!("Error: {}", e), None);
                     });
                 typed_access_key
             },
@@ -142,12 +177,18 @@ pub fn add(matches: &ArgMatches) {
 
         let secret_key = matches.get_one::<String>("secret-key").map_or_else(
             || {
+                if is_json_mode() {
+                    handle_error(
+                        "Missing required argument: --secret-key (required in --mode json)"
+                            .to_string(),
+                        None,
+                    );
+                }
                 let typed_secret_key: String = Input::<String>::new()
                     .with_prompt("Enter the S3 secret key")
                     .interact_text()
                     .unwrap_or_else(|e| {
-                        eprintln!("Error: {}", e);
-                        std::process::exit(1);
+                        handle_error(format!("Error: {}", e), None);
                     });
                 typed_secret_key
             },
@@ -156,14 +197,16 @@ pub fn add(matches: &ArgMatches) {
 
         let endpoint = matches.get_one::<String>("endpoint").map_or_else(
             || {
+                if is_json_mode() {
+                    return format!("https://s3.{}.amazonaws.com", region);
+                }
                 let typed_endpoint: String = Input::<String>::new()
                     .with_prompt("Enter the S3 endpoint")
                     .default(format!("https://s3.{}.amazonaws.com", region))
                     .show_default(true)
                     .interact_text()
                     .unwrap_or_else(|e| {
-                        eprintln!("Error: {}", e);
-                        std::process::exit(1);
+                        handle_error(format!("Error: {}", e), None);
                     });
                 typed_endpoint
             },
@@ -177,30 +220,79 @@ pub fn add(matches: &ArgMatches) {
         storage.endpoint = Some(endpoint);
     }
 
-    let pb = ProgressBar::new(100);
-    pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+    let json_progress = if is_json_mode() {
+        let progress = JsonProgress::new(1);
+        progress.set_message(&format!("Writing storage '{}'...", name));
+        Some(progress)
+    } else {
+        None
+    };
 
-    pb.set_message(format!("Writing storage '{}'...", name));
+    let pb = if is_json_mode() {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(100);
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+        pb.set_message(format!("Writing storage '{}'...", name));
+        pb
+    };
 
     let home_dir = home_dir().unwrap();
 
     let mut storage_path = home_dir.join(".gib").join("storages");
 
     if !storage_path.exists() {
-        std::fs::create_dir_all(&storage_path).unwrap();
+        std::fs::create_dir_all(&storage_path).unwrap_or_else(|e| {
+            handle_error(format!("Failed to create storage directory: {}", e), None)
+        });
     }
 
     storage_path.push(format!("{}.msgpack", name));
 
     let mut buf = Vec::new();
-    storage.serialize(&mut Serializer::new(&mut buf)).unwrap();
+    storage
+        .serialize(&mut Serializer::new(&mut buf))
+        .unwrap_or_else(|e| handle_error(format!("Failed to serialize storage: {}", e), None));
 
-    std::fs::write(storage_path, buf).unwrap();
+    std::fs::write(&storage_path, buf)
+        .unwrap_or_else(|e| handle_error(format!("Failed to write storage: {}", e), None));
 
-    let elapsed = pb.elapsed();
+    if let Some(progress) = &json_progress {
+        progress.inc_by(1);
+    }
 
-    pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
-    pb.set_prefix("✓");
-    pb.finish_with_message(format!("Storage written ({:.2?})", elapsed));
+    if is_json_mode() {
+        #[derive(Serialize)]
+        struct StorageOutput {
+            name: String,
+            storage_type: String,
+            path: Option<String>,
+            region: Option<String>,
+            bucket: Option<String>,
+            endpoint: Option<String>,
+        }
+
+        let storage_type_label = match storage.storage_type {
+            0 => "local",
+            1 => "s3",
+            _ => "unknown",
+        };
+
+        let payload = StorageOutput {
+            name,
+            storage_type: storage_type_label.to_string(),
+            path: storage.path,
+            region: storage.region,
+            bucket: storage.bucket,
+            endpoint: storage.endpoint,
+        };
+        emit_output(&payload);
+    } else {
+        let elapsed = pb.elapsed();
+
+        pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
+        pb.set_prefix("OK");
+        pb.finish_with_message(format!("Storage written ({:.2?})", elapsed));
+    }
 }

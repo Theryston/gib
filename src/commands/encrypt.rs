@@ -3,6 +3,7 @@ use crate::core::indexes::list_backup_summaries;
 use crate::core::metadata::{BackupSummary, ChunkIndex};
 use crate::core::{crypto::get_password, indexes::load_chunk_indexes};
 use crate::fs::FS;
+use crate::output::{JsonProgress, emit_output, emit_progress_message, is_json_mode};
 use crate::utils::{get_fs, get_pwd_string, get_storage, handle_error};
 use clap::ArgMatches;
 use console::style;
@@ -31,12 +32,19 @@ pub async fn encrypt(matches: &ArgMatches) {
 
     let storage = get_storage(&storage);
 
-    let pb = ProgressBar::new(100);
+    let pb = if is_json_mode() {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(100);
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+        pb.set_message("Loading metadata from the repository key...");
+        pb
+    };
 
-    pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
-
-    pb.set_message("Loading metadata from the repository key...");
+    if is_json_mode() {
+        emit_progress_message("Loading metadata from the repository key...");
+    }
 
     let fs = get_fs(&storage, Some(&pb));
 
@@ -72,28 +80,43 @@ pub async fn encrypt(matches: &ArgMatches) {
 
     pb.finish_and_clear();
 
-    if *prev_not_encrypted_but_now_yes.lock().unwrap() {
-        println!(
-            "{}",
-            style("Encrypting all chunks of the repository...").green()
-        );
-    } else {
-        println!(
-            "{}",
-            style("Some chunks are already encrypted, encrypting all the other chunks now...")
-                .green()
-        );
+    if !is_json_mode() {
+        if *prev_not_encrypted_but_now_yes.lock().unwrap() {
+            println!(
+                "{}",
+                style("Encrypting all chunks of the repository...").green()
+            );
+        } else {
+            println!(
+                "{}",
+                style("Some chunks are already encrypted, encrypting all the other chunks now...")
+                    .green()
+            );
+        }
     }
 
-    let pb = ProgressBar::new(files_to_encrypt.len() as u64);
-    pb.enable_steady_tick(Duration::from_millis(100));
+    let json_progress = if is_json_mode() {
+        let progress = JsonProgress::new(files_to_encrypt.len() as u64);
+        progress.set_message("Encrypting chunks...");
+        Some(progress)
+    } else {
+        None
+    };
 
-    pb.set_style(
-        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+    let pb = if is_json_mode() {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(files_to_encrypt.len() as u64);
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+            )
             .unwrap(),
-    );
-
-    pb.set_message(format!("Encrypting chunks..."));
+        );
+        pb.set_message("Encrypting chunks...");
+        pb
+    };
 
     let encrypted_amount = Arc::new(Mutex::new(0));
     let already_encrypted_amount = Arc::new(Mutex::new(0));
@@ -112,6 +135,7 @@ pub async fn encrypt(matches: &ArgMatches) {
             let encrypted_amount_clone = Arc::clone(&encrypted_amount);
             let semaphore_clone = Arc::clone(&semaphore);
             let files_set_clone = Arc::clone(&files_set);
+            let json_progress_clone = json_progress.clone();
 
             async move {
                 let mut guard = files_set_clone.lock().await;
@@ -132,7 +156,11 @@ pub async fn encrypt(matches: &ArgMatches) {
                             *already_encrypted_amount_guard += 1;
                         }
 
-                        pb_clone.inc(1);
+                        if let Some(progress) = &json_progress_clone {
+                            progress.inc_by(1);
+                        } else {
+                            pb_clone.inc(1);
+                        }
                         return Ok(());
                     }
 
@@ -149,7 +177,11 @@ pub async fn encrypt(matches: &ArgMatches) {
                         *encrypted_amount_guard += 1;
                     }
 
-                    pb_clone.inc(1);
+                    if let Some(progress) = &json_progress_clone {
+                        progress.inc_by(1);
+                    } else {
+                        pb_clone.inc(1);
+                    }
                     Ok(())
                 });
             }
@@ -184,19 +216,33 @@ pub async fn encrypt(matches: &ArgMatches) {
         );
     }
 
-    pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
-    pb.set_prefix("✓");
-
     let encrypted_amount = encrypted_amount.lock().unwrap();
     let already_encrypted_amount = already_encrypted_amount.lock().unwrap();
 
-    if *already_encrypted_amount > 0 {
-        pb.finish_with_message(format!(
-            "Encrypted {} chunks ({} were already encrypted)",
-            encrypted_amount, already_encrypted_amount
-        ));
+    if is_json_mode() {
+        #[derive(serde::Serialize)]
+        struct EncryptOutput {
+            encrypted: u64,
+            already_encrypted: u64,
+        }
+
+        let payload = EncryptOutput {
+            encrypted: *encrypted_amount,
+            already_encrypted: *already_encrypted_amount,
+        };
+        emit_output(&payload);
     } else {
-        pb.finish_with_message(format!("Encrypted {} chunks", encrypted_amount));
+        pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
+        pb.set_prefix("OK");
+
+        if *already_encrypted_amount > 0 {
+            pb.finish_with_message(format!(
+                "Encrypted {} chunks ({} were already encrypted)",
+                encrypted_amount, already_encrypted_amount
+            ));
+        } else {
+            pb.finish_with_message(format!("Encrypted {} chunks", encrypted_amount));
+        }
     }
 }
 
@@ -258,31 +304,39 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
     let storage_path = home_dir.join(".gib").join("storages");
 
     if !storage_path.exists() {
-        return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
+        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
-    let files = std::fs::read_dir(&storage_path).unwrap();
+    let files =
+        std::fs::read_dir(&storage_path).map_err(|e| format!("Failed to read storages: {}", e))?;
 
     let storages_names = &files
         .map(|file| {
-            file.unwrap()
-                .file_name()
-                .to_string_lossy()
-                .to_string()
-                .split('.')
-                .next()
-                .unwrap()
-                .to_string()
+            file.map_err(|e| format!("Failed to read storage entry: {}", e))
+                .map(|file| {
+                    file.file_name()
+                        .to_string_lossy()
+                        .to_string()
+                        .split('.')
+                        .next()
+                        .unwrap()
+                        .to_string()
+                })
         })
-        .collect::<Vec<String>>();
+        .collect::<Result<Vec<String>, String>>()?;
 
     if storages_names.is_empty() {
-        return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
+        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
     let storage = match matches.get_one::<String>("storage") {
         Some(storage) => storage.to_string(),
         None => {
+            if is_json_mode() {
+                return Err(
+                    "Missing required argument: --storage (required in --mode json)".to_string(),
+                );
+            }
             let selected_index = Select::new()
                 .with_prompt("Select the storage to use")
                 .items(storages_names)
