@@ -84,8 +84,8 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
         return Err("Seams like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
     }
 
-    let files = std::fs::read_dir(&storage_path)
-        .map_err(|e| format!("Failed to read storages: {}", e))?;
+    let files =
+        std::fs::read_dir(&storage_path).map_err(|e| format!("Failed to read storages: {}", e))?;
 
     let storages_names = &files
         .map(|file| {
@@ -154,9 +154,8 @@ struct LogEntry {
 impl LogEntry {
     fn from_summary(summary: &BackupSummary) -> Self {
         let timestamp = summary.timestamp.and_then(|ts| {
-            DateTime::<Utc>::from_timestamp_secs(ts as i64).map(|dt| {
-                dt.to_rfc3339_opts(SecondsFormat::Secs, true)
-            })
+            DateTime::<Utc>::from_timestamp_secs(ts as i64)
+                .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
         });
 
         LogEntry {

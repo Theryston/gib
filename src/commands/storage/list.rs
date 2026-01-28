@@ -31,8 +31,8 @@ pub fn list() {
     let mut json_rows = Vec::new();
 
     for file in files {
-        let file =
-            file.unwrap_or_else(|e| handle_error(format!("Failed to read storage entry: {}", e), None));
+        let file = file
+            .unwrap_or_else(|e| handle_error(format!("Failed to read storage entry: {}", e), None));
         let path = file.path();
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
         let storage_name = file_name.split('.').next().unwrap();

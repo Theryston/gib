@@ -1,7 +1,7 @@
 use serde::Serialize;
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum OutputMode {
