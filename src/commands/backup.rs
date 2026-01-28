@@ -31,11 +31,20 @@ use tokio::task::JoinSet;
 const MAX_CONCURRENT_FILES: usize = 100;
 
 pub async fn backup(matches: &ArgMatches) {
-    let (key, message, root_path_string, storage, compress, password, chunk_size, ignore_patterns) =
-        match get_params(matches) {
-            Ok(params) => params,
-            Err(e) => handle_error(e, None),
-        };
+    let (
+        key,
+        message,
+        root_path_string,
+        storage,
+        compress,
+        password,
+        chunk_size,
+        ignore_patterns,
+        received_pending_backup,
+    ) = match get_params(matches).await {
+        Ok(params) => params,
+        Err(e) => handle_error(e, None),
+    };
 
     let home_dir = match home_dir() {
         Some(dir) => dir,
@@ -337,6 +346,13 @@ pub async fn backup(matches: &ArgMatches) {
 
     let _ = fs.delete_file(&pending_backup_path).await;
 
+    match received_pending_backup {
+        Some(pending_backup) => {
+            let _ = fs.delete_file(&pending_backup.path).await;
+        }
+        None => {}
+    };
+
     if is_json_mode() {
         #[derive(serde::Serialize)]
         struct BackupOutput {
@@ -610,7 +626,60 @@ async fn load_metadata(
     Ok((new_backup, root_files, chunk_indexes))
 }
 
-fn get_params(
+struct PendingBackupMatch {
+    backup: PendingBackup,
+    path: String,
+}
+
+async fn load_pending_backup(
+    fs: Arc<dyn FS>,
+    key: &str,
+    continue_prefix: &str,
+) -> Result<PendingBackupMatch, String> {
+    let indexes_path = format!("{}/indexes", key);
+    let files = fs
+        .list_files(&indexes_path)
+        .await
+        .map_err(|e| format!("Failed to list indexes in '{}': {}", indexes_path, e))?;
+
+    let pending_prefix = format!("{}/indexes/pending_{}", key, continue_prefix);
+    let mut matches: Vec<String> = files
+        .into_iter()
+        .filter(|path| path.starts_with(&pending_prefix))
+        .collect();
+
+    matches.sort();
+    matches.dedup();
+
+    if matches.is_empty() {
+        return Err(format!(
+            "No pending backup found starting with '{}'",
+            pending_prefix
+        ));
+    }
+
+    let pending_path = matches
+        .pop()
+        .ok_or_else(|| "Pending backup match missing".to_string())?;
+    let pending_bytes = fs
+        .read_file(&pending_path)
+        .await
+        .map_err(|e| format!("Failed to read pending backup '{}': {}", pending_path, e))?;
+
+    let pending_backup: PendingBackup = rmp_serde::from_slice(&pending_bytes).map_err(|e| {
+        format!(
+            "Failed to deserialize pending backup '{}': {}",
+            pending_path, e
+        )
+    })?;
+
+    Ok(PendingBackupMatch {
+        backup: pending_backup,
+        path: pending_path,
+    })
+}
+
+async fn get_params(
     matches: &ArgMatches,
 ) -> Result<
     (
@@ -622,6 +691,7 @@ fn get_params(
         Option<String>,
         u64,
         Vec<String>,
+        Option<PendingBackupMatch>,
     ),
     String,
 > {
@@ -654,21 +724,6 @@ fn get_params(
     let key = matches
         .get_one::<String>("key")
         .map_or_else(|| default_key, |key| key.to_string());
-
-    let message = match matches.get_one::<String>("message") {
-        Some(message) => message.to_string(),
-        None => {
-            if is_json_mode() {
-                return Err(
-                    "Missing required argument: --message (required in --mode json)".to_string(),
-                );
-            }
-            Input::<String>::new()
-                .with_prompt("Enter the backup message")
-                .interact_text()
-                .map_err(|e| format!("{}", e))?
-        }
-    };
 
     let home_dir = home_dir().unwrap();
     let storage_path = home_dir.join(".gib").join("storages");
@@ -718,15 +773,6 @@ fn get_params(
         }
     };
 
-    let compress: i32 = matches
-        .get_one::<String>("compress")
-        .map_or_else(|| 3, |compress| compress.parse().unwrap());
-
-    let chunk_size: u64 = matches.get_one::<String>("chunk-size").map_or_else(
-        || parse_size("5 MB").unwrap(),
-        |chunk_size| parse_size(chunk_size).unwrap(),
-    );
-
     let exists = storages_names
         .iter()
         .any(|storage_name| storage_name == &storage);
@@ -735,10 +781,102 @@ fn get_params(
         return Err(format!("Storage '{}' not found", storage));
     }
 
+    let pending_backup = match matches.get_one::<String>("continue") {
+        Some(continue_prefix) => {
+            let storage_config = get_storage(&storage);
+            let fs = get_fs(&storage_config, None);
+            Some(load_pending_backup(fs, &key, continue_prefix).await?)
+        }
+        None => None,
+    };
+
+    let mut reused_fields = Vec::new();
+
+    let message = match matches.get_one::<String>("message") {
+        Some(message) => message.to_string(),
+        None => {
+            if let Some(pending) = &pending_backup
+                && !pending.backup.message.is_empty()
+            {
+                reused_fields.push("message".to_string());
+                pending.backup.message.clone()
+            } else {
+                if is_json_mode() {
+                    return Err(
+                        "Missing required argument: --message (required in --mode json)"
+                            .to_string(),
+                    );
+                }
+                Input::<String>::new()
+                    .with_prompt("Enter the backup message")
+                    .interact_text()
+                    .map_err(|e| format!("{}", e))?
+            }
+        }
+    };
+
+    let compress: i32 = matches.get_one::<String>("compress").map_or_else(
+        || {
+            if let Some(pending) = &pending_backup
+                && pending.backup.compress != 3
+            {
+                reused_fields.push("compress".to_string());
+                pending.backup.compress
+            } else {
+                3
+            }
+        },
+        |compress| compress.parse().unwrap(),
+    );
+
+    let chunk_size: u64 = matches.get_one::<String>("chunk-size").map_or_else(
+        || {
+            if let Some(pending) = &pending_backup
+                && pending.backup.chunk_size != parse_size("5 MB").unwrap()
+            {
+                reused_fields.push("chunk_size".to_string());
+                pending.backup.chunk_size
+            } else {
+                parse_size("5 MB").unwrap()
+            }
+        },
+        |chunk_size| parse_size(chunk_size).unwrap(),
+    );
+
     let ignore_patterns: Vec<String> = matches
         .get_many::<String>("ignore")
         .map(|values| values.map(|s| s.to_string()).collect())
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            if let Some(pending) = &pending_backup
+                && !pending.backup.ignore_patterns.is_empty()
+            {
+                reused_fields.push("ignore_patterns".to_string());
+                pending.backup.ignore_patterns.clone()
+            } else {
+                Vec::new()
+            }
+        });
+
+    if !reused_fields.is_empty() {
+        let pending_name = pending_backup
+            .as_ref()
+            .and_then(|pending| pending.path.rsplit('/').next())
+            .map_or("pending backup".to_string(), |pending| {
+                let hash = pending.replace("pending_", "");
+                hash[..8].to_string()
+            });
+        let warning = format!(
+            "Reusing metadata from {}: {}",
+            pending_name,
+            reused_fields.join(", ")
+        );
+
+        if is_json_mode() {
+            emit_warning(&warning, "pending_backup_reuse");
+        } else {
+            println!("{}", style(warning).yellow());
+        }
+    }
 
     Ok((
         key,
@@ -749,5 +887,6 @@ fn get_params(
         password,
         chunk_size,
         ignore_patterns,
+        pending_backup,
     ))
 }

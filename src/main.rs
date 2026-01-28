@@ -90,8 +90,8 @@ fn cli() -> Command {
                 .arg(
                     Arg::new("continue")
                         .long("continue")
-                        .help("Continue the backup from an impleted backup")
-                        .action(clap::ArgAction::Append)
+                        .value_name("BACKUP")
+                        .help("Continue the backup from an incomplete backup")
                         .required(false),
                 )
                 .subcommand(
