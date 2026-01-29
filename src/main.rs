@@ -102,6 +102,13 @@ fn cli() -> Command {
                         .required(false),
                 )
                 .subcommand(
+                    Command::new("pending")
+                        .about("List pending backups for a repository")
+                        .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
+                        .arg(arg!(-s --storage <STORAGE> "The storage to use").required(false))
+                        .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))
+                )
+                .subcommand(
                     Command::new("delete")
                         .about("Delete a backup and its orphaned chunks")
                         .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
@@ -240,6 +247,7 @@ async fn main() {
         Some(("log", matches)) => commands::log(matches).await,
         Some(("backup", matches)) => match matches.subcommand() {
             Some(("delete", matches)) => commands::delete(matches).await,
+            Some(("pending", matches)) => commands::pending(matches).await,
             None => commands::backup(matches).await,
             _ => {
                 handle_error(
