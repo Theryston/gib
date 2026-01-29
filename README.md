@@ -47,6 +47,8 @@ Need a single file from a huge backup? Use `--only` to restore specific paths �
 
 If your connection drops or a backup gets interrupted, you don't lose progress. Use `--continue <backup-hash>` to pick up exactly where it stopped and reuse already uploaded chunks.
 
+Tip: for list all pending backups run `gib backup pending`.
+
 ### 📁 Multi-Folder Backup with Repository Keys
 
 Organize your backups using **repository keys** — unique identifiers that group all backups from a specific context together. Each key acts as a separate backup repository:
