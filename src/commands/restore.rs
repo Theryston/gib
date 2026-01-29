@@ -2,6 +2,10 @@ use crate::core::crypto::get_password;
 use crate::core::crypto::read_file_maybe_decrypt;
 use crate::core::indexes::list_backup_summaries;
 use crate::core::metadata::Backup;
+use crate::core::only::OnlyRequest;
+use crate::core::only::filter_only_paths;
+use crate::core::only::parse_only_request;
+use crate::core::only::select_only_paths_interactive;
 use crate::core::permissions::set_file_permissions;
 use crate::fs::FS;
 use crate::output::{JsonProgress, emit_output, emit_progress_message, emit_warning, is_json_mode};
@@ -24,11 +28,11 @@ use walkdir::WalkDir;
 const MAX_CONCURRENT_FILES: usize = 100;
 
 pub async fn restore(matches: &ArgMatches) {
-    let (key, storage, password, backup_hash, target_path, prune_local) = match get_params(matches)
-    {
-        Ok(params) => params,
-        Err(e) => handle_error(e, None),
-    };
+    let (key, storage, password, backup_hash, target_path, prune_local, only_request) =
+        match get_params(matches) {
+            Ok(params) => params,
+            Err(e) => handle_error(e, None),
+        };
 
     let started_at = Instant::now();
 
@@ -76,8 +80,32 @@ pub async fn restore(matches: &ArgMatches) {
 
     pb.finish_and_clear();
 
+    let files_to_restore = match only_request {
+        OnlyRequest::None => backup
+            .tree
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        OnlyRequest::Paths(paths) => match filter_only_paths(&backup.tree, &paths) {
+            Ok(files) => files,
+            Err(e) => handle_error(e, None),
+        },
+        OnlyRequest::Interactive => {
+            let selected_paths = match select_only_paths_interactive(&backup.tree) {
+                Ok(paths) => paths,
+                Err(e) => handle_error(e, None),
+            };
+            match filter_only_paths(&backup.tree, &selected_paths) {
+                Ok(files) => files,
+                Err(e) => handle_error(e, None),
+            }
+        }
+    };
+
+    let total_files = files_to_restore.len() as u64;
+
     let json_progress = if is_json_mode() {
-        let progress = JsonProgress::new(backup.tree.len() as u64);
+        let progress = JsonProgress::new(total_files);
         progress.set_message(&format!(
             "Restoring files from {}...",
             full_backup_hash[..8.min(full_backup_hash.len())].to_string()
@@ -90,7 +118,7 @@ pub async fn restore(matches: &ArgMatches) {
     let pb = if is_json_mode() {
         ProgressBar::hidden()
     } else {
-        let pb = ProgressBar::new(backup.tree.len() as u64);
+        let pb = ProgressBar::new(total_files);
         pb.enable_steady_tick(Duration::from_millis(100));
         pb.set_style(
             ProgressStyle::with_template(
@@ -109,12 +137,6 @@ pub async fn restore(matches: &ArgMatches) {
     let restored_files = Arc::new(std::sync::Mutex::new(0u64));
     let skipped_files = Arc::new(std::sync::Mutex::new(0u64));
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILES));
-
-    let files_to_restore: Vec<(String, crate::core::metadata::BackupObject)> = backup
-        .tree
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
 
     let files_stream = stream::iter(files_to_restore);
 
@@ -492,7 +514,18 @@ fn cleanup_extra_files(
 
 fn get_params(
     matches: &ArgMatches,
-) -> Result<(String, String, Option<String>, Option<String>, String, bool), String> {
+) -> Result<
+    (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        bool,
+        OnlyRequest,
+    ),
+    String,
+> {
     let password: Option<String> = matches
         .get_one::<String>("password")
         .map(|s| s.to_string())
@@ -522,6 +555,9 @@ fn get_params(
     let key = matches
         .get_one::<String>("key")
         .map_or_else(|| default_key, |key| key.to_string());
+
+    let prune_local = matches.get_flag("prune-local");
+    let only_request = parse_only_request(matches, prune_local)?;
 
     let home_dir = home_dir().unwrap();
     let storage_path = home_dir.join(".gib").join("storages");
@@ -581,8 +617,6 @@ fn get_params(
 
     let backup_hash = matches.get_one::<String>("backup").map(|s| s.to_string());
 
-    let prune_local = matches.get_flag("prune-local");
-
     Ok((
         key,
         storage,
@@ -590,5 +624,6 @@ fn get_params(
         backup_hash,
         target_path,
         prune_local,
+        only_request,
     ))
 }
