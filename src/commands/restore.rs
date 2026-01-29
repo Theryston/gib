@@ -366,6 +366,11 @@ struct VisibleNode {
     depth: usize,
 }
 
+struct FileEntry {
+    path: String,
+    path_lower: String,
+}
+
 #[derive(Copy, Clone)]
 enum SelectionState {
     None,
@@ -500,6 +505,7 @@ fn select_only_paths_interactive(
     }
 
     let root = build_tree(backup_tree);
+    let file_index = build_file_index(backup_tree);
     let _guard = TerminalGuard::new()?;
 
     let mut expanded: HashSet<String> = HashSet::new();
@@ -507,11 +513,23 @@ fn select_only_paths_interactive(
     let mut cursor_index: usize = 0;
     let mut scroll_offset: usize = 0;
     let mut status_message: Option<String> = None;
+    let mut search_input = false;
+    let mut search_query = String::new();
 
     loop {
-        let visible = visible_nodes(&root, &expanded);
+        let search_active = !search_query.is_empty();
+        let visible = if search_active {
+            visible_search_nodes(&file_index, &search_query)
+        } else {
+            visible_nodes(&root, &expanded)
+        };
+
         if visible.is_empty() {
-            return Err("Backup contains no files to restore".to_string());
+            if search_active {
+                status_message = Some("No matches".to_string());
+            } else {
+                return Err("Backup contains no files to restore".to_string());
+            }
         }
 
         if cursor_index >= visible.len() {
@@ -527,6 +545,9 @@ fn select_only_paths_interactive(
             cursor_index,
             &mut scroll_offset,
             status_message.as_deref(),
+            search_input,
+            search_active,
+            &search_query,
         )?;
         status_message = None;
 
@@ -539,39 +560,90 @@ fn select_only_paths_interactive(
             continue;
         }
 
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
-                return Err("Selection cancelled".to_string());
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+            return Err("Selection cancelled".to_string());
+        }
+
+        let search_active = !search_query.is_empty();
+
+        if search_input {
+            match key.code {
+                KeyCode::Esc => {
+                    search_input = false;
+                    search_query.clear();
+                    cursor_index = 0;
+                    scroll_offset = 0;
+                }
+                KeyCode::Enter => {
+                    search_input = false;
+                    cursor_index = 0;
+                    scroll_offset = 0;
+                }
+                KeyCode::Backspace => {
+                    if search_query.pop().is_some() {
+                        cursor_index = 0;
+                        scroll_offset = 0;
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) && !c.is_control() {
+                        search_query.push(c);
+                        cursor_index = 0;
+                        scroll_offset = 0;
+                    }
+                }
+                _ => {}
             }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Err("Selection cancelled".to_string());
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                if search_active {
+                    search_query.clear();
+                    cursor_index = 0;
+                    scroll_offset = 0;
+                } else {
+                    return Err("Selection cancelled".to_string());
+                }
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                search_input = true;
+                cursor_index = 0;
+                scroll_offset = 0;
             }
             KeyCode::Up => {
-                if cursor_index > 0 {
+                if cursor_index > 0 && !visible.is_empty() {
                     cursor_index -= 1;
                 }
             }
             KeyCode::Down => {
-                if cursor_index + 1 < visible.len() {
+                if cursor_index + 1 < visible.len() && !visible.is_empty() {
                     cursor_index += 1;
                 }
             }
             KeyCode::PageUp => {
-                let page_size = current_page_size()?;
-                cursor_index = cursor_index.saturating_sub(page_size);
-                scroll_offset = page_start_for(cursor_index, page_size);
+                if !visible.is_empty() {
+                    let page_size = current_page_size()?;
+                    cursor_index = cursor_index.saturating_sub(page_size);
+                    scroll_offset = page_start_for(cursor_index, page_size);
+                }
             }
             KeyCode::PageDown => {
-                let page_size = current_page_size()?;
-                let next = cursor_index.saturating_add(page_size);
-                cursor_index = next.min(visible.len().saturating_sub(1));
-                scroll_offset = page_start_for(cursor_index, page_size);
+                if !visible.is_empty() {
+                    let page_size = current_page_size()?;
+                    let next = cursor_index.saturating_add(page_size);
+                    cursor_index = next.min(visible.len().saturating_sub(1));
+                    scroll_offset = page_start_for(cursor_index, page_size);
+                }
             }
             KeyCode::BackTab => {
                 expanded.clear();
             }
             KeyCode::Tab => {
-                let current = &visible[cursor_index];
+                let Some(current) = visible.get(cursor_index) else {
+                    continue;
+                };
                 if current.is_dir {
                     if expanded.contains(&current.path) {
                         expanded.remove(&current.path);
@@ -581,7 +653,9 @@ fn select_only_paths_interactive(
                 }
             }
             KeyCode::Char(' ') => {
-                let current = &visible[cursor_index];
+                let Some(current) = visible.get(cursor_index) else {
+                    continue;
+                };
                 if current.is_dir {
                     if let Some(node) = find_node_by_path(&root, &current.path) {
                         let mut files = Vec::new();
@@ -645,6 +719,9 @@ fn render_selector(
     cursor_index: usize,
     scroll_offset: &mut usize,
     status_message: Option<&str>,
+    search_input: bool,
+    search_active: bool,
+    search_query: &str,
 ) -> Result<(), String> {
     let (width, height) =
         terminal::size().map_err(|e| format!("Failed to read terminal size: {}", e))?;
@@ -673,17 +750,33 @@ fn render_selector(
     )
     .map_err(|e| format!("Failed to render selector: {}", e))?;
 
-    let header = "Keys: Up/Down, Tab=expand/collapse, Shift+Tab=collapse all, Space=select, Enter=confirm, Q=cancel";
+    let header = if search_input {
+        "Search mode: type to filter, Enter=apply, Esc=exit-search"
+    } else if search_active {
+        "Keys: Tab=toggle Shift+Tab=collapse-all Space=select Enter=ok Esc=clear-search S=edit-search"
+    } else {
+        "Keys: Tab=toggle Shift+Tab=collapse-all Space=select Enter=ok S=search Esc=cancel"
+    };
     write_line(&mut stdout, header, width, true)?;
 
     let selection_count = selected.len();
-    let summary = format!(
-        "Selected files: {} | Page {}/{} | Items: {}",
-        selection_count,
-        current_page,
-        total_pages,
-        visible.len()
-    );
+    let summary = if search_active {
+        format!(
+            "Selected files: {} | Matches: {} | Page {}/{}",
+            selection_count,
+            visible.len(),
+            current_page,
+            total_pages
+        )
+    } else {
+        format!(
+            "Selected files: {} | Page {}/{} | Items: {}",
+            selection_count,
+            current_page,
+            total_pages,
+            visible.len()
+        )
+    };
     write_line(&mut stdout, &summary, width, true)?;
 
     for line_index in 0..view_height {
@@ -705,20 +798,25 @@ fn render_selector(
             SelectionState::Selected => "[x]",
         };
 
-        let indent = "  ".repeat(item.depth);
-        let expand_marker = if item.is_dir {
-            if expanded.contains(&item.path) {
-                "-"
+        let (indent, expand_marker, display_name) = if search_active {
+            ("".to_string(), "", item.name.clone())
+        } else {
+            let indent = "  ".repeat(item.depth);
+            let expand_marker = if item.is_dir {
+                if expanded.contains(&item.path) {
+                    "-"
+                } else {
+                    "+"
+                }
             } else {
-                "+"
-            }
-        } else {
-            " "
-        };
-        let display_name = if item.is_dir {
-            format!("{}/", item.name)
-        } else {
-            item.name.clone()
+                " "
+            };
+            let display_name = if item.is_dir {
+                format!("{}/", item.name)
+            } else {
+                item.name.clone()
+            };
+            (indent, expand_marker, display_name)
         };
 
         let line = format!(
@@ -728,8 +826,20 @@ fn render_selector(
         write_line(&mut stdout, &line, width, true)?;
     }
 
-    let footer = status_message.unwrap_or("");
-    write_line(&mut stdout, footer, width, false)?;
+    let footer = if search_input {
+        match status_message {
+            Some(message) => format!("Search: {} | {}", search_query, message),
+            None => format!("Search: {}", search_query),
+        }
+    } else if search_active {
+        match status_message {
+            Some(message) => format!("Filter: {} | {}", search_query, message),
+            None => format!("Filter: {}", search_query),
+        }
+    } else {
+        status_message.unwrap_or("").to_string()
+    };
+    write_line(&mut stdout, &footer, width, false)?;
 
     stdout
         .flush()
@@ -912,6 +1022,46 @@ fn sort_tree(node: &mut TreeNode) {
             sort_tree(child);
         }
     }
+}
+
+fn build_file_index(
+    backup_tree: &HashMap<String, crate::core::metadata::BackupObject>,
+) -> Vec<FileEntry> {
+    let mut entries: Vec<FileEntry> = backup_tree
+        .keys()
+        .map(|path| {
+            let path_lower = path.to_lowercase();
+            FileEntry {
+                path: path.clone(),
+                path_lower,
+            }
+        })
+        .collect();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries
+}
+
+fn visible_search_nodes(entries: &[FileEntry], query: &str) -> Vec<VisibleNode> {
+    let needle = query.to_lowercase();
+    let mut out = Vec::new();
+
+    for entry in entries {
+        if needle.is_empty() || entry.path_lower.contains(&needle) {
+            let display_path = if entry.path.starts_with('/') {
+                entry.path.clone()
+            } else {
+                format!("/{}", entry.path)
+            };
+            out.push(VisibleNode {
+                path: entry.path.clone(),
+                name: display_path,
+                is_dir: false,
+                depth: 0,
+            });
+        }
+    }
+
+    out
 }
 
 fn find_node_by_path<'a>(node: &'a TreeNode, path: &str) -> Option<&'a TreeNode> {
