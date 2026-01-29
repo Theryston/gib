@@ -7,12 +7,19 @@ use crate::fs::FS;
 use crate::output::{JsonProgress, emit_output, emit_progress_message, emit_warning, is_json_mode};
 use crate::utils::{decompress_bytes, get_fs, get_pwd_string, get_storage, handle_error};
 use clap::ArgMatches;
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute, queue,
+    terminal::{self, ClearType},
+};
 use dialoguer::Select;
 use dirs::home_dir;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,11 +31,11 @@ use walkdir::WalkDir;
 const MAX_CONCURRENT_FILES: usize = 100;
 
 pub async fn restore(matches: &ArgMatches) {
-    let (key, storage, password, backup_hash, target_path, prune_local) = match get_params(matches)
-    {
-        Ok(params) => params,
-        Err(e) => handle_error(e, None),
-    };
+    let (key, storage, password, backup_hash, target_path, prune_local, only_request) =
+        match get_params(matches) {
+            Ok(params) => params,
+            Err(e) => handle_error(e, None),
+        };
 
     let started_at = Instant::now();
 
@@ -76,8 +83,32 @@ pub async fn restore(matches: &ArgMatches) {
 
     pb.finish_and_clear();
 
+    let files_to_restore = match only_request {
+        OnlyRequest::None => backup
+            .tree
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        OnlyRequest::Paths(paths) => match filter_only_paths(&backup.tree, &paths) {
+            Ok(files) => files,
+            Err(e) => handle_error(e, None),
+        },
+        OnlyRequest::Interactive => {
+            let selected_paths = match select_only_paths_interactive(&backup.tree) {
+                Ok(paths) => paths,
+                Err(e) => handle_error(e, None),
+            };
+            match filter_only_paths(&backup.tree, &selected_paths) {
+                Ok(files) => files,
+                Err(e) => handle_error(e, None),
+            }
+        }
+    };
+
+    let total_files = files_to_restore.len() as u64;
+
     let json_progress = if is_json_mode() {
-        let progress = JsonProgress::new(backup.tree.len() as u64);
+        let progress = JsonProgress::new(total_files);
         progress.set_message(&format!(
             "Restoring files from {}...",
             full_backup_hash[..8.min(full_backup_hash.len())].to_string()
@@ -90,7 +121,7 @@ pub async fn restore(matches: &ArgMatches) {
     let pb = if is_json_mode() {
         ProgressBar::hidden()
     } else {
-        let pb = ProgressBar::new(backup.tree.len() as u64);
+        let pb = ProgressBar::new(total_files);
         pb.enable_steady_tick(Duration::from_millis(100));
         pb.set_style(
             ProgressStyle::with_template(
@@ -109,12 +140,6 @@ pub async fn restore(matches: &ArgMatches) {
     let restored_files = Arc::new(std::sync::Mutex::new(0u64));
     let skipped_files = Arc::new(std::sync::Mutex::new(0u64));
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILES));
-
-    let files_to_restore: Vec<(String, crate::core::metadata::BackupObject)> = backup
-        .tree
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
 
     let files_stream = stream::iter(files_to_restore);
 
@@ -310,6 +335,609 @@ pub async fn restore(matches: &ArgMatches) {
     }
 }
 
+enum OnlyRequest {
+    None,
+    Paths(Vec<String>),
+    Interactive,
+}
+
+struct TreeNode {
+    name: String,
+    path: String,
+    is_dir: bool,
+    children: Vec<TreeNode>,
+}
+
+impl TreeNode {
+    fn new(name: String, path: String, is_dir: bool) -> Self {
+        Self {
+            name,
+            path,
+            is_dir,
+            children: Vec::new(),
+        }
+    }
+}
+
+struct VisibleNode {
+    path: String,
+    name: String,
+    is_dir: bool,
+    depth: usize,
+}
+
+#[derive(Copy, Clone)]
+enum SelectionState {
+    None,
+    Partial,
+    Selected,
+}
+
+struct TerminalGuard {
+    raw_mode: bool,
+}
+
+impl TerminalGuard {
+    fn new() -> Result<Self, String> {
+        terminal::enable_raw_mode().map_err(|e| format!("Failed to enable raw mode: {}", e))?;
+        let mut stdout = std::io::stdout();
+        execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)
+            .map_err(|e| format!("Failed to initialize terminal: {}", e))?;
+        Ok(Self { raw_mode: true })
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let mut stdout = std::io::stdout();
+        let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
+        if self.raw_mode {
+            let _ = terminal::disable_raw_mode();
+        }
+    }
+}
+
+fn parse_only_request(matches: &ArgMatches, prune_local: bool) -> Result<OnlyRequest, String> {
+    if !matches.contains_id("only") {
+        return Ok(OnlyRequest::None);
+    }
+
+    if prune_local {
+        return Err("--only cannot be used together with --prune-local".to_string());
+    }
+
+    let values: Vec<String> = matches
+        .get_many::<String>("only")
+        .map(|vals| vals.map(|v| v.to_string()).collect())
+        .unwrap_or_default();
+
+    if values.is_empty() {
+        if is_json_mode() {
+            return Err("--only requires a path value when used in JSON mode".to_string());
+        }
+        return Ok(OnlyRequest::Interactive);
+    }
+
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values {
+        normalized.push(normalize_only_path(&value)?);
+    }
+
+    Ok(OnlyRequest::Paths(normalized))
+}
+
+fn normalize_only_path(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Invalid --only path: empty".to_string());
+    }
+
+    let mut path = trimmed.replace('\\', "/");
+
+    while path.starts_with("./") {
+        path = path[2..].to_string();
+    }
+
+    if path.starts_with('/') {
+        path = path.trim_start_matches('/').to_string();
+    }
+
+    while path.ends_with('/') {
+        path.pop();
+    }
+
+    if path.is_empty() {
+        return Err(format!("Invalid --only path: {}", value));
+    }
+
+    Ok(path)
+}
+
+fn filter_only_paths(
+    backup_tree: &HashMap<String, crate::core::metadata::BackupObject>,
+    only_paths: &[String],
+) -> Result<Vec<(String, crate::core::metadata::BackupObject)>, String> {
+    if only_paths.is_empty() {
+        return Err("No paths selected".to_string());
+    }
+
+    let mut matched_paths = HashSet::new();
+
+    for path in only_paths {
+        if backup_tree.contains_key(path) {
+            matched_paths.insert(path.clone());
+            continue;
+        }
+
+        let mut found = false;
+        let prefix = format!("{}/", path);
+        for key in backup_tree.keys() {
+            if key.starts_with(&prefix) {
+                matched_paths.insert(key.clone());
+                found = true;
+            }
+        }
+
+        if !found {
+            return Err(format!("No files found for path: {}", path));
+        }
+    }
+
+    let mut files: Vec<(String, crate::core::metadata::BackupObject)> = matched_paths
+        .into_iter()
+        .filter_map(|path| backup_tree.get(&path).map(|obj| (path, obj.clone())))
+        .collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    Ok(files)
+}
+
+fn select_only_paths_interactive(
+    backup_tree: &HashMap<String, crate::core::metadata::BackupObject>,
+) -> Result<Vec<String>, String> {
+    if backup_tree.is_empty() {
+        return Err("Backup contains no files to restore".to_string());
+    }
+
+    let root = build_tree(backup_tree);
+    let _guard = TerminalGuard::new()?;
+
+    let mut expanded: HashSet<String> = HashSet::new();
+    let mut selected: HashSet<String> = HashSet::new();
+    let mut cursor_index: usize = 0;
+    let mut scroll_offset: usize = 0;
+    let mut status_message: Option<String> = None;
+
+    loop {
+        let visible = visible_nodes(&root, &expanded);
+        if visible.is_empty() {
+            return Err("Backup contains no files to restore".to_string());
+        }
+
+        if cursor_index >= visible.len() {
+            cursor_index = visible.len().saturating_sub(1);
+        }
+
+        let selection_states = selection_states(&root, &selected);
+        render_selector(
+            &visible,
+            &expanded,
+            &selected,
+            &selection_states,
+            cursor_index,
+            &mut scroll_offset,
+            status_message.as_deref(),
+        )?;
+        status_message = None;
+
+        let event = event::read().map_err(|e| format!("Failed to read input: {}", e))?;
+        let Event::Key(key) = event else {
+            continue;
+        };
+
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                return Err("Selection cancelled".to_string());
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Err("Selection cancelled".to_string());
+            }
+            KeyCode::Up => {
+                if cursor_index > 0 {
+                    cursor_index -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if cursor_index + 1 < visible.len() {
+                    cursor_index += 1;
+                }
+            }
+            KeyCode::PageUp => {
+                let page_size = current_page_size()?;
+                cursor_index = cursor_index.saturating_sub(page_size);
+                scroll_offset = page_start_for(cursor_index, page_size);
+            }
+            KeyCode::PageDown => {
+                let page_size = current_page_size()?;
+                let next = cursor_index.saturating_add(page_size);
+                cursor_index = next.min(visible.len().saturating_sub(1));
+                scroll_offset = page_start_for(cursor_index, page_size);
+            }
+            KeyCode::BackTab => {
+                expanded.clear();
+            }
+            KeyCode::Tab => {
+                let current = &visible[cursor_index];
+                if current.is_dir {
+                    if expanded.contains(&current.path) {
+                        expanded.remove(&current.path);
+                    } else {
+                        expanded.insert(current.path.clone());
+                    }
+                }
+            }
+            KeyCode::Char(' ') => {
+                let current = &visible[cursor_index];
+                if current.is_dir {
+                    if let Some(node) = find_node_by_path(&root, &current.path) {
+                        let mut files = Vec::new();
+                        collect_file_paths(node, &mut files);
+                        let all_selected = files.iter().all(|path| selected.contains(path));
+                        if all_selected {
+                            for path in files {
+                                selected.remove(&path);
+                            }
+                        } else {
+                            for path in files {
+                                selected.insert(path);
+                            }
+                        }
+                    }
+                } else if selected.contains(&current.path) {
+                    selected.remove(&current.path);
+                } else {
+                    selected.insert(current.path.clone());
+                }
+            }
+            KeyCode::Enter => {
+                if selected.is_empty() {
+                    status_message = Some("Select at least one path using space.".to_string());
+                } else {
+                    let mut result: Vec<String> = selected.into_iter().collect();
+                    result.sort();
+                    return Ok(result);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn current_page_size() -> Result<usize, String> {
+    let (_, height) =
+        terminal::size().map_err(|e| format!("Failed to read terminal size: {}", e))?;
+    let header_lines = 2u16;
+    let footer_lines = 1u16;
+    let available = height.saturating_sub(header_lines + footer_lines);
+    let page_size = available as usize;
+    if page_size == 0 {
+        return Err("Terminal window too small to render selector".to_string());
+    }
+    Ok(page_size)
+}
+
+fn page_start_for(cursor_index: usize, page_size: usize) -> usize {
+    if page_size == 0 {
+        return 0;
+    }
+    (cursor_index / page_size) * page_size
+}
+
+fn render_selector(
+    visible: &[VisibleNode],
+    expanded: &HashSet<String>,
+    selected: &HashSet<String>,
+    selection_states: &HashMap<String, SelectionState>,
+    cursor_index: usize,
+    scroll_offset: &mut usize,
+    status_message: Option<&str>,
+) -> Result<(), String> {
+    let (width, height) =
+        terminal::size().map_err(|e| format!("Failed to read terminal size: {}", e))?;
+    let header_lines = 2usize;
+    let footer_lines = 1usize;
+    let view_height = height.saturating_sub((header_lines + footer_lines) as u16) as usize;
+
+    if view_height == 0 {
+        return Err("Terminal window too small to render selector".to_string());
+    }
+
+    if cursor_index < *scroll_offset {
+        *scroll_offset = cursor_index;
+    } else if cursor_index >= *scroll_offset + view_height {
+        *scroll_offset = cursor_index + 1 - view_height;
+    }
+
+    let total_pages = (visible.len().saturating_sub(1) / view_height) + 1;
+    let current_page = (cursor_index / view_height) + 1;
+
+    let mut stdout = std::io::stdout();
+    queue!(
+        stdout,
+        terminal::Clear(ClearType::All),
+        cursor::MoveTo(0, 0)
+    )
+    .map_err(|e| format!("Failed to render selector: {}", e))?;
+
+    let header = "Keys: Up/Down, Tab=expand/collapse, Shift+Tab=collapse all, Space=select, Enter=confirm, Q=cancel";
+    write_line(&mut stdout, header, width, true)?;
+
+    let selection_count = selected.len();
+    let summary = format!(
+        "Selected files: {} | Page {}/{} | Items: {}",
+        selection_count,
+        current_page,
+        total_pages,
+        visible.len()
+    );
+    write_line(&mut stdout, &summary, width, true)?;
+
+    for line_index in 0..view_height {
+        let item_index = *scroll_offset + line_index;
+        if item_index >= visible.len() {
+            write_line(&mut stdout, "", width, true)?;
+            continue;
+        }
+
+        let item = &visible[item_index];
+        let cursor_marker = if item_index == cursor_index { ">" } else { " " };
+        let selection_state = selection_states
+            .get(&item.path)
+            .copied()
+            .unwrap_or(SelectionState::None);
+        let selection_marker = match selection_state {
+            SelectionState::None => "[ ]",
+            SelectionState::Partial => "[~]",
+            SelectionState::Selected => "[x]",
+        };
+
+        let indent = "  ".repeat(item.depth);
+        let expand_marker = if item.is_dir {
+            if expanded.contains(&item.path) {
+                "-"
+            } else {
+                "+"
+            }
+        } else {
+            " "
+        };
+        let display_name = if item.is_dir {
+            format!("{}/", item.name)
+        } else {
+            item.name.clone()
+        };
+
+        let line = format!(
+            "{} {} {}{} {}",
+            cursor_marker, selection_marker, indent, expand_marker, display_name
+        );
+        write_line(&mut stdout, &line, width, true)?;
+    }
+
+    let footer = status_message.unwrap_or("");
+    write_line(&mut stdout, footer, width, false)?;
+
+    stdout
+        .flush()
+        .map_err(|e| format!("Failed to render selector: {}", e))?;
+    Ok(())
+}
+
+fn write_line(
+    stdout: &mut std::io::Stdout,
+    text: &str,
+    width: u16,
+    newline: bool,
+) -> Result<(), String> {
+    let mut line = String::new();
+    let mut count = 0usize;
+    for ch in text.chars() {
+        if count >= width as usize {
+            break;
+        }
+        line.push(ch);
+        count += 1;
+    }
+    if newline {
+        line.push_str("\r\n");
+    } else {
+        line.push('\r');
+    }
+    stdout
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("Failed to write output: {}", e))?;
+    Ok(())
+}
+
+fn visible_nodes(root: &TreeNode, expanded: &HashSet<String>) -> Vec<VisibleNode> {
+    let mut out = Vec::new();
+    collect_visible_nodes(root, expanded, 0, &mut out);
+    out
+}
+
+fn collect_visible_nodes(
+    node: &TreeNode,
+    expanded: &HashSet<String>,
+    depth: usize,
+    out: &mut Vec<VisibleNode>,
+) {
+    for child in &node.children {
+        out.push(VisibleNode {
+            path: child.path.clone(),
+            name: child.name.clone(),
+            is_dir: child.is_dir,
+            depth,
+        });
+        if child.is_dir && expanded.contains(&child.path) {
+            collect_visible_nodes(child, expanded, depth + 1, out);
+        }
+    }
+}
+
+fn selection_states(
+    root: &TreeNode,
+    selected: &HashSet<String>,
+) -> HashMap<String, SelectionState> {
+    let mut states = HashMap::new();
+    fill_selection_states(root, selected, &mut states);
+    states
+}
+
+fn fill_selection_states(
+    node: &TreeNode,
+    selected: &HashSet<String>,
+    states: &mut HashMap<String, SelectionState>,
+) -> SelectionState {
+    if node.is_dir {
+        let mut any_selected = false;
+        let mut all_selected = true;
+
+        for child in &node.children {
+            let child_state = fill_selection_states(child, selected, states);
+            match child_state {
+                SelectionState::Selected => {
+                    any_selected = true;
+                }
+                SelectionState::Partial => {
+                    any_selected = true;
+                    all_selected = false;
+                }
+                SelectionState::None => {
+                    all_selected = false;
+                }
+            }
+        }
+
+        let state = if node.children.is_empty() {
+            SelectionState::None
+        } else if all_selected {
+            SelectionState::Selected
+        } else if any_selected {
+            SelectionState::Partial
+        } else {
+            SelectionState::None
+        };
+
+        if !node.path.is_empty() {
+            states.insert(node.path.clone(), state);
+        }
+
+        state
+    } else {
+        let state = if selected.contains(&node.path) {
+            SelectionState::Selected
+        } else {
+            SelectionState::None
+        };
+        if !node.path.is_empty() {
+            states.insert(node.path.clone(), state);
+        }
+        state
+    }
+}
+
+fn build_tree(backup_tree: &HashMap<String, crate::core::metadata::BackupObject>) -> TreeNode {
+    let mut root = TreeNode::new(String::new(), String::new(), true);
+
+    for path in backup_tree.keys() {
+        let parts: Vec<&str> = path.split('/').collect();
+        let mut current = &mut root;
+        let mut current_path = String::new();
+
+        for (index, part) in parts.iter().enumerate() {
+            if !current_path.is_empty() {
+                current_path.push('/');
+            }
+            current_path.push_str(part);
+
+            let is_last = index == parts.len().saturating_sub(1);
+            if is_last {
+                if current
+                    .children
+                    .iter()
+                    .any(|child| child.path == current_path)
+                {
+                    continue;
+                }
+                current
+                    .children
+                    .push(TreeNode::new(part.to_string(), current_path.clone(), false));
+            } else {
+                let next_index = current
+                    .children
+                    .iter()
+                    .position(|child| child.is_dir && child.name == *part);
+                match next_index {
+                    Some(index) => current = &mut current.children[index],
+                    None => {
+                        current.children.push(TreeNode::new(
+                            part.to_string(),
+                            current_path.clone(),
+                            true,
+                        ));
+                        let len = current.children.len();
+                        current = &mut current.children[len - 1];
+                    }
+                }
+            }
+        }
+    }
+
+    sort_tree(&mut root);
+    root
+}
+
+fn sort_tree(node: &mut TreeNode) {
+    node.children.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => a.name.cmp(&b.name),
+    });
+    for child in &mut node.children {
+        if child.is_dir {
+            sort_tree(child);
+        }
+    }
+}
+
+fn find_node_by_path<'a>(node: &'a TreeNode, path: &str) -> Option<&'a TreeNode> {
+    if node.path == path {
+        return Some(node);
+    }
+
+    for child in &node.children {
+        if let Some(found) = find_node_by_path(child, path) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
+fn collect_file_paths(node: &TreeNode, out: &mut Vec<String>) {
+    if node.is_dir {
+        for child in &node.children {
+            collect_file_paths(child, out);
+        }
+    } else if !node.path.is_empty() {
+        out.push(node.path.clone());
+    }
+}
+
 async fn resolve_backup_hash(
     fs: Arc<dyn FS>,
     key: String,
@@ -492,7 +1120,18 @@ fn cleanup_extra_files(
 
 fn get_params(
     matches: &ArgMatches,
-) -> Result<(String, String, Option<String>, Option<String>, String, bool), String> {
+) -> Result<
+    (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        bool,
+        OnlyRequest,
+    ),
+    String,
+> {
     let password: Option<String> = matches
         .get_one::<String>("password")
         .map(|s| s.to_string())
@@ -522,6 +1161,9 @@ fn get_params(
     let key = matches
         .get_one::<String>("key")
         .map_or_else(|| default_key, |key| key.to_string());
+
+    let prune_local = matches.get_flag("prune-local");
+    let only_request = parse_only_request(matches, prune_local)?;
 
     let home_dir = home_dir().unwrap();
     let storage_path = home_dir.join(".gib").join("storages");
@@ -581,8 +1223,6 @@ fn get_params(
 
     let backup_hash = matches.get_one::<String>("backup").map(|s| s.to_string());
 
-    let prune_local = matches.get_flag("prune-local");
-
     Ok((
         key,
         storage,
@@ -590,5 +1230,6 @@ fn get_params(
         backup_hash,
         target_path,
         prune_local,
+        only_request,
     ))
 }

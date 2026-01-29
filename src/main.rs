@@ -118,6 +118,15 @@ fn cli() -> Command {
                 .arg(arg!(-s --storage <STORAGE> "The storage to use").required(false))
                 .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))
                 .arg(
+                    Arg::new("only")
+                        .long("only")
+                        .value_name("PATH")
+                        .help("Restore only the specified file or directory (omit value to select interactively)")
+                        .num_args(0..=1)
+                        .action(clap::ArgAction::Append)
+                        .required(false),
+                )
+                .arg(
                     Arg::new("target-path")
                         .short('t')
                         .long("target-path")
@@ -129,6 +138,7 @@ fn cli() -> Command {
                     Arg::new("prune-local")
                         .short('d')
                         .long("prune-local")
+                        .visible_alias("delete")
                         .help("Delete local files that are not in the backup tree")
                         .action(clap::ArgAction::SetTrue)
                         .required(false),
