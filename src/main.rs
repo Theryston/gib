@@ -102,6 +102,13 @@ fn cli() -> Command {
                         .required(false),
                 )
                 .subcommand(
+                    Command::new("pending")
+                        .about("List pending backups for a repository")
+                        .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
+                        .arg(arg!(-s --storage <STORAGE> "The storage to use").required(false))
+                        .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))
+                )
+                .subcommand(
                     Command::new("delete")
                         .about("Delete a backup and its orphaned chunks")
                         .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
@@ -118,6 +125,15 @@ fn cli() -> Command {
                 .arg(arg!(-s --storage <STORAGE> "The storage to use").required(false))
                 .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))
                 .arg(
+                    Arg::new("only")
+                        .long("only")
+                        .value_name("PATH")
+                        .help("Restore only the specified file or directory (omit value to select interactively)")
+                        .num_args(0..=1)
+                        .action(clap::ArgAction::Append)
+                        .required(false),
+                )
+                .arg(
                     Arg::new("target-path")
                         .short('t')
                         .long("target-path")
@@ -129,6 +145,7 @@ fn cli() -> Command {
                     Arg::new("prune-local")
                         .short('d')
                         .long("prune-local")
+                        .visible_alias("delete")
                         .help("Delete local files that are not in the backup tree")
                         .action(clap::ArgAction::SetTrue)
                         .required(false),
@@ -230,6 +247,7 @@ async fn main() {
         Some(("log", matches)) => commands::log(matches).await,
         Some(("backup", matches)) => match matches.subcommand() {
             Some(("delete", matches)) => commands::delete(matches).await,
+            Some(("pending", matches)) => commands::pending(matches).await,
             None => commands::backup(matches).await,
             _ => {
                 handle_error(

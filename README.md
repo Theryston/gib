@@ -39,6 +39,16 @@ That's it! Run `gib --help` to get started.
 
 Every backup creates a unique snapshot with its own hash. Travel back in time to any point — restore exactly what you need, when you need it.
 
+### 🎯 Selective Restore (Only What You Need)
+
+Need a single file from a huge backup? Use `--only` to restore specific paths — either by passing a path directly or using the interactive selector to pick files and folders. Fast, precise, and no extra noise.
+
+### ♻️ Resume Interrupted Backups
+
+If your connection drops or a backup gets interrupted, you don't lose progress. Use `--continue <backup-hash>` to pick up exactly where it stopped and reuse already uploaded chunks.
+
+Tip: for list all pending backups run `gib backup pending`.
+
 ### 📁 Multi-Folder Backup with Repository Keys
 
 Organize your backups using **repository keys** — unique identifiers that group all backups from a specific context together. Each key acts as a separate backup repository:
@@ -219,6 +229,7 @@ gib backup \
   --key my-project \           # Repository name (default: folder name)
   --message "My backup" \      # Backup description
   --storage cloud \            # Which storage to use
+  --continue abc12345 \        # Continue an interrupted backup (by hash prefix)
   --password "secret" \        # Enable encryption
   --compress 3 \               # Compression level (1-22, default: 3)
   --chunk-size "10 MB" \       # Chunk size (default: 5 MB)
@@ -233,8 +244,11 @@ gib restore \
   --backup abc12345 \          # Backup hash (full or first 8 chars)
   --storage cloud \            # Which storage to use
   --password "secret" \        # Decrypt password
+  --only path/to/file_or_dir \ # Restore only a specific file/folder
   --target-path ./restored     # Where to restore (default: current dir)
 ```
+
+Tip: run `gib restore --only` (with no path) to open the interactive selector and pick exactly what you want to restore.
 
 ---
 

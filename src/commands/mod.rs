@@ -3,6 +3,7 @@ mod config;
 mod delete;
 mod encrypt;
 mod log;
+mod pending;
 mod restore;
 mod whoami;
 
@@ -13,5 +14,6 @@ pub use config::config;
 pub use delete::delete;
 pub use encrypt::encrypt;
 pub use log::log;
+pub use pending::pending;
 pub use restore::restore;
 pub use whoami::whoami;
