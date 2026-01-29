@@ -30,8 +30,6 @@ use std::time::Duration;
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use tokio::task::JoinSet;
 
-const MAX_CONCURRENT_FILES: usize = 100;
-
 pub async fn backup(matches: &ArgMatches) {
     let (
         key,
@@ -43,6 +41,7 @@ pub async fn backup(matches: &ArgMatches) {
         chunk_size,
         ignore_patterns,
         received_pending_backup,
+        concurrency,
     ) = match get_params(matches).await {
         Ok(params) => params,
         Err(e) => handle_error(e, None),
@@ -167,11 +166,13 @@ pub async fn backup(matches: &ArgMatches) {
     let files_set = Arc::new(TokioMutex::new(JoinSet::new()));
     let written_bytes = Arc::new(Mutex::new(0));
     let deduplicated_bytes = Arc::new(Mutex::new(0));
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILES));
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+
     let pending_backup = Arc::new(Mutex::new(PendingBackup {
         message: new_backup.lock().unwrap().message.clone(),
         compress,
         chunk_size,
+        concurrency,
         ignore_patterns: ignore_patterns.clone(),
         processed_chunks: Vec::new(),
     }));
@@ -205,7 +206,7 @@ pub async fn backup(matches: &ArgMatches) {
     let files_stream = stream::iter(root_files);
 
     files_stream
-        .for_each_concurrent(MAX_CONCURRENT_FILES, |file_path| {
+        .for_each_concurrent(concurrency, |file_path| {
             let pb_clone = pb.clone();
             let chunk_indexes_clone = Arc::clone(&chunk_indexes);
             let password_clone = password.clone();
@@ -730,6 +731,7 @@ async fn get_params(
         u64,
         Vec<String>,
         Option<PendingBackupMatch>,
+        usize,
     ),
     String,
 > {
@@ -918,6 +920,22 @@ async fn get_params(
         }
     }
 
+    let default_concurrency = num_cpus::get() * 2;
+
+    let concurrency = matches.get_one::<String>("concurrency").map_or_else(
+        || {
+            if let Some(pending) = &pending_backup
+                && pending.backup.concurrency != default_concurrency
+            {
+                reused_data.push("concurrency".to_string());
+                pending.backup.concurrency
+            } else {
+                default_concurrency
+            }
+        },
+        |concurrency| concurrency.parse().unwrap_or(default_concurrency),
+    );
+
     Ok((
         key,
         message,
@@ -928,5 +946,6 @@ async fn get_params(
         chunk_size,
         ignore_patterns,
         pending_backup,
+        concurrency,
     ))
 }

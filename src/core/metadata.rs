@@ -40,5 +40,6 @@ pub(crate) struct PendingBackup {
     pub(crate) compress: i32,
     pub(crate) chunk_size: u64,
     pub(crate) ignore_patterns: Vec<String>,
+    pub(crate) concurrency: usize,
     pub(crate) processed_chunks: Vec<String>,
 }

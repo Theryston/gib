@@ -94,6 +94,13 @@ fn cli() -> Command {
                         .help("Continue the backup from an incomplete backup")
                         .required(false),
                 )
+                .arg(
+                    Arg::new("concurrency")
+                        .long("concurrency")
+                        .help("How many files to process at the same time [default: the number of CPUs * 2]")
+                        .value_name("CONCURRENCY")
+                        .required(false),
+                )
                 .subcommand(
                     Command::new("delete")
                         .about("Delete a backup and its orphaned chunks")
