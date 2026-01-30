@@ -20,13 +20,13 @@
 ### Linux & macOS
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Theryston/gib/main/install.sh | bash
+curl -fsSL https://trygib.org/unix.sh | bash
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/Theryston/gib/main/install.ps1 | iex
+irm https://trygib.org/win.ps1 | iex
 ```
 
 That's it! Run `gib --help` to get started.
