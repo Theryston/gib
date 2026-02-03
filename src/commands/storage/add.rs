@@ -1,25 +1,18 @@
-use clap::ArgMatches;
+﻿use clap::ArgMatches;
 use dialoguer::{Input, Select};
 use dirs::home_dir;
 use indicatif::{ProgressBar, ProgressStyle};
 use rmp_serde::Serializer;
-use serde::{Deserialize, Serialize};
-use std::path::Path;
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::output::{JsonProgress, emit_output, is_json_mode};
+use crate::storage_clients::{
+    public_fields, storage_definition, storage_definitions, storage_type_values, StorageConfig,
+    StorageDefinition, StorageField, StorageFields,
+};
 use crate::utils::handle_error;
-
-#[derive(Debug, PartialEq, Deserialize, Serialize)]
-pub struct Storage {
-    pub storage_type: u8,
-    pub path: Option<String>,
-    pub region: Option<String>,
-    pub bucket: Option<String>,
-    pub access_key: Option<String>,
-    pub secret_key: Option<String>,
-    pub endpoint: Option<String>,
-}
 
 pub fn add(matches: &ArgMatches) {
     let name = matches.get_one::<String>("name").map_or_else(
@@ -53,171 +46,22 @@ pub fn add(matches: &ArgMatches) {
         );
     }
 
-    let storage_type: u8 = matches.get_one::<String>("type").map_or_else(
-        || {
-            if is_json_mode() {
-                handle_error(
-                    "Missing required argument: --type (required in --mode json)".to_string(),
-                    None,
-                );
-            }
-            let selected_storage_type: u8 = Select::new()
-                .with_prompt("Enter the type of the storage")
-                .default(0)
-                .items(&["local", "s3"])
-                .interact()
-                .unwrap_or_else(|e| {
-                    handle_error(format!("Error: {}", e), None);
-                }) as u8;
-            selected_storage_type
-        },
-        |storage_type| match storage_type.as_str() {
-            "local" => 0u8,
-            "s3" => 1u8,
-            _ => {
-                handle_error(format!("Unknown storage type '{}'", storage_type), None);
-            }
-        },
-    );
+    let storage_definition = select_storage_definition(matches);
 
-    let mut storage = Storage {
-        storage_type,
-        path: None,
-        region: None,
-        bucket: None,
-        access_key: None,
-        secret_key: None,
-        endpoint: None,
+    let mut fields = StorageFields::new();
+    for field in storage_definition.fields {
+        if let Some(value) = resolve_field_value(field, matches, &fields) {
+            fields.insert(field.key.to_string(), value);
+        }
+    }
+
+    let mut storage = StorageConfig {
+        storage_type: storage_definition.id.to_string(),
+        fields,
     };
 
-    if storage_type == 0 {
-        let path = matches.get_one::<String>("path").map_or_else(
-            || {
-                if is_json_mode() {
-                    handle_error(
-                        "Missing required argument: --path (required in --mode json)".to_string(),
-                        None,
-                    );
-                }
-                let typed_path: String = Input::<String>::new()
-                    .with_prompt("Enter the path for local storage")
-                    .interact_text()
-                    .unwrap_or_else(|e| {
-                        handle_error(format!("Error: {}", e), None);
-                    });
-                typed_path
-            },
-            |path| path.to_string(),
-        );
-
-        if !Path::new(&path).exists() {
-            std::fs::create_dir_all(&path)
-                .unwrap_or_else(|e| handle_error(format!("Failed to create path: {}", e), None));
-        }
-
-        storage.path = Some(path);
-    } else {
-        let region = matches.get_one::<String>("region").map_or_else(
-            || {
-                if is_json_mode() {
-                    handle_error(
-                        "Missing required argument: --region (required in --mode json)".to_string(),
-                        None,
-                    );
-                }
-                let typed_region: String = Input::<String>::new()
-                    .with_prompt("Enter the S3 region")
-                    .interact_text()
-                    .unwrap_or_else(|e| {
-                        handle_error(format!("Error: {}", e), None);
-                    });
-                typed_region
-            },
-            |region| region.to_string(),
-        );
-
-        let bucket = matches.get_one::<String>("bucket").map_or_else(
-            || {
-                if is_json_mode() {
-                    handle_error(
-                        "Missing required argument: --bucket (required in --mode json)".to_string(),
-                        None,
-                    );
-                }
-                let typed_bucket: String = Input::<String>::new()
-                    .with_prompt("Enter the S3 bucket")
-                    .interact_text()
-                    .unwrap_or_else(|e| {
-                        handle_error(format!("Error: {}", e), None);
-                    });
-                typed_bucket
-            },
-            |bucket| bucket.to_string(),
-        );
-
-        let access_key = matches.get_one::<String>("access-key").map_or_else(
-            || {
-                if is_json_mode() {
-                    handle_error(
-                        "Missing required argument: --access-key (required in --mode json)"
-                            .to_string(),
-                        None,
-                    );
-                }
-                let typed_access_key: String = Input::<String>::new()
-                    .with_prompt("Enter the S3 access key")
-                    .interact_text()
-                    .unwrap_or_else(|e| {
-                        handle_error(format!("Error: {}", e), None);
-                    });
-                typed_access_key
-            },
-            |access_key| access_key.to_string(),
-        );
-
-        let secret_key = matches.get_one::<String>("secret-key").map_or_else(
-            || {
-                if is_json_mode() {
-                    handle_error(
-                        "Missing required argument: --secret-key (required in --mode json)"
-                            .to_string(),
-                        None,
-                    );
-                }
-                let typed_secret_key: String = Input::<String>::new()
-                    .with_prompt("Enter the S3 secret key")
-                    .interact_text()
-                    .unwrap_or_else(|e| {
-                        handle_error(format!("Error: {}", e), None);
-                    });
-                typed_secret_key
-            },
-            |secret_key| secret_key.to_string(),
-        );
-
-        let endpoint = matches.get_one::<String>("endpoint").map_or_else(
-            || {
-                if is_json_mode() {
-                    return format!("https://s3.{}.amazonaws.com", region);
-                }
-                let typed_endpoint: String = Input::<String>::new()
-                    .with_prompt("Enter the S3 endpoint")
-                    .default(format!("https://s3.{}.amazonaws.com", region))
-                    .show_default(true)
-                    .interact_text()
-                    .unwrap_or_else(|e| {
-                        handle_error(format!("Error: {}", e), None);
-                    });
-                typed_endpoint
-            },
-            |endpoint| endpoint.to_string(),
-        );
-
-        storage.region = Some(region);
-        storage.bucket = Some(bucket);
-        storage.access_key = Some(access_key);
-        storage.secret_key = Some(secret_key);
-        storage.endpoint = Some(endpoint);
+    if let Some(prepare) = storage_definition.prepare {
+        prepare(&mut storage).unwrap_or_else(|e| handle_error(e, None));
     }
 
     let json_progress = if is_json_mode() {
@@ -267,25 +111,22 @@ pub fn add(matches: &ArgMatches) {
         struct StorageOutput {
             name: String,
             storage_type: String,
+            fields: BTreeMap<String, String>,
             path: Option<String>,
             region: Option<String>,
             bucket: Option<String>,
             endpoint: Option<String>,
         }
 
-        let storage_type_label = match storage.storage_type {
-            0 => "local",
-            1 => "s3",
-            _ => "unknown",
-        };
-
+        let fields = public_fields(&storage);
         let payload = StorageOutput {
             name,
-            storage_type: storage_type_label.to_string(),
-            path: storage.path,
-            region: storage.region,
-            bucket: storage.bucket,
-            endpoint: storage.endpoint,
+            storage_type: storage.storage_type.clone(),
+            path: fields.get("path").cloned(),
+            region: fields.get("region").cloned(),
+            bucket: fields.get("bucket").cloned(),
+            endpoint: fields.get("endpoint").cloned(),
+            fields,
         };
         emit_output(&payload);
     } else {
@@ -295,4 +136,95 @@ pub fn add(matches: &ArgMatches) {
         pb.set_prefix("OK");
         pb.finish_with_message(format!("Storage written ({:.2?})", elapsed));
     }
+}
+
+fn select_storage_definition(matches: &ArgMatches) -> &'static StorageDefinition {
+    let storage_type = matches.get_one::<String>("type").map(|value| value.to_string());
+
+    if let Some(storage_type) = storage_type {
+        return storage_definition(&storage_type).unwrap_or_else(|| {
+            let available = storage_type_values().join(", ");
+            handle_error(
+                format!(
+                    "Unknown storage type '{}'. Available types: {}",
+                    storage_type, available
+                ),
+                None,
+            );
+        });
+    }
+
+    if is_json_mode() {
+        let available = storage_type_values().join(", ");
+        handle_error(
+            format!(
+                "Missing required argument: --type (required in --mode json). Available types: {}",
+                available
+            ),
+            None,
+        );
+    }
+
+    let definitions = storage_definitions();
+    let items: Vec<&str> = definitions.iter().map(|definition| definition.label).collect();
+
+    let selected_storage_type: usize = Select::new()
+        .with_prompt("Enter the type of the storage")
+        .default(0)
+        .items(&items)
+        .interact()
+        .unwrap_or_else(|e| {
+            handle_error(format!("Error: {}", e), None);
+        });
+
+    &definitions[selected_storage_type]
+}
+
+fn resolve_field_value(
+    field: &StorageField,
+    matches: &ArgMatches,
+    fields: &StorageFields,
+) -> Option<String> {
+    if let Some(value) = matches.get_one::<String>(field.arg_name) {
+        return Some(value.to_string());
+    }
+
+    let default_value = field.default_value.map(|default| default(fields));
+
+    if is_json_mode() {
+        if field.required && default_value.is_none() {
+            handle_error(
+                format!(
+                    "Missing required argument: --{} (required in --mode json)",
+                    field.arg_name
+                ),
+                None,
+            );
+        }
+
+        return default_value;
+    }
+
+    if !field.required && default_value.is_none() {
+        return None;
+    }
+
+    let mut input = Input::<String>::new().with_prompt(field.prompt);
+    if let Some(default) = &default_value {
+        input = input.default(default.clone()).show_default(true);
+    }
+
+    let typed_value: String = input.interact_text().unwrap_or_else(|e| {
+        handle_error(format!("Error: {}", e), None);
+    });
+
+    if field.required && typed_value.trim().is_empty() {
+        handle_error(format!("Field '{}' is required", field.arg_name), None);
+    }
+
+    if typed_value.is_empty() {
+        return None;
+    }
+
+    Some(typed_value)
 }

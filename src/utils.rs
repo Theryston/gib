@@ -1,7 +1,4 @@
-use crate::commands::storage::add::Storage;
-use crate::storage_clients::{
-    ClientStorage, LocalClientStorage, S3ClientStorage, S3ClientStorageConfig,
-};
+use crate::storage_clients::{build_storage_client, parse_storage_config, ClientStorage, StorageConfig};
 use argon2::Argon2;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
@@ -95,7 +92,7 @@ pub fn get_pwd_string() -> String {
         .to_string()
 }
 
-pub fn get_storage(name: &str) -> Storage {
+pub fn get_storage(name: &str) -> StorageConfig {
     let home_dir = home_dir().unwrap();
     let storage_path = home_dir
         .join(".gib")
@@ -105,9 +102,8 @@ pub fn get_storage(name: &str) -> Storage {
         handle_error(format!("Failed to read storage '{}': {}", name, e), None)
     });
 
-    rmp_serde::from_slice(&contents).unwrap_or_else(|e| {
-        handle_error(format!("Failed to parse storage '{}': {}", name, e), None)
-    })
+    parse_storage_config(&contents)
+        .unwrap_or_else(|e| handle_error(format!("Failed to parse storage '{}': {}", name, e), None))
 }
 
 pub fn handle_error(error: String, pb: Option<&ProgressBar>) -> ! {
@@ -122,20 +118,9 @@ pub fn handle_error(error: String, pb: Option<&ProgressBar>) -> ! {
     }
 }
 
-pub fn get_storage_client(storage: &Storage, pb: Option<&ProgressBar>) -> Arc<dyn ClientStorage> {
-    let storage_client: Arc<dyn ClientStorage> = match storage.storage_type {
-        0 => Arc::new(LocalClientStorage::new(
-            storage.path.as_ref().unwrap().clone(),
-        )),
-        1 => Arc::new(S3ClientStorage::new(S3ClientStorageConfig {
-            region: storage.region.clone(),
-            bucket: storage.bucket.clone(),
-            access_key: storage.access_key.clone(),
-            secret_key: storage.secret_key.clone(),
-            endpoint: storage.endpoint.clone(),
-        })),
-        _ => handle_error("Invalid storage type".to_string(), pb),
-    };
-
-    storage_client
+pub fn get_storage_client(
+    storage: &StorageConfig,
+    pb: Option<&ProgressBar>,
+) -> Arc<dyn ClientStorage> {
+    build_storage_client(storage).unwrap_or_else(|e| handle_error(e, pb))
 }

@@ -1,4 +1,5 @@
-use crate::output::{emit_output, is_json_mode};
+﻿use crate::output::{emit_output, is_json_mode};
+use crate::storage_clients::{public_fields, storage_definition, storage_details};
 use crate::utils::{get_storage, handle_error};
 use dirs::home_dir;
 use tabled::{Table, Tabled};
@@ -38,24 +39,11 @@ pub fn list() {
         let storage_name = file_name.split('.').next().unwrap();
         let storage = get_storage(storage_name);
 
-        let storage_type = match storage.storage_type {
-            0 => "local",
-            1 => "s3",
-            _ => "unknown",
-        };
+        let storage_type = storage_definition(&storage.storage_type)
+            .map(|definition| definition.label)
+            .unwrap_or("unknown");
 
-        let details = match storage.storage_type {
-            0 => format!("path: {}", storage.path.clone().unwrap_or_default()),
-            1 => format!(
-                "region: {}, bucket: {}, access_key: {}, secret_key: {}, endpoint: {}",
-                storage.region.clone().unwrap_or_default(),
-                storage.bucket.clone().unwrap_or_default(),
-                "********",
-                "********",
-                storage.endpoint.clone().unwrap_or_default()
-            ),
-            _ => "unknown".to_string(),
-        };
+        let details = storage_details(&storage);
 
         rows.push(StorageRow {
             name: storage_name.to_string(),
@@ -63,13 +51,16 @@ pub fn list() {
             details: details.clone(),
         });
 
+        let fields = public_fields(&storage);
+
         json_rows.push(StorageInfo {
             name: storage_name.to_string(),
             storage_type: storage_type.to_string(),
-            path: storage.path,
-            region: storage.region,
-            bucket: storage.bucket,
-            endpoint: storage.endpoint,
+            path: fields.get("path").cloned(),
+            region: fields.get("region").cloned(),
+            bucket: fields.get("bucket").cloned(),
+            endpoint: fields.get("endpoint").cloned(),
+            fields,
         });
     }
 
@@ -85,6 +76,7 @@ pub fn list() {
 struct StorageInfo {
     name: String,
     storage_type: String,
+    fields: std::collections::BTreeMap<String, String>,
     path: Option<String>,
     region: Option<String>,
     bucket: Option<String>,

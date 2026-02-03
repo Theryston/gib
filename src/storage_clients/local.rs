@@ -1,5 +1,8 @@
-use crate::storage_clients::ClientStorage;
+use crate::storage_clients::{
+    ClientStorage, StorageConfig, StorageDefinition, StorageField, StorageFields,
+};
 use async_trait::async_trait;
+use std::sync::Arc;
 use walkdir::WalkDir;
 
 pub struct LocalClientStorage {
@@ -70,3 +73,46 @@ impl ClientStorage for LocalClientStorage {
         Ok(())
     }
 }
+
+fn build_client(fields: &StorageFields) -> Result<Arc<dyn ClientStorage>, String> {
+    let path = fields
+        .get("path")
+        .ok_or_else(|| "Missing required field: path".to_string())?;
+
+    Ok(Arc::new(LocalClientStorage::new(path.clone())))
+}
+
+fn prepare_storage(storage: &mut StorageConfig) -> Result<(), String> {
+    let path = storage
+        .fields
+        .get("path")
+        .ok_or_else(|| "Missing required field: path".to_string())?;
+
+    let path = std::path::Path::new(path);
+    if !path.exists() {
+        std::fs::create_dir_all(path).map_err(|e| format!("Failed to create path: {}", e))?;
+    }
+
+    Ok(())
+}
+
+const LOCAL_FIELDS: &[StorageField] = &[StorageField {
+    key: "path",
+    arg_name: "path",
+    value_name: "PATH",
+    short: Some('p'),
+    help: "The path for storing backups (only for local storage)",
+    prompt: "Enter the path for local storage",
+    required: true,
+    secret: false,
+    default_value: None,
+}];
+
+pub const DEFINITION: StorageDefinition = StorageDefinition {
+    id: "local",
+    label: "local",
+    legacy_type: Some(0),
+    fields: LOCAL_FIELDS,
+    build_client,
+    prepare: Some(prepare_storage),
+};

@@ -1,9 +1,12 @@
-use crate::storage_clients::ClientStorage;
+use crate::storage_clients::{
+    ClientStorage, StorageDefinition, StorageField, StorageFields,
+};
 use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sdk_s3 as s3;
 use aws_types::region::Region;
 use bytes::Bytes;
+use std::sync::Arc;
 
 pub struct S3ClientStorage {
     client: s3::Client,
@@ -132,3 +135,109 @@ impl ClientStorage for S3ClientStorage {
         Ok(())
     }
 }
+
+fn build_client(fields: &StorageFields) -> Result<Arc<dyn ClientStorage>, String> {
+    let region = fields
+        .get("region")
+        .ok_or_else(|| "Missing required field: region".to_string())?
+        .clone();
+    let bucket = fields
+        .get("bucket")
+        .ok_or_else(|| "Missing required field: bucket".to_string())?
+        .clone();
+    let access_key = fields
+        .get("access_key")
+        .ok_or_else(|| "Missing required field: access_key".to_string())?
+        .clone();
+    let secret_key = fields
+        .get("secret_key")
+        .ok_or_else(|| "Missing required field: secret_key".to_string())?
+        .clone();
+    let endpoint = fields
+        .get("endpoint")
+        .cloned()
+        .unwrap_or_else(|| format!("https://s3.{}.amazonaws.com", region));
+
+    Ok(Arc::new(S3ClientStorage::new(S3ClientStorageConfig {
+        region: Some(region),
+        bucket: Some(bucket),
+        access_key: Some(access_key),
+        secret_key: Some(secret_key),
+        endpoint: Some(endpoint),
+    })))
+}
+
+fn default_s3_endpoint(fields: &StorageFields) -> String {
+    let region = fields
+        .get("region")
+        .cloned()
+        .unwrap_or_else(|| "us-east-1".to_string());
+    format!("https://s3.{}.amazonaws.com", region)
+}
+
+const S3_FIELDS: &[StorageField] = &[
+    StorageField {
+        key: "region",
+        arg_name: "region",
+        value_name: "REGION",
+        short: Some('r'),
+        help: "The region for the S3 storage (only for S3 storage)",
+        prompt: "Enter the S3 region",
+        required: true,
+        secret: false,
+        default_value: None,
+    },
+    StorageField {
+        key: "bucket",
+        arg_name: "bucket",
+        value_name: "BUCKET",
+        short: Some('b'),
+        help: "The bucket for the S3 storage (only for S3 storage)",
+        prompt: "Enter the S3 bucket",
+        required: true,
+        secret: false,
+        default_value: None,
+    },
+    StorageField {
+        key: "access_key",
+        arg_name: "access-key",
+        value_name: "ACCESS_KEY",
+        short: Some('a'),
+        help: "The access key for the S3 storage (only for S3 storage)",
+        prompt: "Enter the S3 access key",
+        required: true,
+        secret: true,
+        default_value: None,
+    },
+    StorageField {
+        key: "secret_key",
+        arg_name: "secret-key",
+        value_name: "SECRET_KEY",
+        short: Some('s'),
+        help: "The secret key for the S3 storage (only for S3 storage)",
+        prompt: "Enter the S3 secret key",
+        required: true,
+        secret: true,
+        default_value: None,
+    },
+    StorageField {
+        key: "endpoint",
+        arg_name: "endpoint",
+        value_name: "ENDPOINT",
+        short: Some('e'),
+        help: "The endpoint for the S3 storage (only for S3 storage)",
+        prompt: "Enter the S3 endpoint",
+        required: false,
+        secret: false,
+        default_value: Some(default_s3_endpoint),
+    },
+];
+
+pub const DEFINITION: StorageDefinition = StorageDefinition {
+    id: "s3",
+    label: "s3",
+    legacy_type: Some(1),
+    fields: S3_FIELDS,
+    build_client,
+    prepare: None,
+};

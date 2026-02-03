@@ -1,4 +1,4 @@
-use clap::{Arg, Command, arg};
+use clap::{Arg, Command, arg, builder::PossibleValuesParser};
 
 use crate::output::{
     detect_mode_from_args, emit_error, emit_help, emit_version, init_panic_hook_if_json,
@@ -13,6 +13,39 @@ mod storage_clients;
 mod utils;
 
 fn cli() -> Command {
+    let storage_type_values = storage_clients::storage_type_values();
+    let storage_type_help = format!(
+        "The type of the storage ({})",
+        storage_type_values.join(", ")
+    );
+
+    let mut storage_add = Command::new("add")
+        .about("Add a new storage")
+        .arg(arg!(-n --name <NAME> "The name of the storage").required(false))
+        .arg(
+            Arg::new("type")
+                .short('t')
+                .long("type")
+                .value_name("TYPE")
+                .help(storage_type_help)
+                .required(false)
+                .value_parser(PossibleValuesParser::new(storage_type_values.clone())),
+        );
+
+    for field in storage_clients::storage_add_fields() {
+        let mut arg = Arg::new(field.arg_name)
+            .long(field.arg_name)
+            .value_name(field.value_name)
+            .help(field.help)
+            .required(false);
+
+        if let Some(short) = field.short {
+            arg = arg.short(short);
+        }
+
+        storage_add = storage_add.arg(arg);
+    }
+
     Command::new("gib")
         .about("A blazingly fast, modern backup tool with versioning, deduplication, and encryption.")
         .version(env!("CARGO_PKG_VERSION"))
@@ -154,36 +187,7 @@ fn cli() -> Command {
         .subcommand(
             Command::new("storage")
                 .about("Manage your storage")
-                .subcommand(
-                    Command::new("add")
-                        .about("Add a new storage")
-                        .arg(arg!(-n --name <NAME> "The name of the storage").required(false))
-                        .arg(
-                            arg!(-t --type <TYPE> "The type of the storage ('local' or 's3')")
-                                .required(false)
-                                .value_parser(["local", "s3"]),
-                        )
-                        .arg(arg!(-p --path <PATH> "The path for storing backups (only for local storage)").required(false))
-                        .arg(arg!(-r --region <REGION> "The region for the S3 storage (only for S3 storage)").required(false))
-                        .arg(arg!(-b --bucket <BUCKET> "The bucket for the S3 storage (only for S3 storage)").required(false))
-                        .arg(
-                            Arg::new("access-key")
-                                .short('a')
-                                .long("access-key")
-                                .value_name("ACCESS_KEY")
-                                .help("The access key for the S3 storage (only for S3 storage)")
-                                .required(false),
-                        )
-                        .arg(
-                            Arg::new("secret-key")
-                                .short('s')
-                                .long("secret-key")
-                                .value_name("SECRET_KEY")
-                                .help("The secret key for the S3 storage (only for S3 storage)")
-                                .required(false),
-                        )
-                        .arg(arg!(-e --endpoint <ENDPOINT> "The endpoint for the S3 storage (only for S3 storage)").required(false))
-                )
+                .subcommand(storage_add)
                 .subcommand(
                     Command::new("list")
                         .about("List all storages")
