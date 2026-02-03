@@ -1,5 +1,7 @@
 use crate::commands::storage::add::Storage;
-use crate::fs::{FS, LocalFS, S3FS, S3FSConfig};
+use crate::storage_clients::{
+    ClientStorage, LocalClientStorage, S3ClientStorage, S3ClientStorageConfig,
+};
 use argon2::Argon2;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
@@ -120,10 +122,12 @@ pub fn handle_error(error: String, pb: Option<&ProgressBar>) -> ! {
     }
 }
 
-pub fn get_fs(storage: &Storage, pb: Option<&ProgressBar>) -> Arc<dyn FS> {
-    let fs: Arc<dyn FS> = match storage.storage_type {
-        0 => Arc::new(LocalFS::new(storage.path.as_ref().unwrap().clone())),
-        1 => Arc::new(S3FS::new(S3FSConfig {
+pub fn get_storage_client(storage: &Storage, pb: Option<&ProgressBar>) -> Arc<dyn ClientStorage> {
+    let storage_client: Arc<dyn ClientStorage> = match storage.storage_type {
+        0 => Arc::new(LocalClientStorage::new(
+            storage.path.as_ref().unwrap().clone(),
+        )),
+        1 => Arc::new(S3ClientStorage::new(S3ClientStorageConfig {
             region: storage.region.clone(),
             bucket: storage.bucket.clone(),
             access_key: storage.access_key.clone(),
@@ -133,5 +137,5 @@ pub fn get_fs(storage: &Storage, pb: Option<&ProgressBar>) -> Arc<dyn FS> {
         _ => handle_error("Invalid storage type".to_string(), pb),
     };
 
-    fs
+    storage_client
 }

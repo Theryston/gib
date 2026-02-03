@@ -1,8 +1,8 @@
-use crate::core::crypto::get_password;
+﻿use crate::core::crypto::get_password;
 use crate::core::indexes::list_backup_summaries;
 use crate::core::metadata::BackupSummary;
 use crate::output::{emit_output, is_json_mode};
-use crate::utils::{get_fs, get_pwd_string, get_storage, handle_error};
+use crate::utils::{get_storage_client, get_pwd_string, get_storage, handle_error};
 use bytesize::ByteSize;
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use clap::ArgMatches;
@@ -24,10 +24,10 @@ pub async fn log(matches: &ArgMatches) {
 
     let storage = get_storage(&storage);
 
-    let fs = get_fs(&storage, None);
+    let storage_client = get_storage_client(&storage, None);
 
     let backup_summaries =
-        match list_backup_summaries(Arc::clone(&fs), key.clone(), password.clone()).await {
+        match list_backup_summaries(Arc::clone(&storage_client), key.clone(), password.clone()).await {
             Ok(summaries) => summaries,
             Err(e) => handle_error(e, None),
         };
@@ -266,3 +266,5 @@ fn display_paginated_backups(backup_summaries: &[BackupSummary]) {
     disable_raw_mode().unwrap_or(());
     term.clear_screen().unwrap_or(());
 }
+
+

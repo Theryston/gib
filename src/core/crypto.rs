@@ -1,5 +1,5 @@
-use crate::fs::FS;
 use crate::output::is_json_mode;
+use crate::storage_clients::ClientStorage;
 use crate::utils::handle_error;
 use crate::utils::{decrypt_bytes, encrypt_bytes, is_encrypted};
 use dialoguer::Password;
@@ -11,12 +11,15 @@ pub struct ReadDecryption {
 }
 
 pub(crate) async fn read_file_maybe_decrypt(
-    fs: &Arc<dyn FS>,
+    storage_client: &Arc<dyn ClientStorage>,
     path: &str,
     password: Option<&str>,
     encrypted_without_password_error: &str,
 ) -> Result<ReadDecryption, String> {
-    let file_bytes = fs.read_file(path).await.unwrap_or_else(|_| Vec::new());
+    let file_bytes = storage_client
+        .read_file(path)
+        .await
+        .unwrap_or_else(|_| Vec::new());
 
     if file_bytes.is_empty() {
         return Ok(ReadDecryption {
@@ -51,7 +54,7 @@ pub(crate) async fn read_file_maybe_decrypt(
 }
 
 pub(crate) async fn write_file_maybe_encrypt(
-    fs: &Arc<dyn FS>,
+    storage_client: &Arc<dyn ClientStorage>,
     path: &str,
     data: &[u8],
     password: Option<&str>,
@@ -61,7 +64,8 @@ pub(crate) async fn write_file_maybe_encrypt(
         None => data.to_vec(),
     };
 
-    fs.write_file(path, &final_bytes)
+    storage_client
+        .write_file(path, &final_bytes)
         .await
         .map_err(|e| format!("Failed to write file {}: {}", path, e))?;
 

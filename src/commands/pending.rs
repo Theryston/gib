@@ -1,7 +1,9 @@
 use crate::core::crypto::{get_password, read_file_maybe_decrypt};
 use crate::core::metadata::PendingBackup;
 use crate::output::{emit_output, emit_progress_message, is_json_mode};
-use crate::utils::{decompress_bytes, get_fs, get_pwd_string, get_storage, handle_error};
+use crate::utils::{
+    decompress_bytes, get_pwd_string, get_storage, get_storage_client, handle_error,
+};
 use bytesize::ByteSize;
 use clap::ArgMatches;
 use console::{Term, style};
@@ -38,9 +40,9 @@ pub async fn pending(matches: &ArgMatches) {
     };
 
     let storage = get_storage(&storage);
-    let fs = get_fs(&storage, None);
+    let storage_client = get_storage_client(&storage, None);
 
-    let pending_paths = match list_pending_backup_paths(Arc::clone(&fs), &key).await {
+    let pending_paths = match list_pending_backup_paths(Arc::clone(&storage_client), &key).await {
         Ok(paths) => paths,
         Err(e) => handle_error(e, None),
     };
@@ -77,9 +79,9 @@ pub async fn pending(matches: &ArgMatches) {
     let mut errors = Vec::new();
 
     let mut stream = stream::iter(pending_paths.into_iter().map(|path| {
-        let fs = Arc::clone(&fs);
+        let storage_client = Arc::clone(&storage_client);
         let password = password.clone();
-        async move { load_pending_backup_entry(fs, path, password).await }
+        async move { load_pending_backup_entry(storage_client, path, password).await }
     }))
     .buffer_unordered(concurrency);
 
@@ -117,11 +119,11 @@ pub async fn pending(matches: &ArgMatches) {
 }
 
 async fn list_pending_backup_paths(
-    fs: Arc<dyn crate::fs::FS>,
+    storage_client: Arc<dyn crate::storage_clients::ClientStorage>,
     key: &str,
 ) -> Result<Vec<String>, String> {
     let indexes_path = format!("{}/indexes", key);
-    let files = fs
+    let files = storage_client
         .list_files(&indexes_path)
         .await
         .map_err(|e| format!("Failed to list indexes in '{}': {}", indexes_path, e))?;
@@ -138,12 +140,12 @@ async fn list_pending_backup_paths(
 }
 
 async fn load_pending_backup_entry(
-    fs: Arc<dyn crate::fs::FS>,
+    storage_client: Arc<dyn crate::storage_clients::ClientStorage>,
     pending_path: String,
     password: Option<String>,
 ) -> Result<PendingBackupEntry, String> {
     let pending_result = read_file_maybe_decrypt(
-        &fs,
+        &storage_client,
         &pending_path,
         password.as_deref(),
         "Pending backup is encrypted but no password provided",

@@ -7,9 +7,11 @@ use crate::core::only::filter_only_paths;
 use crate::core::only::parse_only_request;
 use crate::core::only::select_only_paths_interactive;
 use crate::core::permissions::set_file_permissions;
-use crate::fs::FS;
 use crate::output::{JsonProgress, emit_output, emit_progress_message, emit_warning, is_json_mode};
-use crate::utils::{decompress_bytes, get_fs, get_pwd_string, get_storage, handle_error};
+use crate::storage_clients::ClientStorage;
+use crate::utils::{
+    decompress_bytes, get_pwd_string, get_storage, get_storage_client, handle_error,
+};
 use clap::ArgMatches;
 use dialoguer::Select;
 use dirs::home_dir;
@@ -38,10 +40,10 @@ pub async fn restore(matches: &ArgMatches) {
 
     let storage = get_storage(&storage);
 
-    let fs = get_fs(&storage, None);
+    let storage_client = get_storage_client(&storage, None);
 
     let full_backup_hash = match resolve_backup_hash(
-        Arc::clone(&fs),
+        Arc::clone(&storage_client),
         key.clone(),
         password.clone(),
         backup_hash,
@@ -67,7 +69,7 @@ pub async fn restore(matches: &ArgMatches) {
     }
 
     let backup = match load_backup(
-        Arc::clone(&fs),
+        Arc::clone(&storage_client),
         key.clone(),
         password.clone(),
         &full_backup_hash,
@@ -143,7 +145,7 @@ pub async fn restore(matches: &ArgMatches) {
     files_stream
         .for_each_concurrent(MAX_CONCURRENT_FILES, |(relative_path, backup_object)| {
             let pb_clone = pb.clone();
-            let fs_clone = Arc::clone(&fs);
+            let storage_client_clone = Arc::clone(&storage_client);
             let key_clone = key.clone();
             let password_clone = password.clone();
             let target_path_clone = target_path.clone();
@@ -200,7 +202,7 @@ pub async fn restore(matches: &ArgMatches) {
                         let chunk_path = format!("{}/chunks/{}/{}", key_clone, prefix, rest);
 
                         let chunk_data = read_file_maybe_decrypt(
-                            &fs_clone,
+                            &storage_client_clone,
                             &chunk_path,
                             password_clone.as_deref(),
                             "Chunk is encrypted but no password provided",
@@ -333,7 +335,7 @@ pub async fn restore(matches: &ArgMatches) {
 }
 
 async fn resolve_backup_hash(
-    fs: Arc<dyn FS>,
+    storage_client: Arc<dyn ClientStorage>,
     key: String,
     password: Option<String>,
     provided_hash: Option<String>,
@@ -341,7 +343,7 @@ async fn resolve_backup_hash(
     match provided_hash {
         Some(hash) => {
             if hash.len() <= 8 {
-                let summaries = list_backup_summaries(fs, key, password).await?;
+                let summaries = list_backup_summaries(storage_client, key, password).await?;
 
                 for summary in summaries {
                     if summary.hash.starts_with(&hash) {
@@ -360,7 +362,7 @@ async fn resolve_backup_hash(
                     "Missing required argument: --backup (required in --mode json)".to_string(),
                 );
             }
-            let summaries = list_backup_summaries(fs, key, password).await?;
+            let summaries = list_backup_summaries(storage_client, key, password).await?;
 
             if summaries.is_empty() {
                 return Err("No backups found in repository".to_string());
@@ -402,7 +404,7 @@ struct BackupSummaryDisplay {
 }
 
 async fn load_backup(
-    fs: Arc<dyn FS>,
+    storage_client: Arc<dyn ClientStorage>,
     key: String,
     password: Option<String>,
     backup_hash: &str,
@@ -410,7 +412,7 @@ async fn load_backup(
     let backup_path = format!("{}/backups/{}", key, backup_hash);
 
     let read_result = read_file_maybe_decrypt(
-        &fs,
+        &storage_client,
         &backup_path,
         password.as_deref(),
         "Backup is encrypted but no password provided",

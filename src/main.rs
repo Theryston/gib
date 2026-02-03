@@ -8,8 +8,8 @@ use crate::utils::handle_error;
 
 mod commands;
 mod core;
-mod fs;
 mod output;
+mod storage_clients;
 mod utils;
 
 fn cli() -> Command {

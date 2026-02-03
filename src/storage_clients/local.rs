@@ -1,19 +1,19 @@
-use crate::fs::FS;
+use crate::storage_clients::ClientStorage;
 use async_trait::async_trait;
 use walkdir::WalkDir;
 
-pub struct LocalFS {
+pub struct LocalClientStorage {
     path: std::path::PathBuf,
 }
 
-impl LocalFS {
+impl LocalClientStorage {
     pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
         Self { path: path.into() }
     }
 }
 
 #[async_trait]
-impl FS for LocalFS {
+impl ClientStorage for LocalClientStorage {
     async fn read_file(&self, path: &str) -> Result<Vec<u8>, std::io::Error> {
         std::fs::read(&self.path.join(path))
     }

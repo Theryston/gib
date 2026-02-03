@@ -3,10 +3,10 @@ use crate::core::crypto::read_file_maybe_decrypt;
 use crate::core::crypto::write_file_maybe_encrypt;
 use crate::core::indexes::{list_backup_summaries, load_chunk_indexes};
 use crate::core::metadata::Backup;
-use crate::fs::FS;
 use crate::output::{JsonProgress, emit_output, emit_progress_message, is_json_mode};
+use crate::storage_clients::ClientStorage;
 use crate::utils::{
-    compress_bytes, decompress_bytes, get_fs, get_pwd_string, get_storage, handle_error,
+    compress_bytes, decompress_bytes, get_pwd_string, get_storage, get_storage_client, handle_error,
 };
 use clap::ArgMatches;
 use dialoguer::Select;
@@ -31,10 +31,10 @@ pub async fn delete(matches: &ArgMatches) {
 
     let storage = get_storage(&storage);
 
-    let fs = get_fs(&storage, None);
+    let storage_client = get_storage_client(&storage, None);
 
     let full_backup_hash = match resolve_backup_hash(
-        Arc::clone(&fs),
+        Arc::clone(&storage_client),
         key.clone(),
         password.clone(),
         backup_hash,
@@ -61,21 +61,21 @@ pub async fn delete(matches: &ArgMatches) {
 
     let full_backup_hash_clone = full_backup_hash.clone();
     let backup_future = tokio::spawn(load_backup(
-        Arc::clone(&fs),
+        Arc::clone(&storage_client),
         key.clone(),
         password.clone(),
         full_backup_hash_clone,
     ));
 
     let chunk_indexes_future = tokio::spawn(load_chunk_indexes(
-        Arc::clone(&fs),
+        Arc::clone(&storage_client),
         key.clone(),
         password.clone(),
         Arc::new(Mutex::new(false)),
     ));
 
     let backup_summaries_future = tokio::spawn(list_backup_summaries(
-        Arc::clone(&fs),
+        Arc::clone(&storage_client),
         key.clone(),
         password.clone(),
     ));
@@ -145,7 +145,7 @@ pub async fn delete(matches: &ArgMatches) {
 
     let chunk_index_path = format!("{}/indexes/chunks", key);
     let write_chunk_index_future = write_file_maybe_encrypt(
-        &fs,
+        &storage_client,
         &chunk_index_path,
         &compressed_chunk_indexes_bytes,
         password.as_deref(),
@@ -162,7 +162,7 @@ pub async fn delete(matches: &ArgMatches) {
 
     let backup_index_path = format!("{}/indexes/backups", key);
     let write_backup_index_future = write_file_maybe_encrypt(
-        &fs,
+        &storage_client,
         &backup_index_path,
         &compressed_backup_summaries_bytes,
         password.as_deref(),
@@ -185,7 +185,7 @@ pub async fn delete(matches: &ArgMatches) {
     }
 
     let backup_file_path = format!("{}/backups/{}", key, full_backup_hash);
-    if let Err(e) = fs.delete_file(&backup_file_path).await {
+    if let Err(e) = storage_client.delete_file(&backup_file_path).await {
         handle_error(format!("Failed to delete backup file: {}", e), Some(&pb));
     }
 
@@ -222,7 +222,7 @@ pub async fn delete(matches: &ArgMatches) {
         chunks_stream
             .for_each_concurrent(MAX_CONCURRENT_CHUNKS, |chunk_hash| {
                 let pb_clone = pb.clone();
-                let fs_clone = Arc::clone(&fs);
+                let storage_client_clone = Arc::clone(&storage_client);
                 let key_clone = key.clone();
                 let chunk_hash_clone = chunk_hash.clone();
                 let semaphore_clone = Arc::clone(&semaphore);
@@ -236,7 +236,7 @@ pub async fn delete(matches: &ArgMatches) {
                         let (prefix, rest) = chunk_hash_clone.split_at(2);
                         let chunk_path = format!("{}/chunks/{}/{}", key_clone, prefix, rest);
 
-                        if let Err(e) = fs_clone.delete_file(&chunk_path).await {
+                        if let Err(e) = storage_client_clone.delete_file(&chunk_path).await {
                             return Err(format!(
                                 "Failed to delete chunk {}: {}",
                                 chunk_hash_clone, e
@@ -314,7 +314,7 @@ pub async fn delete(matches: &ArgMatches) {
 }
 
 async fn resolve_backup_hash(
-    fs: Arc<dyn FS>,
+    storage_client: Arc<dyn ClientStorage>,
     key: String,
     password: Option<String>,
     provided_hash: Option<String>,
@@ -322,7 +322,7 @@ async fn resolve_backup_hash(
     match provided_hash {
         Some(hash) => {
             if hash.len() <= 8 {
-                let summaries = list_backup_summaries(fs, key, password).await?;
+                let summaries = list_backup_summaries(storage_client, key, password).await?;
 
                 for summary in summaries {
                     if summary.hash.starts_with(&hash) {
@@ -341,7 +341,7 @@ async fn resolve_backup_hash(
                     "Missing required argument: --backup (required in --mode json)".to_string(),
                 );
             }
-            let summaries = list_backup_summaries(fs, key, password).await?;
+            let summaries = list_backup_summaries(storage_client, key, password).await?;
 
             if summaries.is_empty() {
                 return Err("No backups found in repository".to_string());
@@ -383,7 +383,7 @@ struct BackupSummaryDisplay {
 }
 
 async fn load_backup(
-    fs: Arc<dyn FS>,
+    storage_client: Arc<dyn ClientStorage>,
     key: String,
     password: Option<String>,
     backup_hash: String,
@@ -391,7 +391,7 @@ async fn load_backup(
     let backup_path = format!("{}/backups/{}", key, backup_hash);
 
     let read_result = read_file_maybe_decrypt(
-        &fs,
+        &storage_client,
         &backup_path,
         password.as_deref(),
         "Backup is encrypted but no password provided",

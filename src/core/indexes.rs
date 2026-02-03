@@ -1,19 +1,19 @@
 use crate::core::crypto::{read_file_maybe_decrypt, write_file_maybe_encrypt};
 use crate::core::metadata::{Backup, BackupSummary, ChunkIndex};
-use crate::fs::FS;
+use crate::storage_clients::ClientStorage;
 use crate::utils::{compress_bytes, decompress_bytes};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub(crate) async fn load_chunk_indexes(
-    fs: Arc<dyn FS>,
+    storage_client: Arc<dyn ClientStorage>,
     key: String,
     password: Option<String>,
     prev_not_encrypted_but_now_yes: Arc<Mutex<bool>>,
 ) -> Result<HashMap<String, ChunkIndex>, String> {
     let read_result = read_file_maybe_decrypt(
-        &fs,
+        &storage_client,
         format!("{}/indexes/chunks", key).as_str(),
         password.as_deref(),
         "Chunk indexes are encrypted but no password provided",
@@ -38,12 +38,12 @@ pub(crate) async fn load_chunk_indexes(
 }
 
 pub(crate) async fn list_backup_summaries(
-    fs: Arc<dyn FS>,
+    storage_client: Arc<dyn ClientStorage>,
     key: String,
     password: Option<String>,
 ) -> Result<Vec<BackupSummary>, String> {
     let read_result = read_file_maybe_decrypt(
-        &fs,
+        &storage_client,
         format!("{}/indexes/backups", key).as_str(),
         password.as_deref(),
         "Backup summaries are encrypted but no password provided",
@@ -89,7 +89,7 @@ pub(crate) fn create_new_backup(message: String, author: String) -> Backup {
 }
 
 pub(crate) async fn add_backup_summary(
-    fs: Arc<dyn FS>,
+    storage_client: Arc<dyn ClientStorage>,
     key: String,
     backup: &Backup,
     compress: i32,
@@ -104,7 +104,7 @@ pub(crate) async fn add_backup_summary(
     };
 
     let mut backup_summaries =
-        list_backup_summaries(Arc::clone(&fs), key.clone(), password.clone()).await?;
+        list_backup_summaries(Arc::clone(&storage_client), key.clone(), password.clone()).await?;
 
     backup_summaries.insert(0, new_backup_summary);
 
@@ -114,7 +114,7 @@ pub(crate) async fn add_backup_summary(
 
     let index_path = format!("{}/indexes/backups", key);
     write_file_maybe_encrypt(
-        &fs,
+        &storage_client,
         &index_path,
         &compressed_backup_summaries_bytes,
         password.as_deref(),

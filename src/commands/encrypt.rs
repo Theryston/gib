@@ -2,9 +2,9 @@ use crate::core::crypto::{read_file_maybe_decrypt, write_file_maybe_encrypt};
 use crate::core::indexes::list_backup_summaries;
 use crate::core::metadata::{BackupSummary, ChunkIndex};
 use crate::core::{crypto::get_password, indexes::load_chunk_indexes};
-use crate::fs::FS;
 use crate::output::{JsonProgress, emit_output, emit_progress_message, is_json_mode};
-use crate::utils::{get_fs, get_pwd_string, get_storage, handle_error};
+use crate::storage_clients::ClientStorage;
+use crate::utils::{get_pwd_string, get_storage, get_storage_client, handle_error};
 use clap::ArgMatches;
 use console::style;
 use dialoguer::Select;
@@ -46,12 +46,12 @@ pub async fn encrypt(matches: &ArgMatches) {
         emit_progress_message("Loading metadata from the repository key...");
     }
 
-    let fs = get_fs(&storage, Some(&pb));
+    let storage_client = get_storage_client(&storage, Some(&pb));
 
     let prev_not_encrypted_but_now_yes = Arc::new(Mutex::new(false));
 
     let (chunk_indexes, backup_summaries) = match load_metadata(
-        Arc::clone(&fs),
+        Arc::clone(&storage_client),
         key.clone(),
         password.clone(),
         Arc::clone(&prev_not_encrypted_but_now_yes),
@@ -129,7 +129,7 @@ pub async fn encrypt(matches: &ArgMatches) {
         .for_each_concurrent(MAX_CONCURRENT_FILES, |file_path| {
             let pb_clone = pb.clone();
             let password_clone = password.clone();
-            let fs_clone = Arc::clone(&fs);
+            let storage_client_clone = Arc::clone(&storage_client);
             let file_path_clone = file_path.clone();
             let already_encrypted_amount_clone = Arc::clone(&already_encrypted_amount);
             let encrypted_amount_clone = Arc::clone(&encrypted_amount);
@@ -142,7 +142,7 @@ pub async fn encrypt(matches: &ArgMatches) {
                 guard.spawn(async move {
                     let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
                     let read_result = read_file_maybe_decrypt(
-                        &fs_clone,
+                        &storage_client_clone,
                         &file_path_clone,
                         password_clone.as_deref(),
                         "File is encrypted but no password provided",
@@ -165,7 +165,7 @@ pub async fn encrypt(matches: &ArgMatches) {
                     }
 
                     write_file_maybe_encrypt(
-                        &fs_clone,
+                        &storage_client_clone,
                         &file_path_clone,
                         &read_result.bytes,
                         password_clone.as_deref(),
@@ -247,20 +247,20 @@ pub async fn encrypt(matches: &ArgMatches) {
 }
 
 async fn load_metadata(
-    fs: Arc<dyn FS>,
+    storage_client: Arc<dyn ClientStorage>,
     key: String,
     password: Option<String>,
     prev_not_encrypted_but_now_yes: Arc<Mutex<bool>>,
 ) -> Result<(HashMap<String, ChunkIndex>, Vec<BackupSummary>), String> {
     let chunk_indexes_future = tokio::spawn(load_chunk_indexes(
-        Arc::clone(&fs),
+        Arc::clone(&storage_client),
         key.clone(),
         password.clone(),
         Arc::clone(&prev_not_encrypted_but_now_yes),
     ));
 
     let backup_summaries_future = tokio::spawn(list_backup_summaries(
-        Arc::clone(&fs),
+        Arc::clone(&storage_client),
         key.clone(),
         password.clone(),
     ));

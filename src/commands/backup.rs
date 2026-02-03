@@ -6,10 +6,10 @@ use crate::core::indexes::{add_backup_summary, create_new_backup, load_chunk_ind
 use crate::core::metadata::PendingBackup;
 use crate::core::metadata::{Backup, BackupObject, ChunkIndex};
 use crate::core::permissions::get_file_permissions_with_path;
-use crate::fs::FS;
 use crate::output::{JsonProgress, emit_output, emit_progress_message, emit_warning, is_json_mode};
+use crate::storage_clients::ClientStorage;
 use crate::utils::decompress_bytes;
-use crate::utils::{compress_bytes, get_fs, get_pwd_string, get_storage, handle_error};
+use crate::utils::{compress_bytes, get_pwd_string, get_storage, get_storage_client, handle_error};
 use bytesize::ByteSize;
 use clap::ArgMatches;
 use console::style;
@@ -86,7 +86,7 @@ pub async fn backup(matches: &ArgMatches) {
 
     let storage = get_storage(&storage);
 
-    let fs = get_fs(&storage, Some(&pb));
+    let storage_client = get_storage_client(&storage, Some(&pb));
 
     pb.set_message("Generating new backup...");
     if is_json_mode() {
@@ -96,7 +96,7 @@ pub async fn backup(matches: &ArgMatches) {
     let prev_not_encrypted_but_now_yes = Arc::new(Mutex::new(false));
 
     let (new_backup, root_files, chunk_indexes) = match load_metadata(
-        Arc::clone(&fs),
+        Arc::clone(&storage_client),
         key.clone(),
         message,
         config,
@@ -185,7 +185,7 @@ pub async fn backup(matches: &ArgMatches) {
     let pending_backup_watcher_stop = Arc::new(AtomicBool::new(false));
 
     {
-        let fs_clone = Arc::clone(&fs);
+        let storage_client_clone = Arc::clone(&storage_client);
         let pending_backup_clone = Arc::clone(&pending_backup);
         let pending_backup_path_clone = pending_backup_path.clone();
         let pending_backup_watcher_stop_clone = pending_backup_watcher_stop.clone();
@@ -196,7 +196,7 @@ pub async fn backup(matches: &ArgMatches) {
             runtime.block_on(watch_pending_backup(
                 pending_backup_clone,
                 pending_backup_path_clone,
-                fs_clone,
+                storage_client_clone,
                 pending_backup_watcher_stop_clone,
                 password_clone,
             ));
@@ -211,7 +211,7 @@ pub async fn backup(matches: &ArgMatches) {
             let chunk_indexes_clone = Arc::clone(&chunk_indexes);
             let password_clone = password.clone();
             let key_clone = key.clone();
-            let fs_clone = Arc::clone(&fs);
+            let storage_client_clone = Arc::clone(&storage_client);
             let new_backup_clone = Arc::clone(&new_backup);
             let root_path_string_clone = root_path_string.clone();
             let written_bytes_clone = Arc::clone(&written_bytes);
@@ -232,7 +232,7 @@ pub async fn backup(matches: &ArgMatches) {
                         chunk_indexes_clone,
                         password_clone,
                         key_clone,
-                        fs_clone,
+                        storage_client_clone,
                         new_backup_clone,
                         root_path_string_clone,
                         written_bytes_clone,
@@ -288,7 +288,7 @@ pub async fn backup(matches: &ArgMatches) {
     let chunk_index_path = format!("{}/indexes/chunks", key);
 
     let write_chunk_index_future = write_file_maybe_encrypt(
-        &fs,
+        &storage_client,
         &chunk_index_path,
         &compressed_chunk_indexes_bytes,
         password.as_deref(),
@@ -302,7 +302,7 @@ pub async fn backup(matches: &ArgMatches) {
     let backup_file_path = format!("{}/backups/{}", key, new_backup.lock().unwrap().hash);
 
     let write_backup_file_future = write_file_maybe_encrypt(
-        &fs,
+        &storage_client,
         &backup_file_path,
         &compressed_backup_file_bytes,
         password.as_deref(),
@@ -334,7 +334,7 @@ pub async fn backup(matches: &ArgMatches) {
     {
         let backup_guard = new_backup.lock().unwrap();
         if let Err(e) = add_backup_summary(
-            Arc::clone(&fs),
+            Arc::clone(&storage_client),
             key.clone(),
             &backup_guard,
             compress,
@@ -353,12 +353,12 @@ pub async fn backup(matches: &ArgMatches) {
         }
     }
 
-    let _ = fs.delete_file(&pending_backup_path).await;
+    let _ = storage_client.delete_file(&pending_backup_path).await;
 
     {
         match received_pending_backup.lock().unwrap().take() {
             Some(pending_backup) => {
-                let _ = fs.delete_file(&pending_backup.path).await;
+                let _ = storage_client.delete_file(&pending_backup.path).await;
             }
             None => {}
         };
@@ -408,7 +408,7 @@ pub async fn backup(matches: &ArgMatches) {
 async fn watch_pending_backup(
     pending_backup: Arc<Mutex<PendingBackup>>,
     pending_backup_path: Arc<String>,
-    fs: Arc<dyn FS>,
+    storage_client: Arc<dyn ClientStorage>,
     pending_backup_watcher_stop: Arc<AtomicBool>,
     password: Option<String>,
 ) {
@@ -429,7 +429,7 @@ async fn watch_pending_backup(
         let compressed_bytes = compress_bytes(&bytes_to_write, 3);
 
         let _ = write_file_maybe_encrypt(
-            &fs,
+            &storage_client,
             pending_backup_path.as_str(),
             &compressed_bytes,
             password.as_deref(),
@@ -444,7 +444,7 @@ async fn backup_file(
     chunk_indexes: Arc<Mutex<HashMap<String, ChunkIndex>>>,
     password: Option<String>,
     key: String,
-    fs: Arc<dyn FS>,
+    storage_client: Arc<dyn ClientStorage>,
     new_backup: Arc<Mutex<Backup>>,
     root_path_string: String,
     written_bytes: Arc<Mutex<u64>>,
@@ -526,7 +526,7 @@ async fn backup_file(
 
         for attempt in 1..=3 {
             match write_file_maybe_encrypt(
-                &fs,
+                &storage_client,
                 &chunk_path,
                 &compressed_chunk_bytes,
                 password.as_deref(),
@@ -627,7 +627,7 @@ fn list_files(path: &str, ignore_patterns: &[String]) -> Vec<String> {
 }
 
 async fn load_metadata(
-    fs: Arc<dyn FS>,
+    storage_client: Arc<dyn ClientStorage>,
     key: String,
     message: String,
     config: Config,
@@ -642,7 +642,7 @@ async fn load_metadata(
         tokio::spawn(async move { list_files(&root_path_string, &ignore_patterns) });
 
     let chunk_indexes_future = tokio::spawn(load_chunk_indexes(
-        Arc::clone(&fs),
+        Arc::clone(&storage_client),
         key.clone(),
         password,
         prev_not_encrypted_but_now_yes,
@@ -666,13 +666,13 @@ struct PendingBackupMatch {
 }
 
 async fn load_pending_backup(
-    fs: Arc<dyn FS>,
+    storage_client: Arc<dyn ClientStorage>,
     key: &str,
     continue_prefix: &str,
     password: &Option<String>,
 ) -> Result<PendingBackupMatch, String> {
     let indexes_path = format!("{}/indexes", key);
-    let files = fs
+    let files = storage_client
         .list_files(&indexes_path)
         .await
         .map_err(|e| format!("Failed to list indexes in '{}': {}", indexes_path, e))?;
@@ -695,7 +695,7 @@ async fn load_pending_backup(
         .ok_or_else(|| "Pending backup match missing".to_string())?;
 
     let pending_result = read_file_maybe_decrypt(
-        &fs,
+        &storage_client,
         &pending_path,
         password.as_deref(),
         "The pending backup is encrypted. Please enter the password to decrypt it.",
@@ -824,8 +824,8 @@ async fn get_params(
     let pending_backup = match matches.get_one::<String>("continue") {
         Some(continue_prefix) => {
             let storage_config = get_storage(&storage);
-            let fs = get_fs(&storage_config, None);
-            Some(load_pending_backup(fs, &key, continue_prefix, &password).await?)
+            let storage_client = get_storage_client(&storage_config, None);
+            Some(load_pending_backup(storage_client, &key, continue_prefix, &password).await?)
         }
         None => None,
     };

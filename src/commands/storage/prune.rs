@@ -1,9 +1,9 @@
-use std::sync::{Arc, Mutex};
+﻿use std::sync::{Arc, Mutex};
 
 use crate::core::crypto::get_password;
 use crate::core::indexes::load_chunk_indexes;
 use crate::output::{JsonProgress, emit_output, emit_progress_message, is_json_mode};
-use crate::utils::{get_fs, get_pwd_string, get_storage, handle_error};
+use crate::utils::{get_storage_client, get_pwd_string, get_storage, handle_error};
 use clap::ArgMatches;
 use dialoguer::Select;
 use dirs::home_dir;
@@ -27,7 +27,7 @@ pub async fn prune(matches: &ArgMatches) {
 
     let storage = get_storage(&storage);
 
-    let fs = get_fs(&storage, None);
+    let storage_client = get_storage_client(&storage, None);
 
     let pb = if is_json_mode() {
         ProgressBar::hidden()
@@ -44,7 +44,7 @@ pub async fn prune(matches: &ArgMatches) {
     }
 
     let chunk_indexes = match load_chunk_indexes(
-        Arc::clone(&fs),
+        Arc::clone(&storage_client),
         key.clone(),
         password.clone(),
         Arc::new(Mutex::new(false)),
@@ -63,12 +63,12 @@ pub async fn prune(matches: &ArgMatches) {
     let chunks_folder = format!("{}/chunks", key);
     let indexes_folder = format!("{}/indexes", key);
 
-    let chunks = match fs.list_files(&chunks_folder).await {
+    let chunks = match storage_client.list_files(&chunks_folder).await {
         Ok(chunks) => chunks,
         Err(e) => handle_error(e.to_string(), Some(&pb)),
     };
 
-    let pending_backups = match fs.list_files(&indexes_folder).await {
+    let pending_backups = match storage_client.list_files(&indexes_folder).await {
         Ok(indexes) => indexes
             .iter()
             .filter(|index| {
@@ -193,7 +193,7 @@ pub async fn prune(matches: &ArgMatches) {
     chunks_stream
         .for_each_concurrent(MAX_CONCURRENT_CHUNKS, |chunk| {
             let pb_clone = pb.clone();
-            let fs_clone = Arc::clone(&fs);
+            let storage_client_clone = Arc::clone(&storage_client);
             let chunk_clone = chunk.clone();
             let semaphore_clone = Arc::clone(&semaphore);
             let chunks_set_clone = Arc::clone(&chunks_set);
@@ -203,7 +203,7 @@ pub async fn prune(matches: &ArgMatches) {
                 let mut guard = chunks_set_clone.lock().await;
                 guard.spawn(async move {
                     let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
-                    let _ = fs_clone.delete_file(&chunk_clone).await;
+                    let _ = storage_client_clone.delete_file(&chunk_clone).await;
                     if let Some(progress) = &json_progress_clone {
                         progress.inc_by(1);
                     } else {
@@ -345,3 +345,5 @@ fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), 
 
     Ok((key, storage, password))
 }
+
+
