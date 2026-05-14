@@ -2,7 +2,9 @@ use crate::commands::config::Config;
 use crate::core::crypto::get_password;
 use crate::core::crypto::read_file_maybe_decrypt;
 use crate::core::crypto::write_file_maybe_encrypt;
-use crate::core::indexes::{add_backup_summary, create_new_backup, load_chunk_indexes};
+use crate::core::indexes::{
+    add_backup_summary, create_new_backup, list_backup_summaries, load_chunk_indexes,
+};
 use crate::core::metadata::PendingBackup;
 use crate::core::metadata::{Backup, BackupObject, ChunkIndex};
 use crate::core::permissions::get_file_permissions_with_path;
@@ -41,6 +43,7 @@ pub async fn backup(matches: &ArgMatches) {
         chunk_size,
         ignore_patterns,
         received_pending_backup,
+        parent_hash,
         concurrency,
     ) = match get_params(matches).await {
         Ok(params) => params,
@@ -104,6 +107,7 @@ pub async fn backup(matches: &ArgMatches) {
         password.clone(),
         Arc::clone(&prev_not_encrypted_but_now_yes),
         ignore_patterns.clone(),
+        parent_hash.clone(),
     )
     .await
     {
@@ -174,6 +178,7 @@ pub async fn backup(matches: &ArgMatches) {
         chunk_size,
         concurrency,
         ignore_patterns: ignore_patterns.clone(),
+        parent: parent_hash,
         processed_chunks: Vec::new(),
     }));
     let pending_backup_path = Arc::new(format!(
@@ -581,7 +586,7 @@ async fn backup_file(
 
     let file_permissions = get_file_permissions_with_path(&file_metadata, &file_path);
 
-    {
+    let replaced_backup_object = {
         let mut new_backup_guard = new_backup.lock().unwrap();
 
         new_backup_guard.tree.insert(
@@ -593,7 +598,11 @@ async fn backup_file(
                 permissions: file_permissions,
                 chunks: file_chunks,
             },
-        );
+        )
+    };
+
+    if let Some(previous_backup_object) = replaced_backup_object {
+        decrement_chunk_refcounts(&chunk_indexes, &previous_backup_object);
     }
 
     if let Some(progress) = &json_progress {
@@ -635,11 +644,24 @@ async fn load_metadata(
     password: Option<String>,
     prev_not_encrypted_but_now_yes: Arc<Mutex<bool>>,
     ignore_patterns: Vec<String>,
+    parent_hash: Option<String>,
 ) -> Result<(Backup, Vec<String>, HashMap<String, ChunkIndex>), String> {
-    let new_backup = create_new_backup(message, config.author);
+    let mut new_backup = create_new_backup(message, config.author);
 
     let root_files_future =
         tokio::spawn(async move { list_files(&root_path_string, &ignore_patterns) });
+
+    let parent_backup_future = tokio::spawn({
+        let fs = Arc::clone(&fs);
+        let key = key.clone();
+        let password = password.clone();
+        async move {
+            match parent_hash {
+                Some(parent_hash) => load_backup(fs, key, password, &parent_hash).await.map(Some),
+                None => Ok(None),
+            }
+        }
+    });
 
     let chunk_indexes_future = tokio::spawn(load_chunk_indexes(
         Arc::clone(&fs),
@@ -648,14 +670,22 @@ async fn load_metadata(
         prev_not_encrypted_but_now_yes,
     ));
 
-    let (root_files_result, chunk_indexes_result) =
-        tokio::join!(root_files_future, chunk_indexes_future);
+    let (root_files_result, chunk_indexes_result, parent_backup_result) =
+        tokio::join!(root_files_future, chunk_indexes_future, parent_backup_future);
 
     let root_files = root_files_result.map_err(|e| format!("Failed to list root files: {}", e))?;
 
-    let chunk_indexes = chunk_indexes_result
+    let mut chunk_indexes = chunk_indexes_result
         .map_err(|e| format!("Failed to load chunk indexes: {}", e))?
         .map_err(|e| format!("Failed to load chunk indexes: {}", e))?;
+
+    if let Some(parent_backup) = parent_backup_result
+        .map_err(|e| format!("Failed to load parent backup: {}", e))?
+        .map_err(|e| format!("Failed to load parent backup: {}", e))?
+    {
+        increment_chunk_refcounts(&mut chunk_indexes, &parent_backup.tree);
+        new_backup.tree = parent_backup.tree;
+    }
 
     Ok((new_backup, root_files, chunk_indexes))
 }
@@ -663,6 +693,11 @@ async fn load_metadata(
 struct PendingBackupMatch {
     backup: PendingBackup,
     path: String,
+}
+
+struct BackupSummaryDisplay {
+    hash: String,
+    message: String,
 }
 
 async fn load_pending_backup(
@@ -731,10 +766,22 @@ async fn get_params(
         u64,
         Vec<String>,
         Option<PendingBackupMatch>,
+        Option<String>,
         usize,
     ),
     String,
 > {
+    if matches.contains_id("parent")
+        && matches.get_one::<String>("parent").is_none()
+        && is_json_mode()
+    {
+        return Err("--parent requires a backup hash when used in JSON mode".to_string());
+    }
+
+    if matches.contains_id("continue") && matches.contains_id("parent") {
+        return Err("--parent cannot be used together with --continue".to_string());
+    }
+
     let password: Option<String> = matches
         .get_one::<String>("password")
         .map(|s| s.to_string())
@@ -821,11 +868,12 @@ async fn get_params(
         return Err(format!("Storage '{}' not found", storage));
     }
 
+    let storage_config = get_storage(&storage);
+    let fs = get_fs(&storage_config, None);
+
     let pending_backup = match matches.get_one::<String>("continue") {
         Some(continue_prefix) => {
-            let storage_config = get_storage(&storage);
-            let fs = get_fs(&storage_config, None);
-            Some(load_pending_backup(fs, &key, continue_prefix, &password).await?)
+            Some(load_pending_backup(Arc::clone(&fs), &key, continue_prefix, &password).await?)
         }
         None => None,
     };
@@ -837,6 +885,22 @@ async fn get_params(
     {
         reused_data.push("uploaded chunks".to_string());
     }
+
+    let parent_hash = match pending_backup.as_ref() {
+        Some(pending) => {
+            if pending.backup.parent.is_some() {
+                reused_data.push("parent".to_string());
+            }
+            pending.backup.parent.clone()
+        }
+        None => resolve_parent_hash(
+            Arc::clone(&fs),
+            key.clone(),
+            password.clone(),
+            matches,
+        )
+        .await?,
+    };
 
     let message = match matches.get_one::<String>("message") {
         Some(message) => message.to_string(),
@@ -946,6 +1010,141 @@ async fn get_params(
         chunk_size,
         ignore_patterns,
         pending_backup,
+        parent_hash,
         concurrency,
     ))
+}
+
+async fn resolve_parent_hash(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+    matches: &ArgMatches,
+) -> Result<Option<String>, String> {
+    if !matches.contains_id("parent") {
+        return Ok(None);
+    }
+
+    match matches.get_one::<String>("parent") {
+        Some(hash) => resolve_backup_hash(fs, key, password, Some(hash.to_string()))
+            .await
+            .map(Some),
+        None => resolve_backup_hash(fs, key, password, None).await.map(Some),
+    }
+}
+
+async fn resolve_backup_hash(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+    provided_hash: Option<String>,
+) -> Result<String, String> {
+    match provided_hash {
+        Some(hash) => {
+            if hash.len() <= 8 {
+                let summaries = list_backup_summaries(fs, key, password).await?;
+
+                for summary in summaries {
+                    if summary.hash.starts_with(&hash) {
+                        return Ok(summary.hash);
+                    }
+                }
+
+                Err(format!("No backup found matching hash prefix: {}", hash))
+            } else {
+                Ok(hash)
+            }
+        }
+        None => {
+            let summaries = list_backup_summaries(fs, key, password).await?;
+
+            if summaries.is_empty() {
+                return Err("No backups found in repository".to_string());
+            }
+
+            let recent_backups: Vec<BackupSummaryDisplay> = summaries
+                .iter()
+                .take(10)
+                .map(|s| BackupSummaryDisplay {
+                    hash: s.hash.clone(),
+                    message: s.message.clone(),
+                })
+                .collect();
+
+            if recent_backups.is_empty() {
+                return Err("No backups found in repository".to_string());
+            }
+
+            let items: Vec<String> = recent_backups
+                .iter()
+                .map(|c| format!("{} {}", &c.hash[..8.min(c.hash.len())], &c.message))
+                .collect();
+
+            let selected_index = Select::new()
+                .with_prompt("Select a parent backup")
+                .items(&items)
+                .default(0)
+                .interact()
+                .map_err(|e| format!("Failed to select parent backup: {}", e))?;
+
+            Ok(recent_backups[selected_index].hash.clone())
+        }
+    }
+}
+
+async fn load_backup(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+    backup_hash: &str,
+) -> Result<Backup, String> {
+    let backup_path = format!("{}/backups/{}", key, backup_hash);
+
+    let read_result = read_file_maybe_decrypt(
+        &fs,
+        &backup_path,
+        password.as_deref(),
+        "Backup is encrypted but no password provided",
+    )
+    .await?;
+
+    if read_result.bytes.is_empty() {
+        return Err(format!("Backup {} not found or is empty", backup_hash));
+    }
+
+    let decompressed_bytes = decompress_bytes(&read_result.bytes);
+
+    let backup: Backup = rmp_serde::from_slice(&decompressed_bytes)
+        .map_err(|e| format!("Failed to deserialize backup: {}", e))?;
+
+    Ok(backup)
+}
+
+fn increment_chunk_refcounts(
+    chunk_indexes: &mut HashMap<String, ChunkIndex>,
+    tree: &HashMap<String, BackupObject>,
+) {
+    for backup_object in tree.values() {
+        for chunk_hash in &backup_object.chunks {
+            let entry = chunk_indexes
+                .entry(chunk_hash.clone())
+                .or_insert(ChunkIndex { refcount: 0 });
+            entry.refcount += 1;
+        }
+    }
+}
+
+fn decrement_chunk_refcounts(
+    chunk_indexes: &Arc<Mutex<HashMap<String, ChunkIndex>>>,
+    backup_object: &BackupObject,
+) {
+    let mut chunk_indexes_guard = chunk_indexes.lock().unwrap();
+
+    for chunk_hash in &backup_object.chunks {
+        if let Some(entry) = chunk_indexes_guard.get_mut(chunk_hash)
+            && entry.refcount > 0
+        {
+            entry.refcount -= 1;
+        }
+    }
 }

@@ -41,5 +41,7 @@ pub(crate) struct PendingBackup {
     pub(crate) chunk_size: u64,
     pub(crate) ignore_patterns: Vec<String>,
     pub(crate) concurrency: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) parent: Option<String>,
     pub(crate) processed_chunks: Vec<String>,
 }

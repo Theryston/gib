@@ -95,6 +95,14 @@ fn cli() -> Command {
                         .required(false),
                 )
                 .arg(
+                    Arg::new("parent")
+                        .long("parent")
+                        .value_name("BACKUP")
+                        .help("Inherit the file tree from a previous backup")
+                        .num_args(0..=1)
+                        .required(false),
+                )
+                .arg(
                     Arg::new("concurrency")
                         .long("concurrency")
                         .help("How many files to process at the same time [default: the number of CPUs * 2]")
