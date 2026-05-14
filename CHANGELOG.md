@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.15](https://github.com/Theryston/gib/compare/v0.0.14...v0.0.15) - 2026-05-14
+
+### Added
+
+- add --parent support to backups
+
+### Other
+
+- Update README installer URLs to trygib.org and delete install scripts
+
 ## [0.0.14](https://github.com/Theryston/gib/compare/v0.0.13...v0.0.14) - 2026-01-29
 
 ### Added
