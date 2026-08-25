@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.21](https://github.com/Theryston/gib/compare/v0.0.20...v0.0.21) - 2026-08-25
+
+### Other
+
+- format AGENTS.md for better readability
+
 ## [0.0.20](https://github.com/Theryston/gib/compare/v0.0.19...v0.0.20) - 2026-08-25
 
 ### Added
