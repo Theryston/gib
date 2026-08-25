@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.18](https://github.com/Theryston/gib/compare/v0.0.17...v0.0.18) - 2026-08-25
+
+### Added
+
+- add watch command for automatic incremental backups
+
+### Other
+
+- Merge branch 'main' of github.com:Theryston/gib
+
 ## [0.0.17](https://github.com/Theryston/gib/compare/v0.0.16...v0.0.17) - 2026-08-25
 
 ### Added
