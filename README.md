@@ -202,13 +202,30 @@ cd /path/to/your/project
 gib backup --message "Initial backup"
 ```
 
-### 5. View backup history
+### 5. Watch for changes
+
+Run a long-lived watcher that creates one debounced, incremental snapshot for
+each batch of filesystem changes:
+
+```bash
+gib watch
+```
+
+Watch-generated messages start with `[WATCH]` and contain only the number of
+created, changed, and deleted files, for example
+`[WATCH] created: 12 files; changed: 3 files`. Each snapshot uses the latest
+completed backup as its parent, so deletions are removed from the new tree and
+unchanged chunks are reused. Press `Ctrl+C` to stop watching. In JSON mode,
+provide `--storage` explicitly; watcher lifecycle, batches, backup progress,
+completions, and recoverable errors are emitted as structured events.
+
+### 6. View backup history
 
 ```bash
 gib log
 ```
 
-### 6. Restore a backup
+### 7. Restore a backup
 
 ```bash
 gib restore
@@ -252,6 +269,7 @@ Don't just take our word for it — try it yourself and feel the speed differenc
 | `gib whoami`         | Show your current identity              |
 | `gib setup`          | Discover and configure local storages   |
 | `gib backup`         | Create a new backup                     |
+| `gib watch`          | Watch a directory for automatic backups |
 | `gib backup delete`  | Delete a backup and its orphaned chunks |
 | `gib restore`        | Restore files from a backup             |
 | `gib log`            | View backup history (paginated)         |
@@ -274,6 +292,15 @@ gib backup \
   --chunk-size "10 MB" \       # Chunk size (default: 5 MB)
   --root-path ./src            # Subdirectory to backup
 ```
+
+### Watch Options
+
+`gib watch` accepts the same backup configuration options as `gib backup`,
+including `--key`, `--storage`, `--password`, `--compress`, `--chunk-size`,
+`--root-path`, `--ignore`, and `--concurrency`. `--message` is optional and is
+included as context after the required `[WATCH]` prefix. `--parent` and
+`--continue` are rejected because the watcher automatically selects the latest
+completed backup for every snapshot.
 
 ### Restore Options
 

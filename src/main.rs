@@ -137,6 +137,62 @@ fn cli() -> Command {
                 )
         )
         .subcommand(
+            Command::new("watch")
+                .about("Watch a directory and create incremental backups automatically")
+                .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
+                .arg(arg!(-m --message <MESSAGE> "Optional context included in automatic backup messages").required(false))
+                .arg(arg!(-s --storage <STORAGE> "The storage to use for the backup").required(false))
+                .arg(arg!(-p --password <PASSWORD> "The password to use for the backup").required(false))
+                .arg(arg!(-c --compress <COMPRESS> "The compression level to use for the backup").required(false))
+                .arg(
+                    Arg::new("chunk-size")
+                        .short('z')
+                        .long("chunk-size")
+                        .value_name("CHUNK_SIZE")
+                        .help("The chunk size to use for the backup (default: 5 MB)")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("root-path")
+                        .short('r')
+                        .long("root-path")
+                        .value_name("ROOT_PATH")
+                        .help("The root path to watch")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("ignore")
+                        .short('i')
+                        .long("ignore")
+                        .value_name("IGNORE")
+                        .help("File or folder names to ignore (can be used multiple times)")
+                        .required(false)
+                        .action(clap::ArgAction::Append),
+                )
+                .arg(
+                    Arg::new("continue")
+                        .long("continue")
+                        .value_name("BACKUP")
+                        .help("Continue the backup from an incomplete backup (not valid for watch)")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("parent")
+                        .long("parent")
+                        .value_name("BACKUP")
+                        .help("Use a parent backup (not valid for watch)")
+                        .num_args(0..=1)
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("concurrency")
+                        .long("concurrency")
+                        .help("How many files to process at the same time [default: the number of CPUs * 2]")
+                        .value_name("CONCURRENCY")
+                        .required(false),
+                ),
+        )
+        .subcommand(
             Command::new("restore")
                 .about("Restore files from a backup")
                 .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
@@ -263,6 +319,7 @@ async fn main() {
         Some(("config", matches)) => commands::config(matches),
         Some(("whoami", _)) => commands::whoami(),
         Some(("setup", matches)) => commands::setup(matches),
+        Some(("watch", matches)) => commands::watch(matches).await,
         Some(("encrypt", matches)) => commands::encrypt(matches).await,
         Some(("log", matches)) => commands::log(matches).await,
         Some(("backup", matches)) => match matches.subcommand() {

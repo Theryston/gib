@@ -7,6 +7,7 @@ mod pending;
 mod restore;
 mod setup;
 mod whoami;
+mod watch;
 
 pub mod storage;
 
@@ -19,3 +20,4 @@ pub use pending::pending;
 pub use restore::restore;
 pub use setup::setup;
 pub use whoami::whoami;
+pub use watch::watch;

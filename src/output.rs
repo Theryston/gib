@@ -120,6 +120,10 @@ pub fn emit_output<T: Serialize>(data: &T) {
     emit_event("output", data, false);
 }
 
+pub fn emit_named_event<T: Serialize>(kind: &'static str, data: &T) {
+    emit_event(kind, data, false);
+}
+
 pub fn emit_help(text: String) {
     let payload = TextData { text };
     emit_event("help", &payload, false);

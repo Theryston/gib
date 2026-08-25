@@ -63,26 +63,17 @@ pub(crate) async fn list_backup_summaries(
 }
 
 pub(crate) fn create_new_backup(message: String, author: String) -> Backup {
-    let backup_hash = Sha256::digest(
-        format!(
-            "{}:{}:{}",
-            message,
-            author,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        )
-        .as_bytes(),
-    );
+    let now = std::time::SystemTime::now();
+    let timestamp = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before the Unix epoch");
+    let backup_hash =
+        Sha256::digest(format!("{}:{}:{}", message, author, timestamp.as_nanos()).as_bytes());
 
     Backup {
         message: message.to_string(),
         author: author.to_string(),
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+        timestamp: timestamp.as_secs(),
         tree: std::collections::HashMap::new(),
         hash: format!("{:x}", backup_hash),
     }
