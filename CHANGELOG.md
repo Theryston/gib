@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.22](https://github.com/Theryston/gib/compare/v0.0.21...v0.0.22) - 2026-08-25
+
+### Added
+
+- rename watch command to live
+- add watch mode polling and repository reconciliation
+
 ## [0.0.21](https://github.com/Theryston/gib/compare/v0.0.20...v0.0.21) - 2026-08-25
 
 ### Other
