@@ -66,6 +66,10 @@ pub async fn encrypt(matches: &ArgMatches) {
 
     files_to_encrypt.push(format!("{}/indexes/chunks", key));
     files_to_encrypt.push(format!("{}/indexes/backups", key));
+    let head_path = format!("{}/indexes/HEAD", key);
+    if fs.read_file(&head_path).await.is_ok() {
+        files_to_encrypt.push(head_path);
+    }
 
     for (chunk_hash, _) in chunk_indexes.iter() {
         let (chunk_hash_prefix, chunk_hash_rest) = chunk_hash.split_at(2);

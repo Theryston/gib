@@ -56,16 +56,20 @@ pub(crate) async fn write_file_maybe_encrypt(
     data: &[u8],
     password: Option<&str>,
 ) -> Result<(), String> {
-    let final_bytes = match password {
-        Some(password) => encrypt_bytes(data, password.as_bytes()).unwrap_or_else(|_| Vec::new()),
-        None => data.to_vec(),
-    };
+    let final_bytes = encode_file_bytes(data, password)?;
 
     fs.write_file(path, &final_bytes)
         .await
         .map_err(|e| format!("Failed to write file {}: {}", path, e))?;
 
     Ok(())
+}
+
+pub(crate) fn encode_file_bytes(data: &[u8], password: Option<&str>) -> Result<Vec<u8>, String> {
+    match password {
+        Some(password) => encrypt_bytes(data, password.as_bytes()),
+        None => Ok(data.to_vec()),
+    }
 }
 
 pub(crate) fn get_password(is_required: bool, is_readonly: bool) -> Option<String> {

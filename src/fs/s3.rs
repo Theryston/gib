@@ -44,6 +44,17 @@ impl S3FS {
     }
 }
 
+fn s3_io_error(message: String) -> std::io::Error {
+    let kind =
+        if message.contains("NoSuchKey") || message.contains("NotFound") || message.contains("404")
+        {
+            std::io::ErrorKind::NotFound
+        } else {
+            std::io::ErrorKind::Other
+        };
+    std::io::Error::new(kind, message)
+}
+
 #[async_trait]
 impl FS for S3FS {
     async fn read_file(&self, path: &str) -> Result<Vec<u8>, std::io::Error> {
@@ -54,7 +65,7 @@ impl FS for S3FS {
             .key(path)
             .send()
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| s3_io_error(e.to_string()))?;
 
         let data = resp
             .body
@@ -73,7 +84,7 @@ impl FS for S3FS {
             .body(Bytes::from(data.to_vec()).into())
             .send()
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| s3_io_error(e.to_string()))?;
 
         Ok(())
     }
@@ -100,10 +111,7 @@ impl FS for S3FS {
                 req = req.continuation_token(token);
             }
 
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            let resp = req.send().await.map_err(|e| s3_io_error(e.to_string()))?;
 
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
@@ -128,7 +136,65 @@ impl FS for S3FS {
             .key(path)
             .send()
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| s3_io_error(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn read_file_with_version(
+        &self,
+        path: &str,
+    ) -> Result<(Vec<u8>, String), std::io::Error> {
+        let head = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(path)
+            .send()
+            .await
+            .map_err(|e| s3_io_error(e.to_string()))?;
+
+        let version = head.e_tag().map(ToString::to_string).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "S3 did not return an ETag for the repository reference",
+            )
+        })?;
+        let data = self.read_file(path).await?;
+        Ok((data, version))
+    }
+
+    async fn write_file_if_version(
+        &self,
+        path: &str,
+        data: &[u8],
+        expected_version: Option<&str>,
+    ) -> Result<(), std::io::Error> {
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(path)
+            .body(Bytes::from(data.to_vec()).into());
+
+        if let Some(expected_version) = expected_version {
+            request = request.if_match(expected_version);
+        } else {
+            request = request.if_none_match("*");
+        }
+
+        request.send().await.map_err(|e| {
+            let message = e.to_string();
+            let kind = if message.contains("Precondition")
+                || message.contains("precondition")
+                || message.contains("412")
+            {
+                std::io::ErrorKind::AlreadyExists
+            } else {
+                std::io::ErrorKind::Other
+            };
+            std::io::Error::new(kind, message)
+        })?;
+
         Ok(())
     }
 }

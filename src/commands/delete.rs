@@ -3,7 +3,10 @@ use crate::config::{
 };
 use crate::core::crypto::read_file_maybe_decrypt;
 use crate::core::crypto::write_file_maybe_encrypt;
-use crate::core::indexes::{list_backup_summaries, load_chunk_indexes, resolve_backup_reference};
+use crate::core::indexes::{
+    list_backup_summaries, load_chunk_indexes, read_repository_head, resolve_backup_reference,
+    set_repository_head,
+};
 use crate::core::metadata::Backup;
 use crate::fs::FS;
 use crate::output::{JsonProgress, emit_output, emit_progress_message, is_json_mode};
@@ -99,12 +102,52 @@ pub async fn delete(matches: &ArgMatches) {
         Err(e) => handle_error(format!("Failed to load backup summaries: {}", e), Some(&pb)),
     };
 
+    let current_head =
+        match read_repository_head(Arc::clone(&fs), key.clone(), password.clone()).await {
+            Ok(head) => head,
+            Err(error) => handle_error(
+                format!("Failed to load repository HEAD: {}", error),
+                Some(&pb),
+            ),
+        };
+
     pb.set_message("Processing chunks...");
     if is_json_mode() {
         emit_progress_message("Processing chunks...");
     }
 
     backup_summaries.retain(|summary| summary.hash != full_backup_hash);
+
+    if let Some(head) = current_head
+        .as_ref()
+        .filter(|head| head.head.backup.as_deref() == Some(full_backup_hash.as_str()))
+    {
+        let next_backup = backup_summaries
+            .first()
+            .map(|summary| summary.hash.as_str());
+        let moved_head = match set_repository_head(
+            Arc::clone(&fs),
+            key.clone(),
+            password.clone(),
+            head,
+            next_backup,
+        )
+        .await
+        {
+            Ok(moved_head) => moved_head,
+            Err(error) => handle_error(
+                format!("Failed to update repository HEAD: {}", error),
+                Some(&pb),
+            ),
+        };
+        if !moved_head {
+            handle_error(
+                "The repository changed while deleting the backup; no files were removed"
+                    .to_string(),
+                Some(&pb),
+            );
+        }
+    }
 
     let chunks_to_delete = Arc::new(Mutex::new(Vec::<String>::new()));
 

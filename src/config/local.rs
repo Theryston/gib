@@ -40,6 +40,7 @@ pub(crate) struct BackupConfig {
 pub(crate) struct WatchConfig {
     pub(crate) message: Option<String>,
     pub(crate) debounce_ms: Option<u64>,
+    pub(crate) poll_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -221,6 +222,13 @@ fn validate_config(config: &LocalConfig, path: &Path) -> Result<(), String> {
     if config.watch.debounce_ms == Some(0) {
         return Err(format!(
             "The watch.debounce_ms value in '{}' must be greater than zero",
+            path.display()
+        ));
+    }
+
+    if config.watch.poll_ms == Some(0) {
+        return Err(format!(
+            "The watch.poll_ms value in '{}' must be greater than zero",
             path.display()
         ));
     }

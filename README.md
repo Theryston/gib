@@ -227,6 +227,7 @@ ignore = ["node_modules", ".git", "dist"]
 [watch]
 message = "Project watch"
 debounce_ms = 1500
+poll_ms = 2000
 
 [restore]
 target_path = "./.gib-restore"
@@ -255,11 +256,20 @@ gib watch
 
 Watch-generated messages start with `[WATCH]` and contain only the number of
 created, changed, and deleted files, for example
-`[WATCH] created: 12 files; changed: 3 files`. Each snapshot uses the latest
-completed backup as its parent, so deletions are removed from the new tree and
-unchanged chunks are reused. Press `Ctrl+C` to stop watching. In JSON mode,
-provide `--storage` explicitly or configure `repository.storage`; watcher
-lifecycle, batches, backup progress, completions, and recoverable errors are
+`[WATCH] created: 12 files; changed: 3 files`. The watcher keeps a small,
+machine-local state file containing the last synchronized backup hash. Before
+publishing a snapshot it compares that base with the current repository HEAD,
+automatically applies one-sided remote changes, and performs bounded
+three-way merges for text files. Binary changes and overlapping text changes
+are reported as conflicts instead of being silently overwritten. Remote
+changes are also polled periodically, so a machine can receive updates even
+when no local file event occurs.
+
+Press `Ctrl+C` to stop watching. In interactive mode, conflicts offer `Keep
+local` and `Use remote`; in JSON mode they are emitted as `watch` conflict
+events and never trigger a prompt. Provide `--storage` explicitly in JSON
+mode or configure `repository.storage`; watcher lifecycle, batches,
+synchronization, backup progress, completions, and recoverable errors are
 emitted as structured events.
 
 ### 7. View backup history
@@ -348,8 +358,9 @@ including `--key`, `--storage`, `--password`, `--compress`, `--chunk-size`,
 `--root-path`, `--ignore`, and `--concurrency`. `--message` is optional and is
 included as context after the required `[WATCH]` prefix. The optional
 `[watch].debounce_ms` setting controls the quiet period used to group file
-events. `--parent` and `--continue` are rejected because the watcher
-automatically selects the latest completed backup for every snapshot.
+events, while `[watch].poll_ms` controls remote HEAD polling (default: 2
+seconds). `--parent` and `--continue` are rejected because the watcher manages
+its synchronized base and repository HEAD automatically.
 
 ### Restore Options
 

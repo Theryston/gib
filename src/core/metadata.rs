@@ -17,7 +17,17 @@ pub(crate) struct Backup {
     pub(crate) hash: String,
     pub(crate) timestamp: u64,
     pub(crate) author: String,
+    /// All snapshots used to build this snapshot. Older repositories do not
+    /// contain this field and deserialize as an empty list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) parents: Vec<String>,
     pub(crate) tree: HashMap<String, BackupObject>,
+}
+
+#[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
+pub(crate) struct RepositoryHead {
+    pub(crate) generation: u64,
+    pub(crate) backup: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]

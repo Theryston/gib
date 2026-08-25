@@ -6,8 +6,9 @@ use crate::config::{
 use crate::core::crypto::read_file_maybe_decrypt;
 use crate::core::crypto::write_file_maybe_encrypt;
 use crate::core::indexes::{
-    add_backup_summary, create_new_backup, list_backup_summaries, load_chunk_indexes,
-    resolve_backup_reference,
+    add_backup_summary, advance_repository_head, create_new_backup, list_backup_summaries,
+    load_chunk_indexes_with_version, read_or_initialize_repository_head, resolve_backup_reference,
+    set_repository_head, write_chunk_indexes_with_merge,
 };
 use crate::core::metadata::PendingBackup;
 use crate::core::metadata::{Backup, BackupObject, ChunkIndex};
@@ -55,6 +56,7 @@ pub(crate) struct ResolvedBackup {
     pub(crate) parent_hash: Option<String>,
     pub(crate) pending_backup: Option<PendingBackupMatch>,
     pub(crate) watch_debounce_ms: u64,
+    pub(crate) watch_poll_ms: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -69,6 +71,7 @@ pub(crate) struct BackupResult {
     pub(crate) written_bytes: u64,
     pub(crate) deduplicated_bytes: u64,
     pub(crate) elapsed_ms: u64,
+    pub(crate) head_published: bool,
 }
 
 struct PendingBackupWatcherGuard(Arc<AtomicBool>);
@@ -103,6 +106,30 @@ pub(crate) async fn run_backup(
     parent_hash: Option<String>,
     received_pending_backup: Option<PendingBackupMatch>,
 ) -> Result<BackupResult, String> {
+    let parent_hashes = parent_hash.into_iter().collect();
+    let fs = Arc::clone(&options.fs);
+    let key = options.key.clone();
+    let password = options.password.clone();
+    let mut result =
+        run_backup_with_parents(options, message, parent_hashes, received_pending_backup).await?;
+
+    if !result.head_published {
+        let snapshot =
+            read_or_initialize_repository_head(Arc::clone(&fs), key.clone(), password.clone())
+                .await?;
+        result.head_published =
+            set_repository_head(fs, key, password, &snapshot, Some(&result.backup.hash)).await?;
+    }
+
+    Ok(result)
+}
+
+pub(crate) async fn run_backup_with_parents(
+    options: BackupOptions,
+    message: String,
+    parent_hashes: Vec<String>,
+    received_pending_backup: Option<PendingBackupMatch>,
+) -> Result<BackupResult, String> {
     let BackupOptions {
         key,
         root_path_string,
@@ -115,6 +142,7 @@ pub(crate) async fn run_backup(
         ignore_patterns,
         concurrency,
     } = options;
+    let primary_parent = parent_hashes.first().cloned();
 
     let received_pending_backup = Arc::new(Mutex::new(received_pending_backup));
     let config = Config { author };
@@ -140,25 +168,29 @@ pub(crate) async fn run_backup(
 
     let prev_not_encrypted_but_now_yes = Arc::new(Mutex::new(false));
 
-    let (new_backup, root_files, chunk_indexes) = match load_metadata(
-        Arc::clone(&fs),
-        key.clone(),
-        message,
-        config,
-        root_path_string.clone(),
-        password.clone(),
-        Arc::clone(&prev_not_encrypted_but_now_yes),
-        ignore_patterns.clone(),
-        parent_hash.clone(),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(e) => {
-            pb.finish_and_clear();
-            return Err(e);
-        }
-    };
+    let (new_backup, root_files, chunk_indexes, initial_chunk_indexes, initial_chunk_index_version) =
+        match load_metadata(
+            Arc::clone(&fs),
+            key.clone(),
+            message,
+            config,
+            root_path_string.clone(),
+            password.clone(),
+            Arc::clone(&prev_not_encrypted_but_now_yes),
+            ignore_patterns.clone(),
+            primary_parent.clone(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                pb.finish_and_clear();
+                return Err(e);
+            }
+        };
+
+    let mut new_backup = new_backup;
+    new_backup.parents = parent_hashes.clone();
 
     let continue_error_message = format!(
         "Continue from the place where the backup was interrupted by running: gib backup --continue {}",
@@ -223,7 +255,7 @@ pub(crate) async fn run_backup(
         chunk_size,
         concurrency,
         ignore_patterns: ignore_patterns.clone(),
-        parent: parent_hash,
+        parent: primary_parent.clone(),
         processed_chunks: Vec::new(),
     }));
     let pending_backup_path = Arc::new(format!(
@@ -330,23 +362,15 @@ pub(crate) async fn run_backup(
         ));
     }
 
-    let chunk_indexes_bytes = match rmp_serde::to_vec_named(&*chunk_indexes.lock().unwrap()) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            pb.finish_and_clear();
-            return Err(format!("Failed to serialize chunk indexes: {}", error));
-        }
-    };
-
-    let compressed_chunk_indexes_bytes = compress_bytes(&chunk_indexes_bytes, compress);
-
-    let chunk_index_path = format!("{}/indexes/chunks", key);
-
-    let write_chunk_index_future = write_file_maybe_encrypt(
-        &fs,
-        &chunk_index_path,
-        &compressed_chunk_indexes_bytes,
-        password.as_deref(),
+    let final_chunk_indexes = chunk_indexes.lock().unwrap().clone();
+    let write_chunk_index_future = write_chunk_indexes_with_merge(
+        Arc::clone(&fs),
+        key.clone(),
+        password.clone(),
+        compress,
+        final_chunk_indexes,
+        initial_chunk_indexes,
+        initial_chunk_index_version,
     );
 
     let backup_file_bytes = match rmp_serde::to_vec_named(&*new_backup.lock().unwrap()) {
@@ -410,6 +434,25 @@ pub(crate) async fn run_backup(
         }
     }
 
+    let backup_hash = new_backup.lock().unwrap().hash.clone();
+    let expected_head_parent = match primary_parent {
+        Some(parent) => Some(parent),
+        None => {
+            read_or_initialize_repository_head(Arc::clone(&fs), key.clone(), password.clone())
+                .await?
+                .head
+                .backup
+        }
+    };
+    let head_published = advance_repository_head(
+        Arc::clone(&fs),
+        key.clone(),
+        password.clone(),
+        expected_head_parent.as_deref(),
+        &backup_hash,
+    )
+    .await?;
+
     let _ = fs.delete_file(&pending_backup_path).await;
 
     {
@@ -433,6 +476,7 @@ pub(crate) async fn run_backup(
             written_bytes: u64,
             deduplicated_bytes: u64,
             elapsed_ms: u64,
+            head_published: bool,
         }
 
         let backup_guard = new_backup.lock().unwrap();
@@ -447,6 +491,7 @@ pub(crate) async fn run_backup(
             written_bytes,
             deduplicated_bytes,
             elapsed_ms,
+            head_published,
         };
         emit_output(&payload);
     } else {
@@ -467,6 +512,7 @@ pub(crate) async fn run_backup(
         written_bytes,
         deduplicated_bytes,
         elapsed_ms: pb.elapsed().as_millis() as u64,
+        head_published,
     })
 }
 
@@ -751,7 +797,16 @@ async fn load_metadata(
     prev_not_encrypted_but_now_yes: Arc<Mutex<bool>>,
     ignore_patterns: Vec<String>,
     parent_hash: Option<String>,
-) -> Result<(Backup, Vec<String>, HashMap<String, ChunkIndex>), String> {
+) -> Result<
+    (
+        Backup,
+        Vec<String>,
+        HashMap<String, ChunkIndex>,
+        HashMap<String, ChunkIndex>,
+        Option<String>,
+    ),
+    String,
+> {
     let mut new_backup = create_new_backup(message, config.author);
 
     let root_path_for_listing = root_path_string.clone();
@@ -773,7 +828,7 @@ async fn load_metadata(
         }
     });
 
-    let chunk_indexes_future = tokio::spawn(load_chunk_indexes(
+    let chunk_indexes_future = tokio::spawn(load_chunk_indexes_with_version(
         Arc::clone(&fs),
         key.clone(),
         password,
@@ -788,9 +843,10 @@ async fn load_metadata(
 
     let root_files = root_files_result.map_err(|e| format!("Failed to list root files: {}", e))?;
 
-    let mut chunk_indexes = chunk_indexes_result
+    let (mut chunk_indexes, chunk_index_version) = chunk_indexes_result
         .map_err(|e| format!("Failed to load chunk indexes: {}", e))?
         .map_err(|e| format!("Failed to load chunk indexes: {}", e))?;
+    let initial_chunk_indexes = chunk_indexes.clone();
 
     if let Some(parent_backup) = parent_backup_result
         .map_err(|e| format!("Failed to load parent backup: {}", e))?
@@ -808,7 +864,13 @@ async fn load_metadata(
         );
     }
 
-    Ok((new_backup, root_files, chunk_indexes))
+    Ok((
+        new_backup,
+        root_files,
+        chunk_indexes,
+        initial_chunk_indexes,
+        chunk_index_version,
+    ))
 }
 
 pub(crate) struct PendingBackupMatch {
@@ -883,7 +945,7 @@ pub(crate) async fn resolve_backup(
 
     if mode == BackupMode::Watch && (parent_requested || continue_requested) {
         return Err(
-            "--parent and --continue cannot be used with gib watch; watch selects the latest completed backup automatically".to_string(),
+            "--parent and --continue cannot be used with gib watch; watch manages its synchronized base automatically".to_string(),
         );
     }
 
@@ -1114,6 +1176,7 @@ pub(crate) async fn resolve_backup(
         parent_hash,
         pending_backup,
         watch_debounce_ms: local_config.config.watch.debounce_ms.unwrap_or(300),
+        watch_poll_ms: local_config.config.watch.poll_ms.unwrap_or(2_000),
     })
 }
 
@@ -1128,15 +1191,6 @@ fn load_config(config_path: &Path) -> Result<Config, String> {
     let config_bytes =
         std::fs::read(config_path).map_err(|e| format!("Failed to read config file: {}", e))?;
     rmp_serde::from_slice(&config_bytes).map_err(|e| format!("Failed to deserialize config: {}", e))
-}
-
-pub(crate) async fn latest_backup_hash(
-    fs: Arc<dyn FS>,
-    key: String,
-    password: Option<String>,
-) -> Result<Option<String>, String> {
-    let summaries = list_backup_summaries(fs, key, password).await?;
-    Ok(summaries.first().map(|summary| summary.hash.clone()))
 }
 
 async fn resolve_parent_hash(
@@ -1202,7 +1256,7 @@ async fn resolve_backup_hash(
     }
 }
 
-async fn load_backup(
+pub(crate) async fn load_backup(
     fs: Arc<dyn FS>,
     key: String,
     password: Option<String>,
