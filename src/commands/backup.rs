@@ -7,6 +7,7 @@ use crate::core::crypto::read_file_maybe_decrypt;
 use crate::core::crypto::write_file_maybe_encrypt;
 use crate::core::indexes::{
     add_backup_summary, create_new_backup, list_backup_summaries, load_chunk_indexes,
+    resolve_backup_reference,
 };
 use crate::core::metadata::PendingBackup;
 use crate::core::metadata::{Backup, BackupObject, ChunkIndex};
@@ -1163,21 +1164,7 @@ async fn resolve_backup_hash(
     provided_hash: Option<String>,
 ) -> Result<String, String> {
     match provided_hash {
-        Some(hash) => {
-            if hash.len() <= 8 {
-                let summaries = list_backup_summaries(fs, key, password).await?;
-
-                for summary in summaries {
-                    if summary.hash.starts_with(&hash) {
-                        return Ok(summary.hash);
-                    }
-                }
-
-                Err(format!("No backup found matching hash prefix: {}", hash))
-            } else {
-                Ok(hash)
-            }
-        }
+        Some(hash) => resolve_backup_reference(fs, key, password, &hash).await,
         None => {
             let summaries = list_backup_summaries(fs, key, password).await?;
 

@@ -336,6 +336,11 @@ gib backup \
   --root-path ./src            # Subdirectory to backup
 ```
 
+Backup references accept a full hash, the first 8 characters of a hash, or
+`latest` (case-insensitive). `latest` resolves to the newest completed backup
+and is supported by `gib restore --backup`, `gib backup delete --backup`, and
+`gib backup --parent`.
+
 ### Watch Options
 
 `gib watch` accepts the same backup configuration options as `gib backup`,
@@ -351,7 +356,7 @@ automatically selects the latest completed backup for every snapshot.
 ```bash
 gib restore \
   --key my-project \           # Repository name
-  --backup abc12345 \          # Backup hash (full or first 8 chars)
+  --backup abc12345 \          # Backup hash, prefix, or latest
   --storage cloud \            # Which storage to use
   --password "secret" \        # Decrypt password
   --only path/to/file_or_dir \ # Restore only a specific file/folder

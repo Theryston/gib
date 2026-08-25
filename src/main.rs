@@ -125,7 +125,7 @@ fn cli() -> Command {
                     Arg::new("parent")
                         .long("parent")
                         .value_name("BACKUP")
-                        .help("Inherit the file tree from a previous backup")
+                        .help("Inherit the file tree from a previous backup (hash, prefix, or latest)")
                         .num_args(0..=1)
                         .required(false),
                 )
@@ -147,7 +147,7 @@ fn cli() -> Command {
                     Command::new("delete")
                         .about("Delete a backup and its orphaned chunks")
                         .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
-                        .arg(arg!(-b --backup <BACKUP> "The backup hash to delete (full hash or first 8 chars)").required(false))
+                        .arg(arg!(-b --backup <BACKUP> "The backup hash, prefix, or latest to delete").required(false))
                         .arg(arg!(-s --storage <STORAGE> "The storage to use").required(false))
                         .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))
                 )
@@ -212,7 +212,7 @@ fn cli() -> Command {
             Command::new("restore")
                 .about("Restore files from a backup")
                 .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
-                .arg(arg!(-b --backup <BACKUP> "The backup hash to restore (full hash or first 8 chars)").required(false))
+                .arg(arg!(-b --backup <BACKUP> "The backup hash, prefix, or latest to restore").required(false))
                 .arg(arg!(-s --storage <STORAGE> "The storage to use").required(false))
                 .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))
                 .arg(
