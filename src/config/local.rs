@@ -13,7 +13,7 @@ pub(crate) struct LocalConfig {
     pub(crate) version: Option<u32>,
     pub(crate) repository: RepositoryConfig,
     pub(crate) backup: BackupConfig,
-    pub(crate) watch: WatchConfig,
+    pub(crate) live: LiveConfig,
     pub(crate) restore: RestoreConfig,
 }
 
@@ -37,7 +37,7 @@ pub(crate) struct BackupConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct WatchConfig {
+pub(crate) struct LiveConfig {
     pub(crate) message: Option<String>,
     pub(crate) debounce_ms: Option<u64>,
     pub(crate) poll_ms: Option<u64>,
@@ -219,16 +219,16 @@ fn validate_config(config: &LocalConfig, path: &Path) -> Result<(), String> {
         }
     }
 
-    if config.watch.debounce_ms == Some(0) {
+    if config.live.debounce_ms == Some(0) {
         return Err(format!(
-            "The watch.debounce_ms value in '{}' must be greater than zero",
+            "The live.debounce_ms value in '{}' must be greater than zero",
             path.display()
         ));
     }
 
-    if config.watch.poll_ms == Some(0) {
+    if config.live.poll_ms == Some(0) {
         return Err(format!(
-            "The watch.poll_ms value in '{}' must be greater than zero",
+            "The live.poll_ms value in '{}' must be greater than zero",
             path.display()
         ));
     }

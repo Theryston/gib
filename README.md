@@ -206,7 +206,7 @@ gib backup --message "Initial backup"
 
 Place a `gib.toml` file in the repository root. GIB discovers the nearest file
 by searching from the current directory upward, so the same settings are reused
-by `backup`, `watch`, `restore`, `log`, and the other repository commands:
+by `backup`, `live`, `restore`, `log`, and the other repository commands:
 
 ```toml
 # version is optional; omitted means version 1.
@@ -224,8 +224,8 @@ chunk_size = "5 MB"
 concurrency = 8
 ignore = ["node_modules", ".git", "dist"]
 
-[watch]
-message = "Project watch"
+[live]
+message = "Project live synchronization"
 debounce_ms = 1500
 poll_ms = 2000
 
@@ -245,30 +245,34 @@ contains passwords, backup selectors, or destructive flags such as
 emits a `config` event with `loaded` and `path` fields without exposing
 sensitive values.
 
-### 6. Watch for changes
+### 6. Keep files backed up and synchronized
 
-Run a long-lived watcher that creates one debounced, incremental snapshot for
-each batch of filesystem changes:
+Run `live` to keep a directory continuously backed up. It creates one debounced,
+incremental snapshot for each batch of filesystem changes:
 
 ```bash
-gib watch
+gib live
 ```
 
-Watch-generated messages start with `[WATCH]` and contain only the number of
-created, changed, and deleted files, for example
-`[WATCH] created: 12 files; changed: 3 files`. The watcher keeps a small,
-machine-local state file containing the last synchronized backup hash. Before
-publishing a snapshot it compares that base with the current repository HEAD,
-automatically applies one-sided remote changes, and performs bounded
-three-way merges for text files. Binary changes and overlapping text changes
-are reported as conflicts instead of being silently overwritten. Remote
-changes are also polled periodically, so a machine can receive updates even
-when no local file event occurs.
+Run `gib live` on every active device that works on the same project. The
+devices automatically synchronize through the repository, so a change made on
+one device is received by the others even when they are running simultaneously.
+The live process keeps a small, machine-local state file containing the last
+synchronized backup hash. Before publishing a snapshot it compares that base
+with the current repository HEAD, automatically applies one-sided remote
+changes, and performs bounded three-way merges for text files. Binary changes
+and overlapping text changes are reported as conflicts instead of being
+silently overwritten. Remote changes are also polled periodically, so a device
+can receive updates even when no local file event occurs.
 
-Press `Ctrl+C` to stop watching. In interactive mode, conflicts offer `Keep
-local` and `Use remote`; in JSON mode they are emitted as `watch` conflict
-events and never trigger a prompt. Provide `--storage` explicitly in JSON
-mode or configure `repository.storage`; watcher lifecycle, batches,
+Live-generated messages start with `[LIVE]` and contain only the number of
+created, changed, and deleted files, for example `[LIVE] created: 12 files;
+changed: 3 files`.
+
+Press `Ctrl+C` to stop live synchronization. In interactive mode, conflicts
+offer `Keep local` and `Use remote`; in JSON mode they are emitted as `live`
+conflict events and never trigger a prompt. Provide `--storage` explicitly in
+JSON mode or configure `repository.storage`; live lifecycle, batches,
 synchronization, backup progress, completions, and recoverable errors are
 emitted as structured events.
 
@@ -322,7 +326,7 @@ Don't just take our word for it — try it yourself and feel the speed differenc
 | `gib whoami`         | Show your current identity              |
 | `gib setup`          | Discover and configure local storages   |
 | `gib backup`         | Create a new backup                     |
-| `gib watch`          | Watch a directory for automatic backups |
+| `gib live`           | Keep files backed up and synchronize active devices |
 | `gib backup delete`  | Delete a backup and its orphaned chunks |
 | `gib restore`        | Restore files from a backup             |
 | `gib log`            | View backup history (paginated)         |
@@ -351,16 +355,16 @@ Backup references accept a full hash, the first 8 characters of a hash, or
 and is supported by `gib restore --backup`, `gib backup delete --backup`, and
 `gib backup --parent`.
 
-### Watch Options
+### Live Options
 
-`gib watch` accepts the same backup configuration options as `gib backup`,
+`gib live` accepts the same backup configuration options as `gib backup`,
 including `--key`, `--storage`, `--password`, `--compress`, `--chunk-size`,
 `--root-path`, `--ignore`, and `--concurrency`. `--message` is optional and is
-included as context after the required `[WATCH]` prefix. The optional
-`[watch].debounce_ms` setting controls the quiet period used to group file
-events, while `[watch].poll_ms` controls remote HEAD polling (default: 2
-seconds). `--parent` and `--continue` are rejected because the watcher manages
-its synchronized base and repository HEAD automatically.
+included as context after the required `[LIVE]` prefix. The optional
+`[live].debounce_ms` setting controls the quiet period used to group file
+events, while `[live].poll_ms` controls remote HEAD polling (default: 2
+seconds). `--parent` and `--continue` are rejected because live manages its
+synchronized base and repository HEAD automatically.
 
 ### Restore Options
 

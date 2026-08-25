@@ -3,11 +3,11 @@ use crate::commands::backup::{
     run_backup_with_parents,
 };
 use crate::core::indexes::read_or_initialize_repository_head;
+use crate::core::live_state::{LiveState, load_live_state, save_live_state};
 use crate::core::metadata::Backup;
 use crate::core::reconcile::{
     ReconcileConflict, apply_remote_change, reconcile_worktree, worktree_matches_backup,
 };
-use crate::core::watch_state::{WatchState, load_watch_state, save_watch_state};
 use crate::output::{emit_named_event, is_json_mode};
 use crate::utils::handle_error;
 use clap::ArgMatches;
@@ -73,7 +73,7 @@ impl ChangeBatch {
 }
 
 #[derive(Serialize)]
-struct WatchStartPayload {
+struct LiveStartPayload {
     event: &'static str,
     root: String,
     storage: String,
@@ -92,7 +92,7 @@ struct ChangeGroupPayload {
 }
 
 #[derive(Serialize)]
-struct WatchBatchPayload {
+struct LiveBatchPayload {
     event: &'static str,
     message: String,
     created: ChangeGroupPayload,
@@ -101,13 +101,13 @@ struct WatchBatchPayload {
 }
 
 #[derive(Serialize)]
-struct WatchBackupStartedPayload {
+struct LiveBackupStartedPayload {
     event: &'static str,
     message: String,
 }
 
 #[derive(Serialize)]
-struct WatchBackupCompletedPayload {
+struct LiveBackupCompletedPayload {
     event: &'static str,
     backup: String,
     backup_short: String,
@@ -119,39 +119,39 @@ struct WatchBackupCompletedPayload {
 }
 
 #[derive(Serialize)]
-struct WatchSyncPayload {
+struct LiveSyncPayload {
     event: &'static str,
     applied_remote: usize,
     merged_text: usize,
 }
 
 #[derive(Serialize)]
-struct WatchConflictItem {
+struct LiveConflictItem {
     path: String,
     reason: String,
 }
 
 #[derive(Serialize)]
-struct WatchConflictPayload {
+struct LiveConflictPayload {
     event: &'static str,
-    conflicts: Vec<WatchConflictItem>,
+    conflicts: Vec<LiveConflictItem>,
     recoverable: bool,
 }
 
 #[derive(Serialize)]
-struct WatchErrorPayload {
+struct LiveErrorPayload {
     event: &'static str,
     message: String,
     recoverable: bool,
 }
 
 #[derive(Serialize)]
-struct WatchStopPayload {
+struct LiveStopPayload {
     event: &'static str,
 }
 
-pub async fn watch(matches: &ArgMatches) {
-    let resolved = match resolve_backup(matches, BackupMode::Watch).await {
+pub async fn live(matches: &ArgMatches) {
+    let resolved = match resolve_backup(matches, BackupMode::Live).await {
         Ok(resolved) => resolved,
         Err(error) => handle_error(error, None),
     };
@@ -160,7 +160,7 @@ pub async fn watch(matches: &ArgMatches) {
     if !root.is_dir() {
         handle_error(
             format!(
-                "Watch root '{}' is not an existing directory",
+                "Live root '{}' is not an existing directory",
                 root.display()
             ),
             None,
@@ -169,20 +169,20 @@ pub async fn watch(matches: &ArgMatches) {
 
     if is_json_mode() {
         emit_named_event(
-            "watch",
-            &WatchStartPayload {
+            "live",
+            &LiveStartPayload {
                 event: "start",
                 root: root.to_string_lossy().to_string(),
                 storage: resolved.options.storage.clone(),
                 key: resolved.options.key.clone(),
                 recursive: true,
-                debounce_ms: resolved.watch_debounce_ms,
-                poll_ms: resolved.watch_poll_ms,
+                debounce_ms: resolved.live_debounce_ms,
+                poll_ms: resolved.live_poll_ms,
                 ignore: resolved.options.ignore_patterns.clone(),
             },
         );
     } else {
-        println!("{}", style("GIB watch started").cyan().bold());
+        println!("{}", style("GIB live started").cyan().bold());
         println!("{} {}", style("Root").bold(), root.to_string_lossy());
         println!(
             "{} {} / {}",
@@ -204,28 +204,28 @@ pub async fn watch(matches: &ArgMatches) {
         println!(
             "{} {}",
             style("Remote sync interval").bold(),
-            format_duration(resolved.watch_poll_ms)
+            format_duration(resolved.live_poll_ms)
         );
     }
 
-    if let Err(error) = watch_loop(resolved).await {
+    if let Err(error) = live_loop(resolved).await {
         handle_error(error, None);
     }
 }
 
-async fn watch_loop(resolved: ResolvedBackup) -> Result<(), String> {
+async fn live_loop(resolved: ResolvedBackup) -> Result<(), String> {
     let root = PathBuf::from(&resolved.options.root_path_string);
     let ignore_patterns = resolved.options.ignore_patterns.clone();
-    let debounce_window = Duration::from_millis(resolved.watch_debounce_ms);
-    let (mut state, first_run) = initialize_watch_state(&resolved, &root).await?;
+    let debounce_window = Duration::from_millis(resolved.live_debounce_ms);
+    let (mut state, first_run) = initialize_live_state(&resolved, &root).await?;
     let startup_message = if first_run {
-        "[WATCH] initial synchronization"
+        "[LIVE] initial synchronization"
     } else {
-        "[WATCH] resumed synchronization"
+        "[LIVE] resumed synchronization"
     };
-    match synchronize_watch(&resolved, &mut state, Some(startup_message.to_string())).await {
+    match synchronize_live(&resolved, &mut state, Some(startup_message.to_string())).await {
         Ok(outcome) => emit_sync_outcome(outcome),
-        Err(error) => emit_watch_error(format!("Initial synchronization failed: {}", error), true),
+        Err(error) => emit_live_error(format!("Initial synchronization failed: {}", error), true),
     }
     let (sender, mut receiver) = unbounded_channel::<notify::Result<Event>>();
 
@@ -239,11 +239,11 @@ async fn watch_loop(resolved: ResolvedBackup) -> Result<(), String> {
 
     watcher
         .watch(&root, RecursiveMode::Recursive)
-        .map_err(|error| format!("Failed to watch '{}': {}", root.display(), error))?;
+        .map_err(|error| format!("Failed to monitor '{}': {}", root.display(), error))?;
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
-    let mut poll_interval = tokio::time::interval(Duration::from_millis(resolved.watch_poll_ms));
+    let mut poll_interval = tokio::time::interval(Duration::from_millis(resolved.live_poll_ms));
     poll_interval.tick().await;
 
     loop {
@@ -259,7 +259,7 @@ async fn watch_loop(resolved: ResolvedBackup) -> Result<(), String> {
                 None
             }
             _ = &mut ctrl_c => {
-                emit_watch_stop();
+                emit_live_stop();
                 return Ok(());
             }
         };
@@ -284,7 +284,7 @@ async fn watch_loop(resolved: ResolvedBackup) -> Result<(), String> {
                     record_notify_result(event, &root, &ignore_patterns, &mut batch);
                 }
                 _ = &mut ctrl_c => {
-                    emit_watch_stop();
+                    emit_live_stop();
                     return Ok(());
                 }
             }
@@ -298,18 +298,18 @@ async fn watch_loop(resolved: ResolvedBackup) -> Result<(), String> {
     }
 }
 
-async fn initialize_watch_state(
+async fn initialize_live_state(
     resolved: &ResolvedBackup,
     root: &Path,
-) -> Result<(WatchState, bool), String> {
-    let mut state = load_watch_state(root, &resolved.options.storage, &resolved.options.key)?;
+) -> Result<(LiveState, bool), String> {
+    let mut state = load_live_state(root, &resolved.options.storage, &resolved.options.key)?;
     if state.initialized {
         return Ok((state, false));
     }
 
     state.initialized = true;
     state.base_backup = None;
-    save_watch_state(
+    save_live_state(
         root,
         &resolved.options.storage,
         &resolved.options.key,
@@ -327,7 +327,7 @@ fn record_notify_result(
     let event = match result {
         Ok(event) => event,
         Err(error) => {
-            emit_watch_error(error.to_string(), true);
+            emit_live_error(error.to_string(), true);
             return;
         }
     };
@@ -361,20 +361,20 @@ fn record_notify_result(
     }
 }
 
-async fn process_remote_sync(resolved: &ResolvedBackup, state: &mut WatchState) {
-    match synchronize_watch(resolved, state, None).await {
+async fn process_remote_sync(resolved: &ResolvedBackup, state: &mut LiveState) {
+    match synchronize_live(resolved, state, None).await {
         Ok(outcome) => emit_sync_outcome(outcome),
-        Err(error) => emit_watch_error(format!("Synchronization failed: {}", error), true),
+        Err(error) => emit_live_error(format!("Synchronization failed: {}", error), true),
     }
 }
 
-async fn process_batch(resolved: &ResolvedBackup, batch: &ChangeBatch, state: &mut WatchState) {
-    let message = build_watch_message(&resolved.message, batch);
-    emit_watch_batch(batch, &message);
+async fn process_batch(resolved: &ResolvedBackup, batch: &ChangeBatch, state: &mut LiveState) {
+    let message = build_live_message(&resolved.message, batch);
+    emit_live_batch(batch, &message);
 
-    match synchronize_watch(resolved, state, Some(message)).await {
+    match synchronize_live(resolved, state, Some(message)).await {
         Ok(outcome) => emit_sync_outcome(outcome),
-        Err(error) => emit_watch_error(format!("Backup failed: {}", error), true),
+        Err(error) => emit_live_error(format!("Backup failed: {}", error), true),
     }
 }
 
@@ -385,9 +385,9 @@ struct SyncOutcome {
     merged_text: usize,
 }
 
-async fn synchronize_watch(
+async fn synchronize_live(
     resolved: &ResolvedBackup,
-    state: &mut WatchState,
+    state: &mut LiveState,
     message: Option<String>,
 ) -> Result<SyncOutcome, String> {
     let root = PathBuf::from(&resolved.options.root_path_string);
@@ -452,7 +452,7 @@ async fn synchronize_watch(
 
             if !reconciliation.conflicts.is_empty() {
                 if is_json_mode() {
-                    emit_watch_conflicts(&reconciliation.conflicts);
+                    emit_live_conflicts(&reconciliation.conflicts);
                     return Ok(outcome);
                 }
                 resolve_interactive_conflicts(
@@ -469,7 +469,7 @@ async fn synchronize_watch(
         if worktree_matches_backup(&root, &resolved.options.ignore_patterns, &remote_tree)? {
             state.initialized = true;
             state.base_backup = remote_hash;
-            save_watch_state(
+            save_live_state(
                 &root,
                 &resolved.options.storage,
                 &resolved.options.key,
@@ -490,12 +490,12 @@ async fn synchronize_watch(
 
         let backup_message = message.clone().unwrap_or_else(|| {
             if remote_changed {
-                "[WATCH] synchronized remote changes".to_string()
+                "[LIVE] synchronized remote changes".to_string()
             } else {
-                "[WATCH] local changes".to_string()
+                "[LIVE] local changes".to_string()
             }
         });
-        emit_watch_backup_started(&backup_message);
+        emit_live_backup_started(&backup_message);
 
         let result =
             run_backup_with_parents(resolved.options.clone(), backup_message, parents, None)
@@ -504,7 +504,7 @@ async fn synchronize_watch(
         if result.head_published {
             state.initialized = true;
             state.base_backup = Some(result.backup.hash.clone());
-            save_watch_state(
+            save_live_state(
                 &root,
                 &resolved.options.storage,
                 &resolved.options.key,
@@ -516,13 +516,13 @@ async fn synchronize_watch(
 
         if attempt == 2 {
             return Err(
-                "The repository changed while publishing the backup; please retry after the other watch finishes"
+                "The repository changed while publishing the backup; please retry after the other live process finishes"
                     .to_string(),
             );
         }
     }
 
-    Err("Failed to synchronize the watch after several concurrent changes".to_string())
+    Err("Failed to synchronize live changes after several concurrent updates".to_string())
 }
 
 fn empty_backup() -> Backup {
@@ -570,11 +570,11 @@ async fn resolve_interactive_conflicts(
     Ok(())
 }
 
-fn emit_watch_batch(batch: &ChangeBatch, message: &str) {
+fn emit_live_batch(batch: &ChangeBatch, message: &str) {
     if is_json_mode() {
         emit_named_event(
-            "watch",
-            &WatchBatchPayload {
+            "live",
+            &LiveBatchPayload {
                 event: "change_batch",
                 message: message.to_string(),
                 created: change_group_payload(batch.paths(ChangeKind::Created)),
@@ -608,8 +608,8 @@ fn emit_backup_completed(result: BackupResult) {
 
     if is_json_mode() {
         emit_named_event(
-            "watch",
-            &WatchBackupCompletedPayload {
+            "live",
+            &LiveBackupCompletedPayload {
                 event: "backup_complete",
                 backup: result.backup.hash,
                 backup_short,
@@ -630,11 +630,11 @@ fn emit_backup_completed(result: BackupResult) {
     }
 }
 
-fn emit_watch_backup_started(message: &str) {
+fn emit_live_backup_started(message: &str) {
     if is_json_mode() {
         emit_named_event(
-            "watch",
-            &WatchBackupStartedPayload {
+            "live",
+            &LiveBackupStartedPayload {
                 event: "backup_start",
                 message: message.to_string(),
             },
@@ -648,8 +648,8 @@ fn emit_sync_outcome(outcome: SyncOutcome) {
     if outcome.applied_remote > 0 || outcome.merged_text > 0 {
         if is_json_mode() {
             emit_named_event(
-                "watch",
-                &WatchSyncPayload {
+                "live",
+                &LiveSyncPayload {
                     event: "synchronized",
                     applied_remote: outcome.applied_remote,
                     merged_text: outcome.merged_text,
@@ -670,15 +670,15 @@ fn emit_sync_outcome(outcome: SyncOutcome) {
     }
 }
 
-fn emit_watch_conflicts(conflicts: &[ReconcileConflict]) {
+fn emit_live_conflicts(conflicts: &[ReconcileConflict]) {
     if is_json_mode() {
         emit_named_event(
-            "watch",
-            &WatchConflictPayload {
+            "live",
+            &LiveConflictPayload {
                 event: "conflict",
                 conflicts: conflicts
                     .iter()
-                    .map(|conflict| WatchConflictItem {
+                    .map(|conflict| LiveConflictItem {
                         path: conflict.path.clone(),
                         reason: conflict.reason.clone(),
                     })
@@ -689,30 +689,30 @@ fn emit_watch_conflicts(conflicts: &[ReconcileConflict]) {
     }
 }
 
-fn emit_watch_error(message: String, recoverable: bool) {
+fn emit_live_error(message: String, recoverable: bool) {
     if is_json_mode() {
         emit_named_event(
-            "watch",
-            &WatchErrorPayload {
+            "live",
+            &LiveErrorPayload {
                 event: "error",
                 message,
                 recoverable,
             },
         );
     } else {
-        eprintln!("{} {}", style("Watch error").red().bold(), message);
+        eprintln!("{} {}", style("Live error").red().bold(), message);
     }
 }
 
-fn emit_watch_stop() {
+fn emit_live_stop() {
     if is_json_mode() {
-        emit_named_event("watch", &WatchStopPayload { event: "stop" });
+        emit_named_event("live", &LiveStopPayload { event: "stop" });
     } else {
-        println!("{}", style("GIB watch stopped").cyan().bold());
+        println!("{}", style("GIB live stopped").cyan().bold());
     }
 }
 
-fn build_watch_message(prefix: &str, batch: &ChangeBatch) -> String {
+fn build_live_message(prefix: &str, batch: &ChangeBatch) -> String {
     let mut sections = Vec::new();
     for (label, kind) in [
         ("created", ChangeKind::Created),
@@ -728,9 +728,9 @@ fn build_watch_message(prefix: &str, batch: &ChangeBatch) -> String {
     let summary = sections.join("; ");
     let prefix = prefix.trim();
     if prefix.is_empty() {
-        format!("[WATCH] {}", summary)
+        format!("[LIVE] {}", summary)
     } else {
-        format!("[WATCH] {} — {}", prefix, summary)
+        format!("[LIVE] {} — {}", prefix, summary)
     }
 }
 
@@ -788,7 +788,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after unix epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("gib-watch-test-{suffix}"));
+        let path = std::env::temp_dir().join(format!("gib-live-test-{suffix}"));
         std::fs::create_dir_all(&path).expect("temporary directory should be created");
         path
     }
@@ -810,17 +810,17 @@ mod tests {
     }
 
     #[test]
-    fn watch_message_contains_actions_and_counts_only() {
+    fn live_message_contains_actions_and_counts_only() {
         let mut batch = ChangeBatch::default();
         batch.record("created.txt".to_string(), ChangeKind::Created);
         batch.record("changed-a.txt".to_string(), ChangeKind::Changed);
         batch.record("changed-b.txt".to_string(), ChangeKind::Changed);
         batch.record("deleted.txt".to_string(), ChangeKind::Deleted);
 
-        let message = build_watch_message("autosave", &batch);
+        let message = build_live_message("autosave", &batch);
         assert_eq!(
             message,
-            "[WATCH] autosave — created: 1 file; changed: 2 files; deleted: 1 file"
+            "[LIVE] autosave — created: 1 file; changed: 2 files; deleted: 1 file"
         );
         assert!(!message.contains("created.txt"));
         assert!(!message.contains("changed-a.txt"));
@@ -875,7 +875,7 @@ mod tests {
 
         let initial = run_backup(
             options_one.clone(),
-            "[WATCH] initial".to_string(),
+            "[LIVE] initial".to_string(),
             None,
             None,
         )
@@ -887,34 +887,34 @@ mod tests {
             message: String::new(),
             parent_hash: None,
             pending_backup: None,
-            watch_debounce_ms: 300,
-            watch_poll_ms: 2_000,
+            live_debounce_ms: 300,
+            live_poll_ms: 2_000,
         };
         let resolved_two = ResolvedBackup {
             options: options_two,
             message: String::new(),
             parent_hash: None,
             pending_backup: None,
-            watch_debounce_ms: 300,
-            watch_poll_ms: 2_000,
+            live_debounce_ms: 300,
+            live_poll_ms: 2_000,
         };
 
-        let mut state_one = WatchState {
+        let mut state_one = LiveState {
             version: 1,
             initialized: true,
             base_backup: Some(initial.backup.hash.clone()),
         };
-        let mut state_two = WatchState {
+        let mut state_two = LiveState {
             version: 1,
             initialized: true,
             base_backup: Some(initial.backup.hash),
         };
 
         std::fs::write(source_one.join("shared.txt"), b"base\nfrom one\n").unwrap();
-        let first_sync = synchronize_watch(
+        let first_sync = synchronize_live(
             &resolved_one,
             &mut state_one,
-            Some("[WATCH] changed".to_string()),
+            Some("[LIVE] changed".to_string()),
         )
         .await
         .unwrap();
@@ -926,7 +926,7 @@ mod tests {
             .hash
             .clone();
 
-        let second_sync = synchronize_watch(&resolved_two, &mut state_two, None)
+        let second_sync = synchronize_live(&resolved_two, &mut state_two, None)
             .await
             .unwrap();
 
@@ -949,17 +949,17 @@ mod tests {
             message: String::new(),
             parent_hash: None,
             pending_backup: None,
-            watch_debounce_ms: 300,
-            watch_poll_ms: 2_000,
+            live_debounce_ms: 300,
+            live_poll_ms: 2_000,
         };
-        let (mut state_three, first_run) = initialize_watch_state(&resolved_three, &source_three)
+        let (mut state_three, first_run) = initialize_live_state(&resolved_three, &source_three)
             .await
             .unwrap();
         assert!(first_run);
-        synchronize_watch(
+        synchronize_live(
             &resolved_three,
             &mut state_three,
-            Some("[WATCH] initial synchronization".to_string()),
+            Some("[LIVE] initial synchronization".to_string()),
         )
         .await
         .unwrap();

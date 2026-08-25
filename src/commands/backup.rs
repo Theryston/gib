@@ -55,14 +55,14 @@ pub(crate) struct ResolvedBackup {
     pub(crate) message: String,
     pub(crate) parent_hash: Option<String>,
     pub(crate) pending_backup: Option<PendingBackupMatch>,
-    pub(crate) watch_debounce_ms: u64,
-    pub(crate) watch_poll_ms: u64,
+    pub(crate) live_debounce_ms: u64,
+    pub(crate) live_poll_ms: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackupMode {
     Manual,
-    Watch,
+    Live,
 }
 
 pub(crate) struct BackupResult {
@@ -74,9 +74,9 @@ pub(crate) struct BackupResult {
     pub(crate) head_published: bool,
 }
 
-struct PendingBackupWatcherGuard(Arc<AtomicBool>);
+struct PendingBackupMonitorGuard(Arc<AtomicBool>);
 
-impl Drop for PendingBackupWatcherGuard {
+impl Drop for PendingBackupMonitorGuard {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
     }
@@ -264,28 +264,28 @@ pub(crate) async fn run_backup_with_parents(
         new_backup.lock().unwrap().hash
     ));
 
-    let pending_backup_watcher_stop = Arc::new(AtomicBool::new(false));
+    let pending_backup_monitor_stop = Arc::new(AtomicBool::new(false));
 
     {
         let fs_clone = Arc::clone(&fs);
         let pending_backup_clone = Arc::clone(&pending_backup);
         let pending_backup_path_clone = pending_backup_path.clone();
-        let pending_backup_watcher_stop_clone = pending_backup_watcher_stop.clone();
+        let pending_backup_monitor_stop_clone = pending_backup_monitor_stop.clone();
         let password_clone = password.clone();
 
         thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().unwrap();
-            runtime.block_on(watch_pending_backup(
+            runtime.block_on(monitor_pending_backup(
                 pending_backup_clone,
                 pending_backup_path_clone,
                 fs_clone,
-                pending_backup_watcher_stop_clone,
+                pending_backup_monitor_stop_clone,
                 password_clone,
             ));
         });
     };
-    let _pending_backup_watcher_guard =
-        PendingBackupWatcherGuard(Arc::clone(&pending_backup_watcher_stop));
+    let _pending_backup_monitor_guard =
+        PendingBackupMonitorGuard(Arc::clone(&pending_backup_monitor_stop));
 
     let files_stream = stream::iter(root_files);
 
@@ -346,7 +346,7 @@ pub(crate) async fn run_backup_with_parents(
         }
     }
 
-    pending_backup_watcher_stop.store(true, Ordering::SeqCst);
+    pending_backup_monitor_stop.store(true, Ordering::SeqCst);
 
     if !failed_files.is_empty() {
         pb.finish_and_clear();
@@ -516,11 +516,11 @@ pub(crate) async fn run_backup_with_parents(
     })
 }
 
-async fn watch_pending_backup(
+async fn monitor_pending_backup(
     pending_backup: Arc<Mutex<PendingBackup>>,
     pending_backup_path: Arc<String>,
     fs: Arc<dyn FS>,
-    pending_backup_watcher_stop: Arc<AtomicBool>,
+    pending_backup_monitor_stop: Arc<AtomicBool>,
     password: Option<String>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -528,7 +528,7 @@ async fn watch_pending_backup(
     loop {
         interval.tick().await;
 
-        if pending_backup_watcher_stop.load(Ordering::SeqCst) {
+        if pending_backup_monitor_stop.load(Ordering::SeqCst) {
             break;
         }
 
@@ -943,9 +943,9 @@ pub(crate) async fn resolve_backup(
     let parent_requested = matches.contains_id("parent");
     let continue_requested = matches.contains_id("continue");
 
-    if mode == BackupMode::Watch && (parent_requested || continue_requested) {
+    if mode == BackupMode::Live && (parent_requested || continue_requested) {
         return Err(
-            "--parent and --continue cannot be used with gib watch; watch manages its synchronized base automatically".to_string(),
+            "--parent and --continue cannot be used with gib live; live manages its synchronized base automatically".to_string(),
         );
     }
 
@@ -1008,7 +1008,7 @@ pub(crate) async fn resolve_backup(
         reused_data.push("uploaded chunks".to_string());
     }
 
-    let parent_hash = if mode == BackupMode::Watch {
+    let parent_hash = if mode == BackupMode::Live {
         None
     } else {
         match pending_backup.as_ref() {
@@ -1024,10 +1024,10 @@ pub(crate) async fn resolve_backup(
         }
     };
 
-    let configured_message = if mode == BackupMode::Watch {
+    let configured_message = if mode == BackupMode::Live {
         local_config
             .config
-            .watch
+            .live
             .message
             .clone()
             .or_else(|| local_config.config.backup.message.clone())
@@ -1175,8 +1175,8 @@ pub(crate) async fn resolve_backup(
         message,
         parent_hash,
         pending_backup,
-        watch_debounce_ms: local_config.config.watch.debounce_ms.unwrap_or(300),
-        watch_poll_ms: local_config.config.watch.poll_ms.unwrap_or(2_000),
+        live_debounce_ms: local_config.config.live.debounce_ms.unwrap_or(300),
+        live_poll_ms: local_config.config.live.poll_ms.unwrap_or(2_000),
     })
 }
 
@@ -1413,7 +1413,7 @@ mod tests {
             concurrency: 1,
         };
 
-        let first = run_backup(options.clone(), "[WATCH] first".to_string(), None, None)
+        let first = run_backup(options.clone(), "[LIVE] first".to_string(), None, None)
             .await
             .unwrap();
         assert!(first.backup.tree.contains_key("kept.txt"));
@@ -1423,7 +1423,7 @@ mod tests {
 
         let second = run_backup(
             options,
-            "[WATCH] deleted".to_string(),
+            "[LIVE] deleted".to_string(),
             Some(first.backup.hash),
             None,
         )

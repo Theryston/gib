@@ -44,9 +44,8 @@ pub(crate) fn scan_worktree(
         .filter_entry(|entry| !is_ignored_path(entry.path(), root, ignore_patterns));
 
     for entry in walker {
-        let entry = entry.map_err(|error| {
-            format!("Failed to scan watch root '{}': {}", root.display(), error)
-        })?;
+        let entry = entry
+            .map_err(|error| format!("Failed to scan live root '{}': {}", root.display(), error))?;
         if !entry.file_type().is_file() {
             continue;
         }

@@ -153,8 +153,8 @@ fn cli() -> Command {
                 )
         )
         .subcommand(
-            Command::new("watch")
-                .about("Watch a directory and create incremental backups automatically")
+            Command::new("live")
+                .about("Keep a directory backed up and synchronized across active devices")
                 .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
                 .arg(arg!(-m --message <MESSAGE> "Optional context included in automatic backup messages").required(false))
                 .arg(arg!(-s --storage <STORAGE> "The storage to use for the backup").required(false))
@@ -173,7 +173,7 @@ fn cli() -> Command {
                         .short('r')
                         .long("root-path")
                         .value_name("ROOT_PATH")
-                        .help("The root path to watch")
+                        .help("The root path to keep backed up and synchronized")
                         .required(false),
                 )
                 .arg(
@@ -189,14 +189,14 @@ fn cli() -> Command {
                     Arg::new("continue")
                         .long("continue")
                         .value_name("BACKUP")
-                        .help("Continue the backup from an incomplete backup (not valid for watch)")
+                        .help("Continue the backup from an incomplete backup (not valid for live)")
                         .required(false),
                 )
                 .arg(
                     Arg::new("parent")
                         .long("parent")
                         .value_name("BACKUP")
-                        .help("Use a parent backup (not valid for watch)")
+                        .help("Use a parent backup (not valid for live)")
                         .num_args(0..=1)
                         .required(false),
                 )
@@ -335,7 +335,7 @@ async fn main() {
         Some(("config", matches)) => commands::config(matches),
         Some(("whoami", _)) => commands::whoami(),
         Some(("setup", matches)) => commands::setup(matches),
-        Some(("watch", matches)) => commands::watch(matches).await,
+        Some(("live", matches)) => commands::live(matches).await,
         Some(("encrypt", matches)) => commands::encrypt(matches).await,
         Some(("log", matches)) => commands::log(matches).await,
         Some(("backup", matches)) => match matches.subcommand() {
