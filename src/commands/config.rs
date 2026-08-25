@@ -9,6 +9,8 @@ use std::time::Duration;
 use crate::output::{JsonProgress, emit_output, is_json_mode};
 use crate::utils::handle_error;
 
+pub const DEFAULT_AUTHOR: &str = "anonymous <anonymous@trygib.org>";
+
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
 pub struct Config {
     pub author: String,
@@ -35,10 +37,7 @@ pub fn config(matches: &ArgMatches) {
         |author| author.to_string(),
     );
 
-    let author_pattern =
-        regex::Regex::new(r"^[A-Za-z]+(?: [A-Za-z]+)+(?: )?<[^@ ]+@[^@ ]+\.[^@ >]+>$").unwrap();
-
-    if !author_pattern.is_match(&author) {
+    if !is_valid_author(&author) {
         handle_error(
             "The author must be in the format 'Firstname Lastname <email>'".to_string(),
             None,
@@ -108,4 +107,11 @@ pub fn config(matches: &ArgMatches) {
         pb.set_prefix("OK");
         pb.finish_with_message(format!("Config written ({:.2?})", elapsed));
     }
+}
+
+pub fn is_valid_author(author: &str) -> bool {
+    let author_pattern =
+        regex::Regex::new(r"^[A-Za-z]+(?: [A-Za-z]+)*(?: )?<[^@ ]+@[^@ ]+\.[^@ >]+>$").unwrap();
+
+    author_pattern.is_match(author)
 }

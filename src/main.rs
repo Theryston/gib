@@ -41,6 +41,17 @@ fn cli() -> Command {
                 .about("Show your identity")
         )
         .subcommand(
+            Command::new("setup")
+                .about("Discover local GIB repositories and configure them as storages")
+                .arg(
+                    Arg::new("no-recursive")
+                        .long("no-recursive")
+                        .help("Only inspect direct child directories")
+                        .action(clap::ArgAction::SetTrue)
+                        .required(false),
+                ),
+        )
+        .subcommand(
             Command::new("encrypt")
                 .about("Encrypt all chunks of your repository")
                 .arg(arg!(-p --password <PASSWORD> "The password to use for the encryption").required(false))
@@ -251,6 +262,7 @@ async fn main() {
     match matches.subcommand() {
         Some(("config", matches)) => commands::config(matches),
         Some(("whoami", _)) => commands::whoami(),
+        Some(("setup", matches)) => commands::setup(matches),
         Some(("encrypt", matches)) => commands::encrypt(matches).await,
         Some(("log", matches)) => commands::log(matches).await,
         Some(("backup", matches)) => match matches.subcommand() {

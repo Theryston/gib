@@ -141,7 +141,20 @@ Built with **Tokio** for maximum performance:
 gib config --author "Your Name <you@example.com>"
 ```
 
-### 2. Add a storage
+### 2. Discover existing local repositories
+
+From a workspace containing existing GIB repositories, run setup to create the
+default identity when needed and register discovered local repositories as
+storages:
+
+```bash
+gib setup
+
+# Inspect only direct child directories
+gib setup --no-recursive
+```
+
+### 3. Add a storage
 
 **Local storage:**
 
@@ -160,20 +173,20 @@ gib storage add --name cloud \
   --secret-key YOUR_SECRET_KEY
 ```
 
-### 3. Create your first backup
+### 4. Create your first backup
 
 ```bash
 cd /path/to/your/project
 gib backup --message "Initial backup"
 ```
 
-### 4. View backup history
+### 5. View backup history
 
 ```bash
 gib log
 ```
 
-### 5. Restore a backup
+### 6. Restore a backup
 
 ```bash
 gib restore
@@ -212,6 +225,7 @@ Don't just take our word for it — try it yourself and feel the speed differenc
 | -------------------- | --------------------------------------- |
 | `gib config`         | Configure your identity                 |
 | `gib whoami`         | Show your current identity              |
+| `gib setup`          | Discover and configure local repositories |
 | `gib backup`         | Create a new backup                     |
 | `gib backup delete`  | Delete a backup and its orphaned chunks |
 | `gib restore`        | Restore files from a backup             |
