@@ -1,18 +1,18 @@
+use crate::config::{
+    PasswordPolicy, RepositoryOptions, load_and_report_local_config, resolve_repository,
+};
 use crate::core::crypto::{read_file_maybe_decrypt, write_file_maybe_encrypt};
 use crate::core::indexes::list_backup_summaries;
+use crate::core::indexes::load_chunk_indexes;
 use crate::core::metadata::{BackupSummary, ChunkIndex};
-use crate::core::{crypto::get_password, indexes::load_chunk_indexes};
 use crate::fs::FS;
 use crate::output::{JsonProgress, emit_output, emit_progress_message, is_json_mode};
-use crate::utils::{get_fs, get_pwd_string, get_storage, handle_error};
+use crate::utils::handle_error;
 use clap::ArgMatches;
 use console::style;
-use dialoguer::Select;
-use dirs::home_dir;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
@@ -21,16 +21,18 @@ use tokio::task::JoinSet;
 const MAX_CONCURRENT_FILES: usize = 100;
 
 pub async fn encrypt(matches: &ArgMatches) {
-    let (key, storage, password) = match get_params(matches) {
+    let repository = match get_params(matches) {
         Ok(params) => params,
         Err(e) => handle_error(e, None),
     };
 
+    let key = repository.key;
+    let password = repository.password;
+    let fs = repository.fs;
+
     if password.is_none() {
         handle_error("Password is required".to_string(), None);
     }
-
-    let storage = get_storage(&storage);
 
     let pb = if is_json_mode() {
         ProgressBar::hidden()
@@ -45,8 +47,6 @@ pub async fn encrypt(matches: &ArgMatches) {
     if is_json_mode() {
         emit_progress_message("Loading metadata from the repository key...");
     }
-
-    let fs = get_fs(&storage, Some(&pb));
 
     let prev_not_encrypted_but_now_yes = Arc::new(Mutex::new(false));
 
@@ -279,82 +279,15 @@ async fn load_metadata(
     Ok((chunk_indexes, backup_summaries))
 }
 
-fn get_params(matches: &ArgMatches) -> Result<(String, String, Option<String>), String> {
-    let password: Option<String> = matches
-        .get_one::<String>("password")
-        .map(|s| s.to_string())
-        .map_or_else(
-            || get_password(true, false),
-            |password| Some(password.to_string()),
-        );
-
-    let pwd_string = get_pwd_string();
-
-    let default_key = Path::new(&pwd_string)
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
-
-    let key = matches
-        .get_one::<String>("key")
-        .map_or_else(|| default_key, |key| key.to_string());
-
-    let home_dir = home_dir().unwrap();
-    let storage_path = home_dir.join(".gib").join("storages");
-
-    if !storage_path.exists() {
-        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
-    }
-
-    let files =
-        std::fs::read_dir(&storage_path).map_err(|e| format!("Failed to read storages: {}", e))?;
-
-    let storages_names = &files
-        .map(|file| {
-            file.map_err(|e| format!("Failed to read storage entry: {}", e))
-                .map(|file| {
-                    file.file_name()
-                        .to_string_lossy()
-                        .to_string()
-                        .split('.')
-                        .next()
-                        .unwrap()
-                        .to_string()
-                })
-        })
-        .collect::<Result<Vec<String>, String>>()?;
-
-    if storages_names.is_empty() {
-        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
-    }
-
-    let storage = match matches.get_one::<String>("storage") {
-        Some(storage) => storage.to_string(),
-        None => {
-            if is_json_mode() {
-                return Err(
-                    "Missing required argument: --storage (required in --mode json)".to_string(),
-                );
-            }
-            let selected_index = Select::new()
-                .with_prompt("Select the storage to use")
-                .items(storages_names)
-                .default(0)
-                .interact()
-                .map_err(|e| format!("{}", e))?;
-
-            storages_names[selected_index].clone()
-        }
-    };
-
-    let exists = storages_names
-        .iter()
-        .any(|storage_name| storage_name == &storage);
-
-    if !exists {
-        return Err(format!("Storage '{}' not found", storage));
-    }
-
-    Ok((key, storage, password))
+fn get_params(matches: &ArgMatches) -> Result<RepositoryOptions, String> {
+    let local_config = load_and_report_local_config(matches)?;
+    resolve_repository(
+        matches,
+        &local_config,
+        PasswordPolicy {
+            required: true,
+            readonly: false,
+        },
+        None,
+    )
 }

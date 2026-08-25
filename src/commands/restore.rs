@@ -1,4 +1,6 @@
-use crate::core::crypto::get_password;
+use crate::config::{
+    PasswordPolicy, load_and_report_local_config, resolve_path, resolve_repository,
+};
 use crate::core::crypto::read_file_maybe_decrypt;
 use crate::core::indexes::list_backup_summaries;
 use crate::core::metadata::Backup;
@@ -9,10 +11,9 @@ use crate::core::only::select_only_paths_interactive;
 use crate::core::permissions::set_file_permissions;
 use crate::fs::FS;
 use crate::output::{JsonProgress, emit_output, emit_progress_message, emit_warning, is_json_mode};
-use crate::utils::{decompress_bytes, get_fs, get_pwd_string, get_storage, handle_error};
+use crate::utils::{decompress_bytes, handle_error};
 use clap::ArgMatches;
 use dialoguer::Select;
-use dirs::home_dir;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
@@ -28,17 +29,13 @@ use walkdir::WalkDir;
 const MAX_CONCURRENT_FILES: usize = 100;
 
 pub async fn restore(matches: &ArgMatches) {
-    let (key, storage, password, backup_hash, target_path, prune_local, only_request) =
+    let (key, fs, password, backup_hash, target_path, prune_local, only_request) =
         match get_params(matches) {
             Ok(params) => params,
             Err(e) => handle_error(e, None),
         };
 
     let started_at = Instant::now();
-
-    let storage = get_storage(&storage);
-
-    let fs = get_fs(&storage, None);
 
     let full_backup_hash = match resolve_backup_hash(
         Arc::clone(&fs),
@@ -517,7 +514,7 @@ fn get_params(
 ) -> Result<
     (
         String,
-        String,
+        Arc<dyn FS>,
         Option<String>,
         Option<String>,
         String,
@@ -526,101 +523,30 @@ fn get_params(
     ),
     String,
 > {
-    let password: Option<String> = matches
-        .get_one::<String>("password")
-        .map(|s| s.to_string())
-        .map_or_else(
-            || get_password(false, true),
-            |password| Some(password.to_string()),
-        );
-
-    let pwd_string = get_pwd_string();
-
-    let target_path = matches.get_one::<String>("target-path").map_or_else(
-        || pwd_string.clone(),
-        |target_path| {
-            Path::new(&pwd_string)
-                .join(target_path)
-                .to_string_lossy()
-                .to_string()
+    let local_config = load_and_report_local_config(matches)?;
+    let repository = resolve_repository(
+        matches,
+        &local_config,
+        PasswordPolicy {
+            required: false,
+            readonly: true,
         },
-    );
-
-    let default_key = Path::new(&pwd_string)
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
-
-    let key = matches
-        .get_one::<String>("key")
-        .map_or_else(|| default_key, |key| key.to_string());
-
+        None,
+    )?;
+    let target_path = resolve_path(
+        matches.get_one::<String>("target-path"),
+        local_config.config.restore.target_path.as_ref(),
+        &local_config,
+    )?;
     let prune_local = matches.get_flag("prune-local");
     let only_request = parse_only_request(matches, prune_local)?;
-
-    let home_dir = home_dir().unwrap();
-    let storage_path = home_dir.join(".gib").join("storages");
-
-    if !storage_path.exists() {
-        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
-    }
-
-    let files =
-        std::fs::read_dir(&storage_path).map_err(|e| format!("Failed to read storages: {}", e))?;
-
-    let storages_names = &files
-        .map(|file| {
-            file.map_err(|e| format!("Failed to read storage entry: {}", e))
-                .map(|file| {
-                    file.file_name()
-                        .to_string_lossy()
-                        .to_string()
-                        .split('.')
-                        .next()
-                        .unwrap()
-                        .to_string()
-                })
-        })
-        .collect::<Result<Vec<String>, String>>()?;
-
-    if storages_names.is_empty() {
-        return Err("Seems like you didn't create any storage yet. Run 'gib storage add' to create a storage.".to_string());
-    }
-
-    let storage = match matches.get_one::<String>("storage") {
-        Some(storage) => storage.to_string(),
-        None => {
-            if is_json_mode() {
-                return Err(
-                    "Missing required argument: --storage (required in --mode json)".to_string(),
-                );
-            }
-            let selected_index = Select::new()
-                .with_prompt("Select the storage to use")
-                .items(storages_names)
-                .default(0)
-                .interact()
-                .map_err(|e| format!("{}", e))?;
-
-            storages_names[selected_index].clone()
-        }
-    };
-
-    let exists = storages_names
-        .iter()
-        .any(|storage_name| storage_name == &storage);
-
-    if !exists {
-        return Err(format!("Storage '{}' not found", storage));
-    }
 
     let backup_hash = matches.get_one::<String>("backup").map(|s| s.to_string());
 
     Ok((
-        key,
-        storage,
-        password,
+        repository.key,
+        repository.fs,
+        repository.password,
         backup_hash,
         target_path,
         prune_local,

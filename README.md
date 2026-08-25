@@ -202,7 +202,49 @@ cd /path/to/your/project
 gib backup --message "Initial backup"
 ```
 
-### 5. Watch for changes
+### 5. Configure project-local defaults
+
+Place a `gib.toml` file in the repository root. GIB discovers the nearest file
+by searching from the current directory upward, so the same settings are reused
+by `backup`, `watch`, `restore`, `log`, and the other repository commands:
+
+```toml
+# version is optional; omitted means version 1.
+version = 1
+
+[repository]
+storage = "mybackups"
+key = "my-project"
+
+[backup]
+root_path = "."
+message = "Project backup"
+compress = 3
+chunk_size = "5 MB"
+concurrency = 8
+ignore = ["node_modules", ".git", "dist"]
+
+[watch]
+message = "Project watch"
+debounce_ms = 1500
+
+[restore]
+target_path = "./.gib-restore"
+```
+
+Every section and key is optional. The precedence is built-in defaults, then
+`gib.toml`, then explicit CLI flags. Ignore patterns from `[backup]` are
+combined with repeated `--ignore` flags and duplicates are removed. Relative
+paths are resolved from the directory containing `gib.toml`.
+
+Use `--config /path/to/gib.toml` to select a specific file or `--no-config` to
+disable local configuration for one invocation. Local configuration never
+contains passwords, backup selectors, or destructive flags such as
+`--prune-local`. Interactive commands report the loaded file path; JSON mode
+emits a `config` event with `loaded` and `path` fields without exposing
+sensitive values.
+
+### 6. Watch for changes
 
 Run a long-lived watcher that creates one debounced, incremental snapshot for
 each batch of filesystem changes:
@@ -216,16 +258,17 @@ created, changed, and deleted files, for example
 `[WATCH] created: 12 files; changed: 3 files`. Each snapshot uses the latest
 completed backup as its parent, so deletions are removed from the new tree and
 unchanged chunks are reused. Press `Ctrl+C` to stop watching. In JSON mode,
-provide `--storage` explicitly; watcher lifecycle, batches, backup progress,
-completions, and recoverable errors are emitted as structured events.
+provide `--storage` explicitly or configure `repository.storage`; watcher
+lifecycle, batches, backup progress, completions, and recoverable errors are
+emitted as structured events.
 
-### 6. View backup history
+### 7. View backup history
 
 ```bash
 gib log
 ```
 
-### 7. Restore a backup
+### 8. Restore a backup
 
 ```bash
 gib restore
@@ -298,9 +341,10 @@ gib backup \
 `gib watch` accepts the same backup configuration options as `gib backup`,
 including `--key`, `--storage`, `--password`, `--compress`, `--chunk-size`,
 `--root-path`, `--ignore`, and `--concurrency`. `--message` is optional and is
-included as context after the required `[WATCH]` prefix. `--parent` and
-`--continue` are rejected because the watcher automatically selects the latest
-completed backup for every snapshot.
+included as context after the required `[WATCH]` prefix. The optional
+`[watch].debounce_ms` setting controls the quiet period used to group file
+events. `--parent` and `--continue` are rejected because the watcher
+automatically selects the latest completed backup for every snapshot.
 
 ### Restore Options
 

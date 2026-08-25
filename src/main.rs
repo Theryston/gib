@@ -7,6 +7,7 @@ use crate::output::{
 use crate::utils::handle_error;
 
 mod commands;
+mod config;
 mod core;
 mod fs;
 mod output;
@@ -26,6 +27,21 @@ fn cli() -> Command {
                 .help("Output mode")
                 .default_value("interactive")
                 .value_parser(["interactive", "json"])
+                .global(true),
+        )
+        .arg(
+            Arg::new("config")
+                .long("config")
+                .value_name("PATH")
+                .help("Use a specific local gib.toml file")
+                .global(true),
+        )
+        .arg(
+            Arg::new("no-config")
+                .long("no-config")
+                .help("Disable local gib.toml discovery")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("config")
                 .global(true),
         )
         .subcommand(

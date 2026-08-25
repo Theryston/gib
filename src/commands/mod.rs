@@ -6,8 +6,8 @@ mod log;
 mod pending;
 mod restore;
 mod setup;
-mod whoami;
 mod watch;
+mod whoami;
 
 pub mod storage;
 
@@ -19,5 +19,5 @@ pub use log::log;
 pub use pending::pending;
 pub use restore::restore;
 pub use setup::setup;
-pub use whoami::whoami;
 pub use watch::watch;
+pub use whoami::whoami;

@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::unbounded_channel;
 
-const DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
 const MAX_EVENT_PATHS: usize = 8;
 const MAX_DISPLAY_PATHS: usize = 8;
 
@@ -73,6 +72,7 @@ struct WatchStartPayload {
     storage: String,
     key: String,
     recursive: bool,
+    debounce_ms: u64,
     ignore: Vec<String>,
 }
 
@@ -148,6 +148,7 @@ pub async fn watch(matches: &ArgMatches) {
                 storage: resolved.options.storage.clone(),
                 key: resolved.options.key.clone(),
                 recursive: true,
+                debounce_ms: resolved.watch_debounce_ms,
                 ignore: resolved.options.ignore_patterns.clone(),
             },
         );
@@ -181,6 +182,7 @@ pub async fn watch(matches: &ArgMatches) {
 async fn watch_loop(resolved: ResolvedBackup) -> Result<(), String> {
     let root = PathBuf::from(&resolved.options.root_path_string);
     let ignore_patterns = resolved.options.ignore_patterns.clone();
+    let debounce_window = Duration::from_millis(resolved.watch_debounce_ms);
     let (sender, mut receiver) = unbounded_channel::<notify::Result<Event>>();
 
     let mut watcher = RecommendedWatcher::new(
@@ -215,7 +217,7 @@ async fn watch_loop(resolved: ResolvedBackup) -> Result<(), String> {
         record_notify_result(first_event, &root, &ignore_patterns, &mut batch);
 
         loop {
-            let quiet_period = tokio::time::sleep(DEBOUNCE_WINDOW);
+            let quiet_period = tokio::time::sleep(debounce_window);
             tokio::pin!(quiet_period);
 
             tokio::select! {
