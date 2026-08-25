@@ -90,6 +90,27 @@ pub(crate) fn load_local_config(matches: &ArgMatches) -> Result<LocalConfigConte
     load_config_file(&config_path)
 }
 
+pub(crate) fn load_local_config_for_root(
+    root: &Path,
+    explicit_path: Option<&Path>,
+) -> Result<LocalConfigContext, String> {
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let config_path = explicit_path
+        .map(|path| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                root.join(path)
+            }
+        })
+        .or_else(|| discover_config(&root));
+
+    match config_path {
+        Some(path) => load_config_file(&path),
+        None => Ok(LocalConfigContext::without_config(root)),
+    }
+}
+
 pub(crate) fn discover_config(start_dir: &Path) -> Option<PathBuf> {
     let mut directory = start_dir.to_path_buf();
 

@@ -277,13 +277,45 @@ event. Provide `--storage` explicitly in JSON mode or configure
 `repository.storage`; live lifecycle, batches, synchronization, backup
 progress, completions, and recoverable errors are emitted as structured events.
 
-### 7. View backup history
+### 7. Start live automatically
+
+Use `autostart` to register one or more independent project directories as
+per-user background jobs. Each job starts `gib live` at user login, uses the
+same synchronization engine as the foreground command, and can be active on
+multiple devices at the same time:
+
+```bash
+gib autostart add \
+  --name work-project \
+  --root-path /path/to/work-project \
+  --storage mybackups \
+  --key work-project \
+  --conflict local \
+  --start-now
+```
+
+Manage jobs with `gib autostart list`, `status [NAME]`, `enable NAME`,
+`disable NAME`, `update NAME`, and `remove NAME --yes`. In JSON mode, `add`
+requires `--name`, `--root-path`, and `--conflict`; `remove` requires `--yes`.
+Autostart jobs are per-user: Linux uses a systemd user unit, macOS uses a
+LaunchAgent, and Windows uses a per-user Task Scheduler task. The generated
+artifact invokes the absolute GIB executable with
+`--mode json autostart run <job-id>` and never passes the repository password.
+
+Job definitions are stored under the platform's user data directory at
+`gib/autostart/jobs`, with bounded JSONL runtime logs in `logs`. Repository
+passwords are kept only in the operating system credential store (Secret
+Service, macOS Keychain, or Windows Credential Manager). Removing a job
+disables and removes only its registration, artifact, registry entry, and
+credential; project files, `gib.toml`, backups, and logs are left untouched.
+
+### 8. View backup history
 
 ```bash
 gib log
 ```
 
-### 8. Restore a backup
+### 9. Restore a backup
 
 ```bash
 gib restore
@@ -328,6 +360,7 @@ Don't just take our word for it — try it yourself and feel the speed differenc
 | `gib setup`          | Discover and configure local storages   |
 | `gib backup`         | Create a new backup                     |
 | `gib live`           | Keep files backed up and synchronize active devices |
+| `gib autostart`      | Manage per-user background live jobs   |
 | `gib backup delete`  | Delete a backup and its orphaned chunks |
 | `gib restore`        | Restore files from a backup             |
 | `gib log`            | View backup history (paginated)         |
@@ -369,6 +402,32 @@ synchronized base and repository HEAD automatically. The `--conflict` flag
 accepts `local` to keep the current files or `remote` to apply the repository
 files. It is optional in interactive mode, where each conflict can be selected
 individually, and required in JSON mode.
+
+### Autostart Options
+
+```bash
+gib autostart add \
+  --name work-project \
+  --root-path /path/to/project \
+  --config /path/to/gib.toml \
+  --storage cloud \
+  --key work-project \
+  --conflict remote \
+  --start-now
+
+gib autostart update work-project --conflict local
+gib autostart status work-project
+gib autostart disable work-project
+gib autostart enable work-project
+gib autostart remove work-project --yes
+```
+
+`add` and `update` accept the live backup options (`--message`, `--compress`,
+`--chunk-size`, `--ignore`, and `--concurrency`). A job's effective identity
+is its canonical root, storage, and repository key; two enabled jobs cannot
+register the same identity. The runner reloads the selected local config and
+revalidates the root and repository on every start, so configuration changes
+are picked up after the next login or restart.
 
 ### Restore Options
 

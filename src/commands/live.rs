@@ -25,13 +25,13 @@ const MAX_EVENT_PATHS: usize = 8;
 const MAX_DISPLAY_PATHS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConflictPolicy {
+pub(crate) enum ConflictPolicy {
     Local,
     Remote,
 }
 
 impl ConflictPolicy {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
             Self::Remote => "remote",
@@ -167,20 +167,51 @@ struct LiveStopPayload {
     event: &'static str,
 }
 
-fn resolve_conflict_policy(matches: &ArgMatches) -> Result<Option<ConflictPolicy>, String> {
-    match matches.get_one::<String>("conflict").map(String::as_str) {
-        Some("local") => Ok(Some(ConflictPolicy::Local)),
-        Some("remote") => Ok(Some(ConflictPolicy::Remote)),
-        Some(value) => Err(format!(
+pub(crate) fn conflict_policy_from_name(value: &str) -> Result<ConflictPolicy, String> {
+    match value {
+        "local" => Ok(ConflictPolicy::Local),
+        "remote" => Ok(ConflictPolicy::Remote),
+        _ => Err(format!(
             "Unsupported conflict policy '{}'; use 'local' or 'remote'",
             value
         )),
+    }
+}
+
+fn resolve_conflict_policy(matches: &ArgMatches) -> Result<Option<ConflictPolicy>, String> {
+    match matches.get_one::<String>("conflict").map(String::as_str) {
+        Some(value) => conflict_policy_from_name(value).map(Some),
         None if is_json_mode() => Err(
             "The --conflict flag is required when --mode json is used with gib live; choose 'local' or 'remote'"
                 .to_string(),
         ),
         None => Ok(None),
     }
+}
+
+pub(crate) fn emit_live_start(resolved: &ResolvedBackup, policy: ConflictPolicy) {
+    let root = PathBuf::from(&resolved.options.root_path_string);
+    emit_named_event(
+        "live",
+        &LiveStartPayload {
+            event: "start",
+            root: root.to_string_lossy().to_string(),
+            storage: resolved.options.storage.clone(),
+            key: resolved.options.key.clone(),
+            conflict: policy.as_str(),
+            recursive: true,
+            debounce_ms: resolved.live_debounce_ms,
+            poll_ms: resolved.live_poll_ms,
+            ignore: resolved.options.ignore_patterns.clone(),
+        },
+    );
+}
+
+pub(crate) async fn run_live(
+    resolved: ResolvedBackup,
+    conflict_policy: ConflictPolicy,
+) -> Result<(), String> {
+    live_loop(resolved, Some(conflict_policy)).await
 }
 
 pub async fn live(matches: &ArgMatches) {
@@ -205,20 +236,9 @@ pub async fn live(matches: &ArgMatches) {
     }
 
     if is_json_mode() {
-        emit_named_event(
-            "live",
-            &LiveStartPayload {
-                event: "start",
-                root: root.to_string_lossy().to_string(),
-                storage: resolved.options.storage.clone(),
-                key: resolved.options.key.clone(),
-                conflict: conflict_policy.map_or("prompt", ConflictPolicy::as_str),
-                recursive: true,
-                debounce_ms: resolved.live_debounce_ms,
-                poll_ms: resolved.live_poll_ms,
-                ignore: resolved.options.ignore_patterns.clone(),
-            },
-        );
+        if let Some(policy) = conflict_policy {
+            emit_live_start(&resolved, policy);
+        }
     } else {
         println!("{}", style("GIB live started").cyan().bold());
         println!("{} {}", style("Root").bold(), root.to_string_lossy());
@@ -246,7 +266,10 @@ pub async fn live(matches: &ArgMatches) {
         );
     }
 
-    if let Err(error) = live_loop(resolved, conflict_policy).await {
+    if let Err(error) = match conflict_policy {
+        Some(policy) => run_live(resolved, policy).await,
+        None => live_loop(resolved, None).await,
+    } {
         handle_error(error, None);
     }
 }

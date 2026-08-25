@@ -6,6 +6,7 @@ use crate::output::{
 };
 use crate::utils::handle_error;
 
+mod autostart;
 mod commands;
 mod config;
 mod core;
@@ -217,6 +218,163 @@ fn cli() -> Command {
                 ),
         )
         .subcommand(
+            Command::new("autostart")
+                .about("Manage per-user jobs that keep directories synchronized with gib live")
+                .subcommand(
+                    Command::new("add")
+                        .about("Register a directory as a per-user live job")
+                        .arg(
+                            Arg::new("name")
+                                .long("name")
+                                .value_name("NAME")
+                                .help("Stable human-readable job name")
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("root-path")
+                                .short('r')
+                                .long("root-path")
+                                .value_name("ROOT_PATH")
+                                .help("Directory to keep backed up and synchronized")
+                                .required(false),
+                        )
+                        .arg(arg!(-k --key <KEY> "Repository key override").required(false))
+                        .arg(arg!(-s --storage <STORAGE> "Storage name override").required(false))
+                        .arg(arg!(-p --password <PASSWORD> "Repository password (stored in the user credential store)").required(false))
+                        .arg(arg!(-m --message <MESSAGE> "Automatic live backup message").required(false))
+                        .arg(arg!(-c --compress <COMPRESS> "Compression level").required(false))
+                        .arg(
+                            Arg::new("chunk-size")
+                                .short('z')
+                                .long("chunk-size")
+                                .value_name("CHUNK_SIZE")
+                                .help("Chunk size")
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("ignore")
+                                .short('i')
+                                .long("ignore")
+                                .value_name("IGNORE")
+                                .help("File or folder name to ignore (repeatable)")
+                                .action(clap::ArgAction::Append)
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("concurrency")
+                                .long("concurrency")
+                                .value_name("CONCURRENCY")
+                                .help("Maximum concurrent file operations")
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("conflict")
+                                .long("conflict")
+                                .value_name("POLICY")
+                                .value_parser(["local", "remote"])
+                                .help("Conflict policy used by the background live process")
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("start-now")
+                                .long("start-now")
+                                .help("Start the job immediately after registering it")
+                                .action(clap::ArgAction::SetTrue)
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("replace")
+                                .long("replace")
+                                .help("Replace an existing job with the same name")
+                                .action(clap::ArgAction::SetTrue)
+                                .required(false),
+                        ),
+                )
+                .subcommand(
+                    Command::new("update")
+                        .about("Update a registered live job")
+                        .arg(Arg::new("name").value_name("NAME").required(true))
+                        .arg(
+                            Arg::new("root-path")
+                                .short('r')
+                                .long("root-path")
+                                .value_name("ROOT_PATH")
+                                .help("New directory to keep synchronized")
+                                .required(false),
+                        )
+                        .arg(Arg::new("key").short('k').long("key").value_name("KEY").required(false))
+                        .arg(Arg::new("storage").short('s').long("storage").value_name("STORAGE").required(false))
+                        .arg(Arg::new("password").short('p').long("password").value_name("PASSWORD").required(false))
+                        .arg(Arg::new("message").short('m').long("message").value_name("MESSAGE").required(false))
+                        .arg(Arg::new("compress").short('c').long("compress").value_name("COMPRESS").required(false))
+                        .arg(
+                            Arg::new("chunk-size")
+                                .short('z')
+                                .long("chunk-size")
+                                .value_name("CHUNK_SIZE")
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("ignore")
+                                .short('i')
+                                .long("ignore")
+                                .value_name("IGNORE")
+                                .action(clap::ArgAction::Append)
+                                .required(false),
+                        )
+                        .arg(Arg::new("concurrency").long("concurrency").value_name("CONCURRENCY").required(false))
+                        .arg(
+                            Arg::new("conflict")
+                                .long("conflict")
+                                .value_name("POLICY")
+                                .value_parser(["local", "remote"])
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("start-now")
+                                .long("start-now")
+                                .help("Enable and start the job immediately")
+                                .action(clap::ArgAction::SetTrue)
+                                .required(false),
+                        ),
+                )
+                .subcommand(Command::new("list").about("List registered live jobs"))
+                .subcommand(
+                    Command::new("status")
+                        .about("Show live job and platform status")
+                        .arg(Arg::new("name").value_name("NAME").required(false)),
+                )
+                .subcommand(
+                    Command::new("enable")
+                        .about("Enable a live job")
+                        .arg(Arg::new("name").value_name("NAME").required(true)),
+                )
+                .subcommand(
+                    Command::new("disable")
+                        .about("Disable a live job")
+                        .arg(Arg::new("name").value_name("NAME").required(true)),
+                )
+                .subcommand(
+                    Command::new("remove")
+                        .about("Remove a live job registration")
+                        .arg(Arg::new("name").value_name("NAME").required(true))
+                        .arg(
+                            Arg::new("yes")
+                                .short('y')
+                                .long("yes")
+                                .help("Confirm removal without an interactive prompt")
+                                .action(clap::ArgAction::SetTrue)
+                                .required(false),
+                        ),
+                )
+                .subcommand(
+                    Command::new("run")
+                        .about("Run one registered live job")
+                        .hide(true)
+                        .arg(Arg::new("job-id").value_name("JOB_ID").required(true)),
+                ),
+        )
+        .subcommand(
             Command::new("restore")
                 .about("Restore files from a backup")
                 .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
@@ -344,6 +502,7 @@ async fn main() {
         Some(("whoami", _)) => commands::whoami(),
         Some(("setup", matches)) => commands::setup(matches),
         Some(("live", matches)) => commands::live(matches).await,
+        Some(("autostart", matches)) => commands::autostart(matches).await,
         Some(("encrypt", matches)) => commands::encrypt(matches).await,
         Some(("log", matches)) => commands::log(matches).await,
         Some(("backup", matches)) => match matches.subcommand() {

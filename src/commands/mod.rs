@@ -1,8 +1,9 @@
-mod backup;
+mod autostart;
+pub(crate) mod backup;
 mod config;
 mod delete;
 mod encrypt;
-mod live;
+pub(crate) mod live;
 mod log;
 mod pending;
 mod restore;
@@ -11,6 +12,7 @@ mod whoami;
 
 pub mod storage;
 
+pub use autostart::autostart;
 pub use backup::backup;
 pub use config::config;
 pub use delete::delete;

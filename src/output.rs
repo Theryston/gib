@@ -1,4 +1,7 @@
 use serde::Serialize;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,6 +15,31 @@ pub enum OutputMode {
 impl OutputMode {}
 
 static OUTPUT_MODE: OnceLock<OutputMode> = OnceLock::new();
+static JSON_LOG_SINK: OnceLock<Mutex<Option<JsonLogSink>>> = OnceLock::new();
+
+const MAX_JSON_LOG_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_JSON_LOG_ROTATIONS: usize = 3;
+
+struct JsonLogSink {
+    path: PathBuf,
+}
+
+pub fn configure_json_log(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "JSON log path has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("Failed to create JSON log directory: {}", error))?;
+
+    let sink = JSON_LOG_SINK.get_or_init(|| Mutex::new(None));
+    let mut guard = sink
+        .lock()
+        .map_err(|_| "JSON log sink lock is poisoned".to_string())?;
+    *guard = Some(JsonLogSink {
+        path: path.to_path_buf(),
+    });
+    Ok(())
+}
 
 pub fn detect_mode_from_args(args: &[String]) -> OutputMode {
     let mut iter = args.iter().skip(1);
@@ -109,11 +137,68 @@ fn emit_event<T: Serialize>(kind: &'static str, data: &T, to_stderr: bool) {
             .unwrap_or_else(|_| "{\"type\":\"error\",\"data\":{\"message\":\"serialization_error\",\"code\":\"serialization_error\"}}".to_string())
     });
 
+    append_json_log(&json);
+
     if to_stderr {
         eprintln!("{json}");
     } else {
         println!("{json}");
     }
+}
+
+fn append_json_log(json: &str) {
+    let Some(sink) = JSON_LOG_SINK.get() else {
+        return;
+    };
+    let Ok(guard) = sink.lock() else {
+        return;
+    };
+    let Some(sink) = guard.as_ref() else {
+        return;
+    };
+
+    rotate_json_log_if_needed(&sink.path, json.len() as u64 + 1);
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&sink.path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{}", json);
+}
+
+fn rotate_json_log_if_needed(path: &Path, incoming_bytes: u64) {
+    let current_size = std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if current_size.saturating_add(incoming_bytes) <= MAX_JSON_LOG_BYTES {
+        return;
+    }
+
+    for index in (1..=MAX_JSON_LOG_ROTATIONS).rev() {
+        let destination = rotated_json_log_path(path, index);
+        let source = if index == 1 {
+            path.to_path_buf()
+        } else {
+            rotated_json_log_path(path, index - 1)
+        };
+
+        if destination.exists() {
+            let _ = std::fs::remove_file(&destination);
+        }
+        if source.exists() {
+            let _ = std::fs::rename(source, destination);
+        }
+    }
+}
+
+fn rotated_json_log_path(path: &Path, index: usize) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "gib.jsonl".to_string());
+    path.with_file_name(format!("{}.{}", file_name, index))
 }
 
 pub fn emit_output<T: Serialize>(data: &T) {

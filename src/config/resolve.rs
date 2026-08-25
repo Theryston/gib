@@ -42,6 +42,15 @@ pub(crate) fn load_and_report_local_config(
     Ok(context)
 }
 
+pub(crate) fn load_and_report_local_config_for_root(
+    root: &Path,
+    explicit_path: Option<&Path>,
+) -> Result<LocalConfigContext, String> {
+    let context = super::local::load_local_config_for_root(root, explicit_path)?;
+    report_local_config(&context);
+    Ok(context)
+}
+
 pub(crate) fn report_local_config(context: &LocalConfigContext) {
     if is_json_mode() {
         emit_named_event(
@@ -74,15 +83,31 @@ pub(crate) fn resolve_repository(
         .map(ToString::to_string)
         .or_else(|| get_password(password_policy.required, password_policy.readonly));
 
+    resolve_repository_values(
+        matches.get_one::<String>("key").map(ToString::to_string),
+        matches
+            .get_one::<String>("storage")
+            .map(ToString::to_string),
+        password,
+        context,
+        default_key,
+    )
+}
+
+pub(crate) fn resolve_repository_values(
+    key_override: Option<String>,
+    storage_override: Option<String>,
+    password: Option<String>,
+    context: &LocalConfigContext,
+    default_key: Option<String>,
+) -> Result<RepositoryOptions, String> {
     let default_key = default_key.unwrap_or_else(|| {
         Path::new(&get_pwd_string())
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| "repository".to_string())
     });
-    let key = matches
-        .get_one::<String>("key")
-        .map(ToString::to_string)
+    let key = key_override
         .or_else(|| context.config.repository.key.clone())
         .unwrap_or(default_key);
 
@@ -92,11 +117,7 @@ pub(crate) fn resolve_repository(
         .join("storages");
     let storage_names = list_storage_names(&storage_dir)?;
 
-    let storage = match matches
-        .get_one::<String>("storage")
-        .map(ToString::to_string)
-        .or_else(|| context.config.repository.storage.clone())
-    {
+    let storage = match storage_override.or_else(|| context.config.repository.storage.clone()) {
         Some(storage) => storage,
         None => {
             if is_json_mode() {

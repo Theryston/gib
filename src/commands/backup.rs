@@ -1,7 +1,7 @@
 use crate::commands::config::Config;
 use crate::config::{
-    PasswordPolicy, load_and_report_local_config, merge_ignore_patterns, resolve_path,
-    resolve_repository,
+    PasswordPolicy, load_and_report_local_config, load_and_report_local_config_for_root,
+    merge_ignore_patterns, resolve_path, resolve_repository, resolve_repository_values,
 };
 use crate::core::crypto::read_file_maybe_decrypt;
 use crate::core::crypto::write_file_maybe_encrypt;
@@ -27,7 +27,7 @@ use parse_size::parse_size;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -57,6 +57,20 @@ pub(crate) struct ResolvedBackup {
     pub(crate) pending_backup: Option<PendingBackupMatch>,
     pub(crate) live_debounce_ms: u64,
     pub(crate) live_poll_ms: u64,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct LiveOverrides {
+    pub(crate) root_path: PathBuf,
+    pub(crate) config_path: Option<PathBuf>,
+    pub(crate) key: Option<String>,
+    pub(crate) storage: Option<String>,
+    pub(crate) message: Option<String>,
+    pub(crate) compress: Option<i32>,
+    pub(crate) chunk_size: Option<String>,
+    pub(crate) ignore: Option<Vec<String>>,
+    pub(crate) concurrency: Option<usize>,
+    pub(crate) password: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1175,6 +1189,100 @@ pub(crate) async fn resolve_backup(
         message,
         parent_hash,
         pending_backup,
+        live_debounce_ms: local_config.config.live.debounce_ms.unwrap_or(300),
+        live_poll_ms: local_config.config.live.poll_ms.unwrap_or(2_000),
+    })
+}
+
+pub(crate) async fn resolve_live_overrides(
+    overrides: LiveOverrides,
+) -> Result<ResolvedBackup, String> {
+    if !overrides.root_path.is_dir() {
+        return Err(format!(
+            "Live root '{}' is not an existing directory",
+            overrides.root_path.display()
+        ));
+    }
+
+    let root =
+        std::fs::canonicalize(&overrides.root_path).unwrap_or_else(|_| overrides.root_path.clone());
+    let local_config =
+        load_and_report_local_config_for_root(&root, overrides.config_path.as_deref())?;
+    let default_key = root
+        .file_name()
+        .ok_or_else(|| "The live root path must have a valid directory name".to_string())?
+        .to_string_lossy()
+        .to_string();
+
+    let repository = resolve_repository_values(
+        overrides.key,
+        overrides.storage,
+        overrides.password,
+        &local_config,
+        Some(default_key),
+    )?;
+    let crate::config::RepositoryOptions {
+        key,
+        storage,
+        password,
+        fs,
+    } = repository;
+
+    let home_dir = dirs::home_dir().ok_or_else(|| "Failed to get home directory".to_string())?;
+    let config = load_config(&home_dir.join(".gib").join("config.msgpack"))?;
+
+    let message = overrides
+        .message
+        .or_else(|| local_config.config.live.message.clone())
+        .or_else(|| local_config.config.backup.message.clone())
+        .unwrap_or_default();
+
+    let compress = overrides
+        .compress
+        .or(local_config.config.backup.compress)
+        .unwrap_or(3);
+    if !(1..=22).contains(&compress) {
+        return Err("The compression level must be between 1 and 22".to_string());
+    }
+
+    let chunk_size = match overrides
+        .chunk_size
+        .or_else(|| local_config.config.backup.chunk_size.clone())
+    {
+        Some(value) => parse_size(&value).map_err(|_| format!("Invalid chunk size '{}'", value))?,
+        None => parse_size("5 MB").expect("default chunk size is valid"),
+    };
+    if chunk_size == 0 {
+        return Err("The chunk size must be greater than zero".to_string());
+    }
+
+    let ignore_patterns = overrides
+        .ignore
+        .unwrap_or_else(|| merge_ignore_patterns(&local_config.config.backup.ignore, &[]));
+    let concurrency = overrides
+        .concurrency
+        .or(local_config.config.backup.concurrency)
+        .unwrap_or(num_cpus::get() * 2);
+    if concurrency == 0 {
+        return Err("Concurrency must be greater than zero".to_string());
+    }
+
+    Ok(ResolvedBackup {
+        options: BackupOptions {
+            key,
+            root_path_string: root.to_string_lossy().to_string(),
+            storage,
+            fs,
+            author: config.author,
+            compress,
+            password,
+            chunk_size,
+            ignore_patterns,
+            concurrency,
+        },
+        message,
+        parent_hash: None,
+        pending_backup: None,
         live_debounce_ms: local_config.config.live.debounce_ms.unwrap_or(300),
         live_poll_ms: local_config.config.live.poll_ms.unwrap_or(2_000),
     })

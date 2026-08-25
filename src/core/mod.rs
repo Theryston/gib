@@ -5,3 +5,4 @@ pub mod metadata;
 pub mod only;
 pub mod permissions;
 pub(crate) mod reconcile;
+pub(crate) mod secrets;
