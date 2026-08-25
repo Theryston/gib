@@ -50,7 +50,7 @@ async fn add(matches: &ArgMatches) -> Result<(), String> {
     validate_name(&name)?;
     let config_path = config_path(matches, &root, None)?;
     let password = password_for_add(matches)?;
-    let overrides = live_overrides(matches, None)?;
+    let mut overrides = live_overrides(matches, None)?;
     let resolved = resolve_live_overrides(LiveOverrides {
         root_path: root.clone(),
         config_path: config_path.clone(),
@@ -64,6 +64,7 @@ async fn add(matches: &ArgMatches) -> Result<(), String> {
         password: password.clone(),
     })
     .await?;
+    persist_effective_repository_values(&mut overrides, &resolved);
 
     let paths = registry_paths()?;
     ensure_registry(&paths)?;
@@ -155,6 +156,7 @@ async fn update(matches: &ArgMatches) -> Result<(), String> {
         password: password.clone(),
     })
     .await?;
+    persist_effective_repository_values(&mut overrides, &resolved);
 
     let start_now = previous.enabled || matches.get_flag("start-now");
     let enabled = start_now;
@@ -562,6 +564,14 @@ fn identity_from_resolved(
         resolved.options.storage.clone(),
         resolved.options.key.clone(),
     )
+}
+
+fn persist_effective_repository_values(
+    overrides: &mut LiveJobOverrides,
+    resolved: &crate::commands::backup::ResolvedBackup,
+) {
+    overrides.storage = Some(resolved.options.storage.clone());
+    overrides.key = Some(resolved.options.key.clone());
 }
 
 fn identity_from_job(job: &AutostartJob) -> Result<(String, String, String), String> {

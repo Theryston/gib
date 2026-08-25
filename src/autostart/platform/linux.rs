@@ -19,18 +19,27 @@ fn unit_path(job: &AutostartJob) -> Result<PathBuf, String> {
 }
 
 fn systemd_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('%', "%%")
-        .replace('\n', "\\n")
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            ' ' => escaped.push_str("\\x20"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '"' => escaped.push_str("\\\""),
+            '%' => escaped.push_str("%%"),
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 pub(crate) fn render_systemd_unit(job: &AutostartJob, executable: &Path) -> String {
     let executable = systemd_escape(&executable.to_string_lossy());
     let root = systemd_escape(&job.root_path);
     format!(
-        "[Unit]\nDescription=GIB Live job {}\n\n[Service]\nType=simple\nWorkingDirectory=\"{}\"\nExecStart=\"{}\" --mode json autostart run {}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=GIB Live job {}\n\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={} --mode json autostart run {}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
         job.id, root, executable, job.id
     )
 }
@@ -44,7 +53,7 @@ fn run_systemctl(args: &[&str]) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "systemctl --user {} failed: {}",
+            "systemctl {} failed: {}",
             args.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         ))
@@ -128,6 +137,7 @@ mod tests {
         };
         let unit = render_systemd_unit(&job, Path::new("/usr/local/bin/gib"));
         assert!(unit.contains("WantedBy=default.target"));
+        assert!(unit.contains("WorkingDirectory=/tmp/project\\x20with\\x20spaces"));
         assert!(unit.contains("--mode json autostart run job-1"));
         assert!(!unit.contains("sh -c"));
     }
