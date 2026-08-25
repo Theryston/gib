@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.23](https://github.com/Theryston/gib/compare/v0.0.22...v0.0.23) - 2026-08-25
+
+### Added
+
+- add conflict resolution policy flag to live command
+
 ## [0.0.22](https://github.com/Theryston/gib/compare/v0.0.21...v0.0.22) - 2026-08-25
 
 ### Added
