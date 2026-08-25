@@ -270,11 +270,12 @@ created, changed, and deleted files, for example `[LIVE] created: 12 files;
 changed: 3 files`.
 
 Press `Ctrl+C` to stop live synchronization. In interactive mode, conflicts
-offer `Keep local` and `Use remote`; in JSON mode they are emitted as `live`
-conflict events and never trigger a prompt. Provide `--storage` explicitly in
-JSON mode or configure `repository.storage`; live lifecycle, batches,
-synchronization, backup progress, completions, and recoverable errors are
-emitted as structured events.
+offer `Keep local` and `Use remote`; in JSON mode, pass the required
+`--conflict local` or `--conflict remote` flag so conflicts are resolved without
+a prompt. JSON output includes the selected resolution in the `live` conflict
+event. Provide `--storage` explicitly in JSON mode or configure
+`repository.storage`; live lifecycle, batches, synchronization, backup
+progress, completions, and recoverable errors are emitted as structured events.
 
 ### 7. View backup history
 
@@ -364,7 +365,10 @@ included as context after the required `[LIVE]` prefix. The optional
 `[live].debounce_ms` setting controls the quiet period used to group file
 events, while `[live].poll_ms` controls remote HEAD polling (default: 2
 seconds). `--parent` and `--continue` are rejected because live manages its
-synchronized base and repository HEAD automatically.
+synchronized base and repository HEAD automatically. The `--conflict` flag
+accepts `local` to keep the current files or `remote` to apply the repository
+files. It is optional in interactive mode, where each conflict can be selected
+individually, and required in JSON mode.
 
 ### Restore Options
 

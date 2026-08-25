@@ -159,6 +159,14 @@ fn cli() -> Command {
                 .arg(arg!(-m --message <MESSAGE> "Optional context included in automatic backup messages").required(false))
                 .arg(arg!(-s --storage <STORAGE> "The storage to use for the backup").required(false))
                 .arg(arg!(-p --password <PASSWORD> "The password to use for the backup").required(false))
+                .arg(
+                    Arg::new("conflict")
+                        .long("conflict")
+                        .value_name("POLICY")
+                        .value_parser(["local", "remote"])
+                        .help("Conflict resolution policy: keep local changes or use remote changes (required in JSON mode)")
+                        .required_if_eq("mode", "json"),
+                )
                 .arg(arg!(-c --compress <COMPRESS> "The compression level to use for the backup").required(false))
                 .arg(
                     Arg::new("chunk-size")

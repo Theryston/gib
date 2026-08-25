@@ -25,6 +25,21 @@ const MAX_EVENT_PATHS: usize = 8;
 const MAX_DISPLAY_PATHS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConflictPolicy {
+    Local,
+    Remote,
+}
+
+impl ConflictPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChangeKind {
     Created,
     Changed,
@@ -78,6 +93,7 @@ struct LiveStartPayload {
     root: String,
     storage: String,
     key: String,
+    conflict: &'static str,
     recursive: bool,
     debounce_ms: u64,
     poll_ms: u64,
@@ -136,6 +152,7 @@ struct LiveConflictPayload {
     event: &'static str,
     conflicts: Vec<LiveConflictItem>,
     recoverable: bool,
+    resolution: &'static str,
 }
 
 #[derive(Serialize)]
@@ -150,7 +167,27 @@ struct LiveStopPayload {
     event: &'static str,
 }
 
+fn resolve_conflict_policy(matches: &ArgMatches) -> Result<Option<ConflictPolicy>, String> {
+    match matches.get_one::<String>("conflict").map(String::as_str) {
+        Some("local") => Ok(Some(ConflictPolicy::Local)),
+        Some("remote") => Ok(Some(ConflictPolicy::Remote)),
+        Some(value) => Err(format!(
+            "Unsupported conflict policy '{}'; use 'local' or 'remote'",
+            value
+        )),
+        None if is_json_mode() => Err(
+            "The --conflict flag is required when --mode json is used with gib live; choose 'local' or 'remote'"
+                .to_string(),
+        ),
+        None => Ok(None),
+    }
+}
+
 pub async fn live(matches: &ArgMatches) {
+    let conflict_policy = match resolve_conflict_policy(matches) {
+        Ok(policy) => policy,
+        Err(error) => handle_error(error, None),
+    };
     let resolved = match resolve_backup(matches, BackupMode::Live).await {
         Ok(resolved) => resolved,
         Err(error) => handle_error(error, None),
@@ -175,6 +212,7 @@ pub async fn live(matches: &ArgMatches) {
                 root: root.to_string_lossy().to_string(),
                 storage: resolved.options.storage.clone(),
                 key: resolved.options.key.clone(),
+                conflict: conflict_policy.map_or("prompt", ConflictPolicy::as_str),
                 recursive: true,
                 debounce_ms: resolved.live_debounce_ms,
                 poll_ms: resolved.live_poll_ms,
@@ -208,12 +246,15 @@ pub async fn live(matches: &ArgMatches) {
         );
     }
 
-    if let Err(error) = live_loop(resolved).await {
+    if let Err(error) = live_loop(resolved, conflict_policy).await {
         handle_error(error, None);
     }
 }
 
-async fn live_loop(resolved: ResolvedBackup) -> Result<(), String> {
+async fn live_loop(
+    resolved: ResolvedBackup,
+    conflict_policy: Option<ConflictPolicy>,
+) -> Result<(), String> {
     let root = PathBuf::from(&resolved.options.root_path_string);
     let ignore_patterns = resolved.options.ignore_patterns.clone();
     let debounce_window = Duration::from_millis(resolved.live_debounce_ms);
@@ -223,7 +264,14 @@ async fn live_loop(resolved: ResolvedBackup) -> Result<(), String> {
     } else {
         "[LIVE] resumed synchronization"
     };
-    match synchronize_live(&resolved, &mut state, Some(startup_message.to_string())).await {
+    match synchronize_live(
+        &resolved,
+        &mut state,
+        Some(startup_message.to_string()),
+        conflict_policy,
+    )
+    .await
+    {
         Ok(outcome) => emit_sync_outcome(outcome),
         Err(error) => emit_live_error(format!("Initial synchronization failed: {}", error), true),
     }
@@ -255,7 +303,7 @@ async fn live_loop(resolved: ResolvedBackup) -> Result<(), String> {
                 Some(event)
             }
             _ = poll_interval.tick() => {
-                process_remote_sync(&resolved, &mut state).await;
+                process_remote_sync(&resolved, &mut state, conflict_policy).await;
                 None
             }
             _ = &mut ctrl_c => {
@@ -294,7 +342,7 @@ async fn live_loop(resolved: ResolvedBackup) -> Result<(), String> {
             continue;
         }
 
-        process_batch(&resolved, &batch, &mut state).await;
+        process_batch(&resolved, &batch, &mut state, conflict_policy).await;
     }
 }
 
@@ -361,18 +409,27 @@ fn record_notify_result(
     }
 }
 
-async fn process_remote_sync(resolved: &ResolvedBackup, state: &mut LiveState) {
-    match synchronize_live(resolved, state, None).await {
+async fn process_remote_sync(
+    resolved: &ResolvedBackup,
+    state: &mut LiveState,
+    conflict_policy: Option<ConflictPolicy>,
+) {
+    match synchronize_live(resolved, state, None, conflict_policy).await {
         Ok(outcome) => emit_sync_outcome(outcome),
         Err(error) => emit_live_error(format!("Synchronization failed: {}", error), true),
     }
 }
 
-async fn process_batch(resolved: &ResolvedBackup, batch: &ChangeBatch, state: &mut LiveState) {
+async fn process_batch(
+    resolved: &ResolvedBackup,
+    batch: &ChangeBatch,
+    state: &mut LiveState,
+    conflict_policy: Option<ConflictPolicy>,
+) {
     let message = build_live_message(&resolved.message, batch);
     emit_live_batch(batch, &message);
 
-    match synchronize_live(resolved, state, Some(message)).await {
+    match synchronize_live(resolved, state, Some(message), conflict_policy).await {
         Ok(outcome) => emit_sync_outcome(outcome),
         Err(error) => emit_live_error(format!("Backup failed: {}", error), true),
     }
@@ -389,6 +446,7 @@ async fn synchronize_live(
     resolved: &ResolvedBackup,
     state: &mut LiveState,
     message: Option<String>,
+    conflict_policy: Option<ConflictPolicy>,
 ) -> Result<SyncOutcome, String> {
     let root = PathBuf::from(&resolved.options.root_path_string);
 
@@ -451,9 +509,8 @@ async fn synchronize_live(
             outcome.merged_text = reconciliation.merged_text;
 
             if !reconciliation.conflicts.is_empty() {
-                if is_json_mode() {
-                    emit_live_conflicts(&reconciliation.conflicts);
-                    return Ok(outcome);
+                if let Some(policy) = conflict_policy.filter(|_| is_json_mode()) {
+                    emit_live_conflicts(&reconciliation.conflicts, policy);
                 }
                 resolve_interactive_conflicts(
                     &root,
@@ -461,6 +518,7 @@ async fn synchronize_live(
                     Arc::clone(&resolved.options.fs),
                     &resolved.options.key,
                     resolved.options.password.as_deref(),
+                    conflict_policy,
                 )
                 .await?;
             }
@@ -542,20 +600,28 @@ async fn resolve_interactive_conflicts(
     fs: Arc<dyn crate::fs::FS>,
     key: &str,
     password: Option<&str>,
+    conflict_policy: Option<ConflictPolicy>,
 ) -> Result<(), String> {
     for conflict in conflicts {
-        let choices = ["Keep local", "Use remote"];
-        let selection = Select::new()
-            .with_prompt(format!(
-                "Conflict in '{}' ({})",
-                conflict.path, conflict.reason
-            ))
-            .items(choices)
-            .default(0)
-            .interact()
-            .map_err(|error| format!("Failed to resolve conflict: {}", error))?;
+        let use_remote = match conflict_policy {
+            Some(ConflictPolicy::Local) => false,
+            Some(ConflictPolicy::Remote) => true,
+            None => {
+                let choices = ["Keep local", "Use remote"];
+                let selection = Select::new()
+                    .with_prompt(format!(
+                        "Conflict in '{}' ({})",
+                        conflict.path, conflict.reason
+                    ))
+                    .items(choices)
+                    .default(0)
+                    .interact()
+                    .map_err(|error| format!("Failed to resolve conflict: {}", error))?;
+                selection == 1
+            }
+        };
 
-        if selection == 1 {
+        if use_remote {
             apply_remote_change(
                 root,
                 &conflict.path,
@@ -670,7 +736,7 @@ fn emit_sync_outcome(outcome: SyncOutcome) {
     }
 }
 
-fn emit_live_conflicts(conflicts: &[ReconcileConflict]) {
+fn emit_live_conflicts(conflicts: &[ReconcileConflict], policy: ConflictPolicy) {
     if is_json_mode() {
         emit_named_event(
             "live",
@@ -684,6 +750,7 @@ fn emit_live_conflicts(conflicts: &[ReconcileConflict]) {
                     })
                     .collect(),
                 recoverable: true,
+                resolution: policy.as_str(),
             },
         );
     }
@@ -915,6 +982,7 @@ mod tests {
             &resolved_one,
             &mut state_one,
             Some("[LIVE] changed".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -926,11 +994,17 @@ mod tests {
             .hash
             .clone();
 
-        let second_sync = synchronize_live(&resolved_two, &mut state_two, None)
-            .await
-            .unwrap();
+        std::fs::write(source_two.join("shared.txt"), b"base\nfrom two\n").unwrap();
+        let second_sync = synchronize_live(
+            &resolved_two,
+            &mut state_two,
+            None,
+            Some(ConflictPolicy::Remote),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(second_sync.applied_remote, 1);
+        assert_eq!(second_sync.applied_remote, 0);
         assert_eq!(
             std::fs::read_to_string(source_two.join("shared.txt")).unwrap(),
             "base\nfrom one\n"
@@ -938,6 +1012,43 @@ mod tests {
         assert_eq!(
             state_two.base_backup.as_deref(),
             Some(published_hash.as_str())
+        );
+
+        std::fs::write(source_one.join("shared.txt"), b"base\nfrom upstream\n").unwrap();
+        let second_remote_sync = synchronize_live(
+            &resolved_one,
+            &mut state_one,
+            Some("[LIVE] upstream change".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        let second_published_hash = second_remote_sync
+            .backup
+            .as_ref()
+            .expect("machine one should publish the second backup")
+            .backup
+            .hash
+            .clone();
+
+        std::fs::write(source_two.join("shared.txt"), b"base\nfrom local\n").unwrap();
+        let local_sync = synchronize_live(
+            &resolved_two,
+            &mut state_two,
+            None,
+            Some(ConflictPolicy::Local),
+        )
+        .await
+        .unwrap();
+
+        assert!(local_sync.backup.is_some());
+        assert_eq!(
+            std::fs::read_to_string(source_two.join("shared.txt")).unwrap(),
+            "base\nfrom local\n"
+        );
+        assert_ne!(
+            state_two.base_backup.as_deref(),
+            Some(second_published_hash.as_str())
         );
 
         let options_three = BackupOptions {
@@ -960,12 +1071,13 @@ mod tests {
             &resolved_three,
             &mut state_three,
             Some("[LIVE] initial synchronization".to_string()),
+            None,
         )
         .await
         .unwrap();
         assert_eq!(
             std::fs::read_to_string(source_three.join("shared.txt")).unwrap(),
-            "base\nfrom one\n"
+            "base\nfrom local\n"
         );
 
         let _ = std::fs::remove_dir_all(fixture);
