@@ -42,11 +42,11 @@ fn cli() -> Command {
         )
         .subcommand(
             Command::new("setup")
-                .about("Discover local GIB repositories and configure them as storages")
+                .about("Discover local GIB storages and configure them")
                 .arg(
                     Arg::new("no-recursive")
                         .long("no-recursive")
-                        .help("Only inspect direct child directories")
+                        .help("Only inspect storage directories directly below the current directory")
                         .action(clap::ArgAction::SetTrue)
                         .required(false),
                 ),

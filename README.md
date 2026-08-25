@@ -37,21 +37,28 @@ That's it! Run `gib --help` to get started.
 
 ### 🔄 Versioned Backups
 
-Every backup creates a unique snapshot with its own hash. Travel back in time to any point — restore exactly what you need, when you need it.
+Every backup creates a unique snapshot with its own hash. Travel back in time to
+any point — restore exactly what you need, when you need it.
 
 ### 🎯 Selective Restore (Only What You Need)
 
-Need a single file from a huge backup? Use `--only` to restore specific paths — either by passing a path directly or using the interactive selector to pick files and folders. Fast, precise, and no extra noise.
+Need a single file from a huge backup? Use `--only` to restore specific paths —
+either by passing a path directly or using the interactive selector to pick
+files and folders. Fast, precise, and no extra noise.
 
 ### ♻️ Resume Interrupted Backups
 
-If your connection drops or a backup gets interrupted, you don't lose progress. Use `--continue <backup-hash>` to pick up exactly where it stopped and reuse already uploaded chunks.
+If your connection drops or a backup gets interrupted, you don't lose progress.
+Use `--continue <backup-hash>` to pick up exactly where it stopped and reuse
+already uploaded chunks.
 
 Tip: for list all pending backups run `gib backup pending`.
 
 ### 📁 Multi-Folder Backup with Repository Keys
 
-Organize your backups using **repository keys** — unique identifiers that group all backups from a specific context together. Each key acts as a separate backup repository:
+Organize your backups using **repository keys** — unique identifiers that group
+all backups from a specific context together. Each key acts as a separate backup
+repository:
 
 ```bash
 # Backup your videos
@@ -70,17 +77,21 @@ All version history, deduplication, and metadata are **isolated per key**:
 - `work-documents` → All document versions, completely separate
 - `dev-projects` → Your code history, independent from the rest
 
-This means you can backup **multiple folders from different machines** to the same storage, each with its own timeline and without any interference. Perfect for:
+This means you can backup **multiple folders from different machines** to the
+same storage, each with its own timeline and without any interference. Perfect
+for:
 
 - 🖥️ Backing up multiple computers to one S3 bucket
 - 📂 Organizing backups by project or category
 - 👥 Sharing storage between team members with separate keys
 
-If no key is specified during backup, it will be the name of the folder where you ran `gib backup`.
+If no key is specified during backup, it will be the name of the folder where
+you ran `gib backup`.
 
 ### 🧩 Chunk-Level Deduplication
 
-gib doesn't just deduplicate files — it deduplicates at the **chunk level**. This means:
+gib doesn't just deduplicate files — it deduplicates at the **chunk level**.
+This means:
 
 - Only the **bytes that actually changed** are stored
 - Modify 1KB in a 1GB file? Only ~1KB is uploaded
@@ -88,11 +99,14 @@ gib doesn't just deduplicate files — it deduplicates at the **chunk level**. T
 
 ### 📦 Built-in Compression
 
-All data is automatically compressed using **Zstd** (Zstandard) — one of the fastest and most efficient compression algorithms available. Configurable compression levels let you balance speed vs. size.
+All data is automatically compressed using **Zstd** (Zstandard) — one of the
+fastest and most efficient compression algorithms available. Configurable
+compression levels let you balance speed vs. size.
 
 ### 🔐 Military-Grade Encryption
 
-Protect your backups with **ChaCha20-Poly1305** encryption and **Argon2** key derivation:
+Protect your backups with **ChaCha20-Poly1305** encryption and **Argon2** key
+derivation:
 
 - Your password never leaves your machine
 - Even if someone accesses your storage, they can't read your data
@@ -115,7 +129,9 @@ Choose where your backups live:
 
 ### 🔒 File Permissions Preserved
 
-gib stores and restores **Unix file permissions** (and handles Windows gracefully), so your executables stay executable and your read-only files stay protected.
+gib stores and restores **Unix file permissions** (and handles Windows
+gracefully), so your executables stay executable and your read-only files stay
+protected.
 
 ### ⚡ Parallel & Async
 
@@ -141,18 +157,24 @@ Built with **Tokio** for maximum performance:
 gib config --author "Your Name <you@example.com>"
 ```
 
-### 2. Discover existing local repositories
+### 2. Discover existing local storages
 
-From a workspace containing existing GIB repositories, run setup to create the
-default identity when needed and register discovered local repositories as
-storages:
+From a workspace containing existing GIB storages, run setup to create the
+default identity when needed and register each storage directory.
 
 ```bash
 gib setup
 
-# Inspect only direct child directories
+# Inspect storage directories directly below the current directory.
+# Each candidate is still inspected one level deeper for repository keys.
 gib setup --no-recursive
 ```
+
+The current directory is checked as a storage root too. Without
+`--no-recursive`, setup continues through descendant directories until there are
+no more child directories. Once a storage is detected, its keys are not
+traversed as separate candidates. Blacklisted directories are pruned before they
+are inspected.
 
 ### 3. Add a storage
 
@@ -200,7 +222,10 @@ gib restore
 
 **Real-world performance that speaks for itself.**
 
-In real-world scenarios, `gib backup` consistently outperforms traditional backup tools. Our benchmarks show that in some cases, `gib backup` can be **up to 3.29x faster** than `borg create` — that's more than three times the speed! 🚀
+In real-world scenarios, `gib backup` consistently outperforms traditional
+backup tools. Our benchmarks show that in some cases, `gib backup` can be **up
+to 3.29x faster** than `borg create` — that's more than three times the speed!
+🚀
 
 ### Performance Comparison
 
@@ -225,7 +250,7 @@ Don't just take our word for it — try it yourself and feel the speed differenc
 | -------------------- | --------------------------------------- |
 | `gib config`         | Configure your identity                 |
 | `gib whoami`         | Show your current identity              |
-| `gib setup`          | Discover and configure local repositories |
+| `gib setup`          | Discover and configure local storages   |
 | `gib backup`         | Create a new backup                     |
 | `gib backup delete`  | Delete a backup and its orphaned chunks |
 | `gib restore`        | Restore files from a backup             |
@@ -262,7 +287,8 @@ gib restore \
   --target-path ./restored     # Where to restore (default: current dir)
 ```
 
-Tip: run `gib restore --only` (with no path) to open the interactive selector and pick exactly what you want to restore.
+Tip: run `gib restore --only` (with no path) to open the interactive selector
+and pick exactly what you want to restore.
 
 ---
 
@@ -291,7 +317,8 @@ Tip: run `gib restore --only` (with no path) to open the interactive selector an
 
 ### The Deduplication Advantage
 
-Imagine you have a 1GB video file. You make a small edit (add a watermark) and save it.
+Imagine you have a 1GB video file. You make a small edit (add a watermark) and
+save it.
 
 **Traditional backup:**
 
@@ -311,11 +338,14 @@ That's **99% less upload time** and **50% less storage** for a single edit!
 
 gib uses industry-standard cryptography:
 
-- **ChaCha20-Poly1305**: A modern AEAD cipher, faster than AES on devices without hardware acceleration
-- **Argon2**: Winner of the Password Hashing Competition, resistant to GPU/ASIC attacks
+- **ChaCha20-Poly1305**: A modern AEAD cipher, faster than AES on devices
+  without hardware acceleration
+- **Argon2**: Winner of the Password Hashing Competition, resistant to GPU/ASIC
+  attacks
 - **SHA-256**: For content-addressable storage and integrity verification
 
-Your password is used to derive an encryption key locally. The password itself is never stored or transmitted.
+Your password is used to derive an encryption key locally. The password itself
+is never stored or transmitted.
 
 ---
 
@@ -367,21 +397,22 @@ Your password is used to derive an encryption key locally. The password itself i
 ## 📊 Storage Structure
 
 ```
-repository-key/
-├── backups/
-│   ├── <backup-hash-1>
-│   ├── <backup-hash-2>
-│   └── ...
-├── chunks/
-│   ├── aa/
-│   │   ├── bb1234...
-│   │   └── cc5678...
-│   ├── bb/
-│   │   └── ...
-│   └── ...
-└── indexes/
-    ├── backups     # List of all backups
-    └── chunks      # Reference counts for deduplication
+storage-root/
+└── repository-key/
+    ├── backups/
+    │   ├── <backup-hash-1>
+    │   ├── <backup-hash-2>
+    │   └── ...
+    ├── chunks/
+    │   ├── aa/
+    │   │   ├── bb1234...
+    │   │   └── cc5678...
+    │   ├── bb/
+    │   │   └── ...
+    │   └── ...
+    └── indexes/
+        ├── backups     # List of all backups
+        └── chunks      # Reference counts for deduplication
 ```
 
 ---

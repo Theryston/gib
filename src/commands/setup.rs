@@ -14,7 +14,7 @@ use crate::commands::storage::add::Storage;
 use crate::output::{emit_output, is_json_mode};
 use crate::utils::handle_error;
 
-const REPOSITORY_DIRECTORIES: [&str; 3] = ["backups", "chunks", "indexes"];
+const KEY_DIRECTORIES: [&str; 3] = ["backups", "chunks", "indexes"];
 
 // Keep directory-name rules in one list so adding another development or build
 // directory does not require changing the traversal algorithm.
@@ -147,14 +147,14 @@ struct SkippedPath {
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct SetupSummary {
     config_created: bool,
-    detected_repositories: Vec<String>,
+    detected_storages: Vec<String>,
     configured_storages: Vec<String>,
     skipped: Vec<SkippedPath>,
 }
 
 #[derive(Default)]
 struct Discovery {
-    repositories: Vec<PathBuf>,
+    storages: Vec<PathBuf>,
     skipped: Vec<SkippedPath>,
 }
 
@@ -189,12 +189,12 @@ fn perform_setup(root: &Path, recursive: bool, gib_dir: &Path) -> Result<SetupSu
     let config_created = ensure_default_config(&gib_dir.join("config.msgpack"))?;
     let storage_dir = gib_dir.join("storages");
     let mut registered_storages = load_registered_storages(&storage_dir)?;
-    let discovery = discover_repositories(root, recursive)?;
+    let discovery = discover_storages(root, recursive)?;
 
     let mut summary = SetupSummary {
         config_created,
-        detected_repositories: discovery
-            .repositories
+        detected_storages: discovery
+            .storages
             .iter()
             .map(|path| path.to_string_lossy().to_string())
             .collect(),
@@ -207,24 +207,24 @@ fn perform_setup(root: &Path, recursive: bool, gib_dir: &Path) -> Result<SetupSu
         .map(|storage| storage_name_key(&storage.name))
         .collect();
 
-    for repository in discovery.repositories {
+    for storage_path in discovery.storages {
         if registered_storages.iter().any(|registered| {
             registered.storage.storage_type == 0
                 && registered
                     .storage
                     .path
                     .as_deref()
-                    .is_some_and(|path| paths_equal(Path::new(path), &repository))
+                    .is_some_and(|path| paths_equal(Path::new(path), &storage_path))
         }) {
             summary.skipped.push(SkippedPath {
-                path: repository.to_string_lossy().to_string(),
+                path: storage_path.to_string_lossy().to_string(),
                 reason: "already configured".to_string(),
             });
             continue;
         }
 
-        let name = allocate_storage_name(&repository, &occupied_names);
-        let storage = local_storage_for(&repository);
+        let name = allocate_storage_name(&storage_path, &occupied_names);
+        let storage = local_storage_for(&storage_path);
         write_new_storage(&storage_dir, &name, &storage)?;
 
         occupied_names.insert(storage_name_key(&name));
@@ -338,9 +338,15 @@ fn load_registered_storages(storage_dir: &Path) -> Result<Vec<RegisteredStorage>
     Ok(registered)
 }
 
-fn discover_repositories(root: &Path, recursive: bool) -> Result<Discovery, String> {
+fn discover_storages(root: &Path, recursive: bool) -> Result<Discovery, String> {
     let root = normalize_existing_path(root);
     let mut discovery = Discovery::default();
+
+    if is_valid_storage(&root)? {
+        discovery.storages.push(root);
+        return Ok(discovery);
+    }
+
     let mut visited = HashSet::new();
     discover_children(&root, recursive, &mut discovery, &mut visited)?;
     Ok(discovery)
@@ -380,8 +386,8 @@ fn discover_children(
             continue;
         }
 
-        if is_valid_repository(&directory) {
-            discovery.repositories.push(directory);
+        if is_valid_storage(&directory)? {
+            discovery.storages.push(directory);
             continue;
         }
 
@@ -393,10 +399,30 @@ fn discover_children(
     Ok(())
 }
 
-fn is_valid_repository(path: &Path) -> bool {
-    REPOSITORY_DIRECTORIES
+fn is_valid_key(path: &Path) -> bool {
+    KEY_DIRECTORIES
         .iter()
         .all(|directory| path.join(directory).is_dir())
+}
+
+fn is_valid_storage(path: &Path) -> Result<bool, String> {
+    let entries = fs::read_dir(path).map_err(|e| {
+        format!(
+            "Failed to read storage candidate '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read storage candidate entry: {}", e))?;
+        let child = entry.path();
+        if child.is_dir() && blacklist_reason(&child).is_none() && is_valid_key(&child) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn blacklist_reason(path: &Path) -> Option<&'static str> {
@@ -576,10 +602,10 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
     path_key(left) == path_key(right)
 }
 
-fn local_storage_for(repository: &Path) -> Storage {
+fn local_storage_for(storage_path: &Path) -> Storage {
     Storage {
         storage_type: 0,
-        path: Some(repository.to_string_lossy().to_string()),
+        path: Some(storage_path.to_string_lossy().to_string()),
         region: None,
         bucket: None,
         access_key: None,
@@ -588,19 +614,19 @@ fn local_storage_for(repository: &Path) -> Storage {
     }
 }
 
-fn allocate_storage_name(repository: &Path, occupied_names: &HashSet<String>) -> String {
+fn allocate_storage_name(storage_path: &Path, occupied_names: &HashSet<String>) -> String {
     let preferred = sanitize_storage_name(
-        repository
+        storage_path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("repository"),
+            .unwrap_or("storage"),
     );
 
     if !occupied_names.contains(&storage_name_key(&preferred)) {
         return preferred;
     }
 
-    let digest = Sha256::digest(path_key(repository).as_bytes());
+    let digest = Sha256::digest(path_key(storage_path).as_bytes());
     let suffix = format!("{:x}", digest);
     let base = format!("{}-{}", preferred, &suffix[..8]);
     if !occupied_names.contains(&storage_name_key(&base)) {
@@ -629,7 +655,7 @@ fn sanitize_storage_name(name: &str) -> String {
 
     let sanitized = sanitized.trim_matches('-').to_string();
     if sanitized.is_empty() {
-        "repository".to_string()
+        "storage".to_string()
     } else {
         sanitized
     }
@@ -698,8 +724,8 @@ fn display_summary(summary: &SetupSummary, recursive: bool) {
     println!("{} {}", style("Global config").bold(), config_status);
     println!(
         "{} {} detected, {} newly configured",
-        style("Repositories").bold(),
-        style(summary.detected_repositories.len()).cyan(),
+        style("Storages").bold(),
+        style(summary.detected_storages.len()).cyan(),
         style(summary.configured_storages.len()).green()
     );
 
@@ -779,8 +805,8 @@ mod tests {
         }
     }
 
-    fn make_repository(path: &Path) {
-        for directory in REPOSITORY_DIRECTORIES {
+    fn make_key(path: &Path) {
+        for directory in KEY_DIRECTORIES {
             fs::create_dir_all(path.join(directory)).unwrap();
         }
     }
@@ -807,61 +833,107 @@ mod tests {
     }
 
     #[test]
-    fn discovers_direct_and_nested_repositories() {
+    fn discovers_direct_and_nested_storages() {
         let fixture = TestDirectory::new();
-        make_repository(&fixture.path().join("project-a"));
-        make_repository(&fixture.path().join("archives").join("project-b"));
+        make_key(&fixture.path().join("storage-a").join("project-a"));
+        make_key(
+            &fixture
+                .path()
+                .join("archives")
+                .join("storage-b")
+                .join("project-b"),
+        );
 
-        let recursive = discover_repositories(fixture.path(), true).unwrap();
-        assert_eq!(recursive.repositories.len(), 2);
+        let recursive = discover_storages(fixture.path(), true).unwrap();
+        assert_eq!(recursive.storages.len(), 2);
 
-        let direct = discover_repositories(fixture.path(), false).unwrap();
-        assert_eq!(direct.repositories.len(), 1);
+        let direct = discover_storages(fixture.path(), false).unwrap();
+        assert_eq!(direct.storages.len(), 1);
         assert_eq!(
-            direct.repositories[0]
+            direct.storages[0]
                 .file_name()
                 .and_then(|name| name.to_str()),
-            Some("project-a")
+            Some("storage-a")
         );
     }
 
     #[test]
-    fn stops_at_a_repository_and_prunes_blacklisted_directories() {
+    fn detects_the_current_directory_as_a_storage() {
         let fixture = TestDirectory::new();
-        let repository = fixture.path().join("project");
-        make_repository(&repository);
-        make_repository(&repository.join("nested"));
-        make_repository(&fixture.path().join(".git").join("nested"));
+        make_key(&fixture.path().join("project"));
 
-        let discovery = discover_repositories(fixture.path(), true).unwrap();
-        assert_eq!(discovery.repositories.len(), 1);
+        let discovery = discover_storages(fixture.path(), false).unwrap();
+
         assert_eq!(
-            discovery.repositories[0],
-            normalize_existing_path(&repository)
+            discovery.storages,
+            vec![normalize_existing_path(fixture.path())]
         );
+    }
+
+    #[test]
+    fn stops_at_a_storage_and_prunes_blacklisted_directories() {
+        let fixture = TestDirectory::new();
+        let storage = fixture.path().join("storage");
+        make_key(&storage.join("project"));
+        make_key(
+            &storage
+                .join("project")
+                .join("nested-storage")
+                .join("nested-key"),
+        );
+        make_key(&fixture.path().join(".git").join("nested"));
+
+        let discovery = discover_storages(fixture.path(), true).unwrap();
+        assert_eq!(discovery.storages.len(), 1);
+        assert_eq!(discovery.storages[0], normalize_existing_path(&storage));
         assert_eq!(discovery.skipped.len(), 1);
         assert_eq!(discovery.skipped[0].reason, "blacklisted directory");
     }
 
     #[test]
-    fn requires_the_complete_repository_layout() {
+    fn requires_the_complete_key_layout() {
         let fixture = TestDirectory::new();
         fs::create_dir_all(fixture.path().join("incomplete").join("backups")).unwrap();
 
-        let discovery = discover_repositories(fixture.path(), true).unwrap();
-        assert!(discovery.repositories.is_empty());
+        let discovery = discover_storages(fixture.path(), true).unwrap();
+        assert!(discovery.storages.is_empty());
     }
 
     #[test]
     fn setup_is_idempotent_and_uses_collision_safe_names() {
         let fixture = TestDirectory::new();
-        make_repository(&fixture.path().join("one").join("repository"));
-        make_repository(&fixture.path().join("two").join("repository"));
+        let first_storage = fixture.path().join("one").join("backups");
+        let second_storage = fixture.path().join("two").join("backups");
+        make_key(&first_storage.join("project"));
+        make_key(&second_storage.join("project"));
         let gib_dir = fixture.path().join("gib");
 
         let first = perform_setup(fixture.path(), true, &gib_dir).unwrap();
         assert_eq!(first.configured_storages.len(), 2);
         assert_ne!(first.configured_storages[0], first.configured_storages[1]);
+
+        let configured_paths = fs::read_dir(gib_dir.join("storages"))
+            .unwrap()
+            .map(|entry| {
+                let bytes = fs::read(entry.unwrap().path()).unwrap();
+                let storage: Storage = rmp_serde::from_slice(&bytes).unwrap();
+                storage.path.unwrap()
+            })
+            .collect::<HashSet<_>>();
+        assert!(
+            configured_paths.contains(
+                &normalize_existing_path(&first_storage)
+                    .to_string_lossy()
+                    .to_string()
+            )
+        );
+        assert!(
+            configured_paths.contains(
+                &normalize_existing_path(&second_storage)
+                    .to_string_lossy()
+                    .to_string()
+            )
+        );
 
         let second = perform_setup(fixture.path(), true, &gib_dir).unwrap();
         assert!(second.configured_storages.is_empty());
