@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.16](https://github.com/Theryston/gib/compare/v0.0.15...v0.0.16) - 2026-08-25
+
+### Added
+
+- improve setup summary output readability
+- add setup command to discover and register local repositories
+
 ## [0.0.15](https://github.com/Theryston/gib/compare/v0.0.14...v0.0.15) - 2026-05-14
 
 ### Added
