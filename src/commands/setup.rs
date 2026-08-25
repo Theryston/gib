@@ -1,9 +1,10 @@
 use clap::ArgMatches;
+use console::style;
 use dirs::home_dir;
 use rmp_serde::Serializer;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -676,47 +677,77 @@ fn serialize<T: Serialize>(value: &T, label: &str) -> Result<Vec<u8>, String> {
 }
 
 fn display_summary(summary: &SetupSummary, recursive: bool) {
+    println!();
+    println!("{}", style("GIB setup complete").cyan().bold());
     println!(
-        "GIB setup complete ({} discovery).",
+        "{} {}",
+        style("Discovery").bold(),
         if recursive {
-            "recursive"
+            style("recursive").green()
         } else {
-            "direct-child"
+            style("direct children only").green()
         }
     );
+    println!();
+
+    let config_status = if summary.config_created {
+        style("created with the default identity").green()
+    } else {
+        style("already exists").dim()
+    };
+    println!("{} {}", style("Global config").bold(), config_status);
     println!(
-        "Global config: {}.",
-        if summary.config_created {
-            "created with the default identity"
-        } else {
-            "already exists"
-        }
+        "{} {} detected, {} newly configured",
+        style("Repositories").bold(),
+        style(summary.detected_repositories.len()).cyan(),
+        style(summary.configured_storages.len()).green()
     );
 
-    if summary.detected_repositories.is_empty() {
-        println!("Detected repositories: none.");
-    } else {
-        println!("Detected repositories:");
-        for path in &summary.detected_repositories {
-            println!("  - {}", path);
+    if !summary.configured_storages.is_empty() {
+        println!();
+        println!("{}", style("New local storages").bold());
+
+        const MAX_STORAGE_NAMES: usize = 10;
+        for name in summary.configured_storages.iter().take(MAX_STORAGE_NAMES) {
+            println!("  {} {}", style("✓").green(), style(name).white());
+        }
+
+        let remaining = summary
+            .configured_storages
+            .len()
+            .saturating_sub(MAX_STORAGE_NAMES);
+        if remaining > 0 {
+            println!(
+                "  {} {} more storages",
+                style("…").dim(),
+                style(remaining).dim()
+            );
         }
     }
 
-    if summary.configured_storages.is_empty() {
-        println!("Configured local storages: none.");
+    println!();
+    if summary.skipped.is_empty() {
+        println!("{} {}", style("Skipped").bold(), style("none").green());
     } else {
-        println!("Configured local storages:");
-        for name in &summary.configured_storages {
-            println!("  - {}", name);
+        let skipped_counts = count_skipped_reasons(&summary.skipped);
+        println!(
+            "{} {} directories",
+            style("Skipped").bold().yellow(),
+            style(summary.skipped.len()).yellow()
+        );
+        for (reason, count) in skipped_counts {
+            println!("  {} {:>5}  {}", style("•").yellow(), count, reason);
         }
     }
+    println!();
+}
 
-    if !summary.skipped.is_empty() {
-        println!("Skipped directories:");
-        for skipped in &summary.skipped {
-            println!("  - {} ({})", skipped.path, skipped.reason);
-        }
+fn count_skipped_reasons(skipped: &[SkippedPath]) -> BTreeMap<&str, usize> {
+    let mut counts = BTreeMap::new();
+    for entry in skipped {
+        *counts.entry(entry.reason.as_str()).or_insert(0) += 1;
     }
+    counts
 }
 
 #[cfg(test)]
