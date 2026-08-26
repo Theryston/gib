@@ -55,16 +55,18 @@ enum SelectionState {
     Selected,
 }
 
-struct TerminalGuard {
+pub(crate) struct TerminalGuard {
     raw_mode: bool,
 }
 
 impl TerminalGuard {
-    fn new() -> Result<Self, String> {
+    pub(crate) fn new() -> Result<Self, String> {
         terminal::enable_raw_mode().map_err(|e| format!("Failed to enable raw mode: {}", e))?;
         let mut stdout = std::io::stdout();
-        execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)
-            .map_err(|e| format!("Failed to initialize terminal: {}", e))?;
+        if let Err(error) = execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide) {
+            let _ = terminal::disable_raw_mode();
+            return Err(format!("Failed to initialize terminal: {}", error));
+        }
         Ok(Self { raw_mode: true })
     }
 }

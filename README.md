@@ -166,6 +166,16 @@ each backup, includes files that were deleted when an earlier revision remains
 restorable, and uses the same repository key, storage, password, and local
 configuration resolution as the other read-only commands.
 
+### 🧭 Historical Explore
+
+Browse the metadata-only historical catalog in an interactive terminal tree or
+consume it as JSON. `gib explore` shows current and deleted paths, file history,
+selection totals, and the backup source for each selected file. Restoring a
+selection reuses the regular restore pipeline, groups files from different
+backups efficiently, and never prunes unrelated local files. The catalog is
+loaded lazily, so opening a large repository does not require downloading every
+manifest or chunk.
+
 ---
 
 ## 🎯 Quick Start
@@ -374,6 +384,48 @@ empty successful result; new backups are indexed automatically.
 Use `--mode json` for a stable structured response. JSON results contain only
 the path, a short valid backup reference, and a ready-to-copy restore command.
 
+### 11. Explore and restore historical files
+
+```bash
+# Open the catalog tree. Use Space to select and R to restore.
+gib explore
+
+# Open a subtree or search without leaving JSON mode.
+gib explore --path downloads
+gib explore --mode json --query invoice
+
+# Include deleted historical paths and inspect restorable revisions.
+gib explore --scope all-history
+gib explore --mode json --path downloads/installers/old.exe --history
+```
+
+The interactive explorer keeps the current selection while switching between
+`Current` and `All history` with `M`. `H` opens a file's restorable revision
+history, `/` searches the same catalog token index used by `gib search`, `G`
+jumps to a normalized path, and `N` loads another lazy page. Press `?` for the
+full key guide. A selected directory expands to all eligible nested files.
+When selected files belong to different snapshots, GIB confirms the destination
+and restores each backup group through the normal decryption, decompression,
+permission, skip-if-identical, and error handling pipeline.
+
+JSON mode never starts a terminal UI. Directory listings contain `path`,
+`scope`, `entries`, and `next_cursor`; file history contains only revisions that
+are still restorable. Use explicit paths and revisions for automation:
+
+```bash
+gib explore --mode json --restore \
+  --select downloads/report.pdf \
+  --select downloads/archive \
+  --revision downloads/report.pdf=latest \
+  --target-path ./restored
+```
+
+`--revision` accepts `PATH=BACKUP`, or just a full/unique backup reference when
+`--path` names the file. The reference can be a full or unique prefix of a
+backup hash, a stable catalog revision ID, or `latest`. Missing catalogs are a
+successful empty response with an explanatory status; new backups populate the
+catalog automatically and old snapshots remain available through `gib restore`.
+
 ---
 
 ## ⚡ Benchmarks
@@ -415,6 +467,7 @@ Don't just take our word for it — try it yourself and feel the speed differenc
 | `gib backup delete`  | Delete a backup and its orphaned chunks             |
 | `gib restore`        | Restore files from a backup                         |
 | `gib search`         | Search the historical filesystem catalog            |
+| `gib explore`        | Browse and restore historical catalog entries       |
 | `gib log`            | View backup history (paginated)                     |
 | `gib encrypt`        | Encrypt all chunks in a repository                  |
 | `gib storage add`    | Add a new storage location                          |
@@ -513,6 +566,33 @@ same resolution rules as `gib log` and `gib restore`. `--limit` defaults to
 100. In interactive mode, a degraded catalog is accompanied by a warning and
 the available results are shown. In JSON mode, the response includes
 `index_status: "degraded"` and a warning when results may be incomplete.
+
+### Explore Options
+
+```bash
+gib explore \
+  --key my-project \
+  --storage cloud \
+  --scope all-history \
+  --path downloads \
+  --sort recent
+
+gib explore --mode json --path downloads --scope current
+gib explore --mode json --query invoice --limit 50
+gib explore --mode json --path downloads/installers/old.exe --history
+```
+
+`--scope current` lists paths present in the latest indexed snapshot;
+`--scope all-history` also lists deleted paths with a restorable revision. The
+interactive default is `all-history` so older files are immediately
+discoverable. `--cursor` continues a paginated directory or search response.
+Use `--restore` with repeatable `--select PATH` values, or use `--path` for one
+file/directory, in JSON mode. Interactive
+restore can be started with `R` after selecting entries; it asks for the target
+and confirmation outside the terminal UI. `--target-path` overrides
+`[restore].target_path` from `gib.toml`. Repository flags and configuration use
+the same read-only resolution rules as `gib log`, `gib search`, and `gib
+restore`.
 
 ---
 

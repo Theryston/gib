@@ -3,7 +3,7 @@ use crate::config::{
     resolve_repository,
 };
 use crate::core::catalog::{
-    CatalogEntryScope, CatalogEntrySummary, CatalogState, lookup_entries_by_tokens, lookup_path,
+    CatalogEntryScope, CatalogEntrySummary, CatalogState, collect_entries_by_tokens, lookup_path,
     normalize_relative_path, path_tokens, read_catalog_status,
 };
 use crate::output::{emit_output, is_json_mode};
@@ -14,7 +14,6 @@ use serde::Serialize;
 use std::sync::Arc;
 
 const DEFAULT_SEARCH_LIMIT: usize = 100;
-const CATALOG_PAGE_SIZE: usize = 256;
 const NO_INDEXED_BACKUPS_MESSAGE: &str = "No searchable backups yet. New backups are indexed automatically; existing older snapshots remain usable normally.";
 const DEGRADED_INDEX_WARNING: &str = "The historical search catalog is degraded; search results may be incomplete until pending backups are indexed.";
 
@@ -218,27 +217,14 @@ async fn run_search(
         SearchIndexStatus::Ready
     };
 
-    let mut candidates = Vec::new();
-    let mut cursor = None;
-    loop {
-        let page = lookup_entries_by_tokens(
-            Arc::clone(&fs),
-            key.clone(),
-            password.clone(),
-            &request.tokens,
-            CatalogEntryScope::AllHistory,
-            cursor.as_deref(),
-            CATALOG_PAGE_SIZE,
-        )
-        .await?;
-        let next_cursor = page.next_cursor.clone();
-        candidates.extend(page.items);
-
-        match next_cursor {
-            Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
-            _ => break,
-        }
-    }
+    let candidates = collect_entries_by_tokens(
+        Arc::clone(&fs),
+        key,
+        password,
+        &request.tokens,
+        CatalogEntryScope::AllHistory,
+    )
+    .await?;
 
     let (results, truncated) = filter_sort_and_limit(candidates, &request);
     Ok(SearchResponse {
@@ -414,6 +400,10 @@ mod tests {
             path: path.to_string(),
             exists_in_latest_indexed_snapshot: backup.is_some(),
             latest_restorable_backup: backup.map(ToString::to_string),
+            latest_revision_id: backup.map(|backup| format!("revision-{backup}")),
+            size: backup.map(|_| 1),
+            content_type: backup.map(|_| "application/octet-stream".to_string()),
+            permissions: backup.map(|_| 0o644),
             newest_revision_timestamp: timestamp,
             revision_count: 1,
         }

@@ -39,6 +39,10 @@ pub(crate) struct CatalogEntrySummary {
     pub(crate) path: String,
     pub(crate) exists_in_latest_indexed_snapshot: bool,
     pub(crate) latest_restorable_backup: Option<String>,
+    pub(crate) latest_revision_id: Option<String>,
+    pub(crate) size: Option<u64>,
+    pub(crate) content_type: Option<String>,
+    pub(crate) permissions: Option<u32>,
     pub(crate) newest_revision_timestamp: u64,
     pub(crate) revision_count: usize,
 }
@@ -150,6 +154,20 @@ pub(crate) async fn list_directory_children(
     };
 
     Ok(CatalogPage { items, next_cursor })
+}
+
+pub(crate) async fn directory_exists(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+    path: &str,
+) -> Result<bool, String> {
+    let normalized = normalize_relative_path(path)?;
+    Ok(
+        find_directory_by_lookup_path(&fs, &key, password.as_deref(), &normalized)
+            .await?
+            .is_some(),
+    )
 }
 
 async fn find_entry_by_lookup_path(
@@ -345,6 +363,12 @@ pub(crate) async fn lookup_entries_by_tokens(
             continue;
         }
 
+        let latest_revision = entry
+            .revisions
+            .iter()
+            .rev()
+            .find(|revision| revision.latest_restorable_backup.is_some());
+
         results.push(CatalogEntrySummary {
             entry_id: entry.entry_id.clone(),
             path: entry.path.clone(),
@@ -356,6 +380,10 @@ pub(crate) async fn lookup_entries_by_tokens(
             } else {
                 entry.latest_restorable_backup.clone()
             },
+            latest_revision_id: latest_revision.map(|revision| revision.revision_id.clone()),
+            size: latest_revision.map(|revision| revision.size),
+            content_type: latest_revision.map(|revision| revision.content_type.clone()),
+            permissions: latest_revision.map(|revision| revision.permissions),
             newest_revision_timestamp: entry
                 .revisions
                 .iter()
@@ -399,6 +427,40 @@ pub(crate) async fn lookup_entries_by_tokens(
         items: filtered,
         next_cursor,
     })
+}
+
+pub(crate) async fn collect_entries_by_tokens(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+    tokens: &[String],
+    scope: CatalogEntryScope,
+) -> Result<Vec<CatalogEntrySummary>, String> {
+    const PAGE_SIZE: usize = 256;
+
+    let mut cursor = None;
+    let mut entries = Vec::new();
+    loop {
+        let page = lookup_entries_by_tokens(
+            Arc::clone(&fs),
+            key.clone(),
+            password.clone(),
+            tokens,
+            scope,
+            cursor.as_deref(),
+            PAGE_SIZE,
+        )
+        .await?;
+        let next_cursor = page.next_cursor.clone();
+        entries.extend(page.items);
+
+        match next_cursor {
+            Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
+            _ => break,
+        }
+    }
+
+    Ok(entries)
 }
 
 fn status_from_catalog(catalog: &Catalog) -> CatalogStatus {

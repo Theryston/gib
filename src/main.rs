@@ -119,6 +119,99 @@ fn cli() -> Command {
                 .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))
         )
         .subcommand(
+            Command::new("explore")
+                .about("Browse and restore files from the historical filesystem catalog")
+                .arg(
+                    Arg::new("path")
+                        .long("path")
+                        .value_name("PATH")
+                        .help("Relative catalog directory or file path to open")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("scope")
+                        .long("scope")
+                        .value_name("SCOPE")
+                        .help("Catalog scope: current or all-history (default: all-history)")
+                        .value_parser(["current", "all-history"])
+                        .default_value("all-history")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("query")
+                        .long("query")
+                        .value_name("QUERY")
+                        .help("Search catalog paths using the shared token index")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("history")
+                        .long("history")
+                        .help("Show only restorable revisions for the file at --path")
+                        .action(clap::ArgAction::SetTrue)
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("restore")
+                        .long("restore")
+                        .help("Restore selected catalog entries")
+                        .action(clap::ArgAction::SetTrue)
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("select")
+                        .long("select")
+                        .value_name("PATH")
+                        .help("File or directory path to restore (repeatable; JSON also accepts --path)")
+                        .action(clap::ArgAction::Append)
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("revision")
+                        .long("revision")
+                        .value_name("PATH=BACKUP")
+                        .help("Restore a specific revision (PATH=BACKUP, or BACKUP with --path)")
+                        .action(clap::ArgAction::Append)
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("target-path")
+                        .short('t')
+                        .long("target-path")
+                        .value_name("TARGET_PATH")
+                        .help("Destination directory for restore (default: restore.target_path or current directory)")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("cursor")
+                        .long("cursor")
+                        .value_name("CURSOR")
+                        .help("Continue a paginated directory or search result listing")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("limit")
+                        .long("limit")
+                        .value_name("N")
+                        .help("Maximum search results (default: 100)")
+                        .value_parser(clap::value_parser!(usize))
+                        .default_value("100")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("sort")
+                        .long("sort")
+                        .value_name("ORDER")
+                        .help("Interactive order: name, size, status, or recent")
+                        .value_parser(["name", "size", "status", "recent"])
+                        .default_value("name")
+                        .required(false),
+                )
+                .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
+                .arg(arg!(-s --storage <STORAGE> "The storage to use").required(false))
+                .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))
+        )
+        .subcommand(
             Command::new("backup")
                 .about("Create a backup of a directory and store it in a storage")
                 .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
@@ -542,6 +635,7 @@ async fn main() {
         Some(("encrypt", matches)) => commands::encrypt(matches).await,
         Some(("log", matches)) => commands::log(matches).await,
         Some(("search", matches)) => commands::search(matches).await,
+        Some(("explore", matches)) => commands::explore(matches).await,
         Some(("backup", matches)) => match matches.subcommand() {
             Some(("delete", matches)) => commands::delete(matches).await,
             Some(("pending", matches)) => commands::pending(matches).await,

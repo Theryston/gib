@@ -1126,6 +1126,8 @@ fn new_revision(
         present_until_timestamp: None,
         content_hash: object.hash.clone(),
         size: object.size,
+        content_type: object.content_type.clone(),
+        permissions: object.permissions,
         latest_restorable_backup: Some(backup_hash.to_string()),
     }
 }

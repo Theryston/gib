@@ -16,7 +16,8 @@ pub(crate) use normalize::{
 };
 pub(crate) use query::{
     CatalogEntryScope, CatalogEntrySummary, CatalogPage, CatalogStatus, DirectoryChildSummary,
-    get_entry_history, list_directory_children, lookup_entries_by_tokens, read_catalog_status,
+    collect_entries_by_tokens, directory_exists, get_entry_history, list_directory_children,
+    lookup_entries_by_tokens, read_catalog_status,
 };
 pub(crate) use update::index_backup_after_finalize;
 

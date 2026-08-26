@@ -89,6 +89,10 @@ pub(crate) struct FileRevision {
     pub(crate) content_hash: String,
     pub(crate) size: u64,
     #[serde(default)]
+    pub(crate) content_type: String,
+    #[serde(default)]
+    pub(crate) permissions: u32,
+    #[serde(default)]
     pub(crate) latest_restorable_backup: Option<String>,
 }
 
