@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.29](https://github.com/Theryston/gib/compare/v0.0.28...v0.0.29) - 2026-08-26
+
+### Added
+
+- add search command for historical catalog queries
+
+### Other
+
+- Fix punctuation in README description
+
 ## [0.0.28](https://github.com/Theryston/gib/compare/v0.0.27...v0.0.28) - 2026-08-26
 
 ### Added
