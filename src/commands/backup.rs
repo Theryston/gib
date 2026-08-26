@@ -25,7 +25,7 @@ use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use parse_size::parse_size;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -144,6 +144,32 @@ pub(crate) async fn run_backup_with_parents(
     parent_hashes: Vec<String>,
     received_pending_backup: Option<PendingBackupMatch>,
 ) -> Result<BackupResult, String> {
+    run_backup_with_scope(
+        options,
+        message,
+        parent_hashes,
+        received_pending_backup,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_incremental_backup_with_parents(
+    options: BackupOptions,
+    message: String,
+    parent_hashes: Vec<String>,
+    changed_paths: BTreeSet<String>,
+) -> Result<BackupResult, String> {
+    run_backup_with_scope(options, message, parent_hashes, None, Some(changed_paths)).await
+}
+
+async fn run_backup_with_scope(
+    options: BackupOptions,
+    message: String,
+    parent_hashes: Vec<String>,
+    received_pending_backup: Option<PendingBackupMatch>,
+    changed_paths: Option<BTreeSet<String>>,
+) -> Result<BackupResult, String> {
     let BackupOptions {
         key,
         root_path_string,
@@ -193,6 +219,7 @@ pub(crate) async fn run_backup_with_parents(
             Arc::clone(&prev_not_encrypted_but_now_yes),
             ignore_patterns.clone(),
             primary_parent.clone(),
+            changed_paths.as_ref(),
         )
         .await
         {
@@ -801,6 +828,88 @@ fn remove_missing_backup_objects(
     }
 }
 
+fn remove_changed_backup_objects(
+    tree: &mut HashMap<String, BackupObject>,
+    chunk_indexes: &mut HashMap<String, ChunkIndex>,
+    root_files: &[String],
+    root_path: &str,
+    ignore_patterns: &[String],
+    changed_paths: &BTreeSet<String>,
+) {
+    let current_paths: HashSet<String> = root_files
+        .iter()
+        .map(|file_path| relative_path(file_path, root_path))
+        .collect();
+
+    let stale_paths: Vec<String> = tree
+        .keys()
+        .filter(|path| {
+            if path
+                .split('/')
+                .any(|component| ignore_patterns.iter().any(|pattern| pattern == component))
+            {
+                return false;
+            }
+
+            changed_paths.iter().any(|changed_path| {
+                let target = Path::new(root_path).join(changed_path);
+                let changed_path = changed_path.trim_matches('/');
+
+                if target.is_dir() {
+                    (path.as_str() == changed_path
+                        || path.starts_with(&format!("{}/", changed_path)))
+                        && !current_paths.contains(*path)
+                } else if target.exists() {
+                    path.as_str() == changed_path && !current_paths.contains(*path)
+                } else {
+                    path.as_str() == changed_path || path.starts_with(&format!("{}/", changed_path))
+                }
+            })
+        })
+        .cloned()
+        .collect();
+
+    for stale_path in stale_paths {
+        if let Some(backup_object) = tree.remove(&stale_path) {
+            decrement_chunk_refcounts_from_map(chunk_indexes, &backup_object);
+        }
+    }
+}
+
+fn list_changed_files(
+    root_path: &str,
+    ignore_patterns: &[String],
+    changed_paths: &BTreeSet<String>,
+) -> Vec<String> {
+    let root = Path::new(root_path);
+    let mut files = BTreeSet::new();
+
+    for changed_path in changed_paths {
+        let path = root.join(changed_path);
+        if path.is_file() && !is_ignored_path(&path, root, ignore_patterns) {
+            files.insert(path.display().to_string());
+            continue;
+        }
+
+        if !path.is_dir() {
+            continue;
+        }
+
+        let walker = walkdir::WalkDir::new(&path)
+            .into_iter()
+            .filter_entry(|entry| !is_ignored_path(entry.path(), root, ignore_patterns));
+
+        for entry in walker
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_file())
+        {
+            files.insert(entry.path().display().to_string());
+        }
+    }
+
+    files.into_iter().collect()
+}
+
 async fn load_metadata(
     fs: Arc<dyn FS>,
     key: String,
@@ -811,6 +920,7 @@ async fn load_metadata(
     prev_not_encrypted_but_now_yes: Arc<Mutex<bool>>,
     ignore_patterns: Vec<String>,
     parent_hash: Option<String>,
+    changed_paths: Option<&BTreeSet<String>>,
 ) -> Result<
     (
         Backup,
@@ -823,12 +933,24 @@ async fn load_metadata(
 > {
     let mut new_backup = create_new_backup(message, config.author);
 
-    let root_path_for_listing = root_path_string.clone();
-    let ignore_patterns_for_listing = ignore_patterns.clone();
-    let root_files_future =
+    let root_files_future = if let Some(changed_paths) = changed_paths {
+        let root_path_for_listing = root_path_string.clone();
+        let ignore_patterns_for_listing = ignore_patterns.clone();
+        let changed_paths_for_listing = changed_paths.clone();
+        tokio::spawn(async move {
+            list_changed_files(
+                &root_path_for_listing,
+                &ignore_patterns_for_listing,
+                &changed_paths_for_listing,
+            )
+        })
+    } else {
+        let root_path_for_listing = root_path_string.clone();
+        let ignore_patterns_for_listing = ignore_patterns.clone();
         tokio::spawn(
             async move { list_files(&root_path_for_listing, &ignore_patterns_for_listing) },
-        );
+        )
+    };
 
     let parent_backup_future = tokio::spawn({
         let fs = Arc::clone(&fs);
@@ -869,13 +991,24 @@ async fn load_metadata(
         increment_chunk_refcounts(&mut chunk_indexes, &parent_backup.tree);
         new_backup.tree = parent_backup.tree;
 
-        remove_missing_backup_objects(
-            &mut new_backup.tree,
-            &mut chunk_indexes,
-            &root_files,
-            &root_path_string,
-            &ignore_patterns,
-        );
+        if let Some(changed_paths) = changed_paths {
+            remove_changed_backup_objects(
+                &mut new_backup.tree,
+                &mut chunk_indexes,
+                &root_files,
+                &root_path_string,
+                &ignore_patterns,
+                changed_paths,
+            );
+        } else {
+            remove_missing_backup_objects(
+                &mut new_backup.tree,
+                &mut chunk_indexes,
+                &root_files,
+                &root_path_string,
+                &ignore_patterns,
+            );
+        }
     }
 
     Ok((
@@ -1540,6 +1673,81 @@ mod tests {
 
         assert!(second.backup.tree.contains_key("kept.txt"));
         assert!(!second.backup.tree.contains_key("deleted.txt"));
+
+        let _ = std::fs::remove_dir_all(fixture);
+    }
+
+    #[tokio::test]
+    async fn incremental_backup_updates_only_the_changed_paths() {
+        let fixture = test_directory();
+        let source = fixture.join("source");
+        let storage = fixture.join("storage");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("changed.txt"), b"before").unwrap();
+        std::fs::write(source.join("untouched.txt"), b"untouched").unwrap();
+        std::fs::write(source.join("deleted.txt"), b"deleted").unwrap();
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("nested/changed.txt"), b"before").unwrap();
+        std::fs::write(source.join("nested/deleted.txt"), b"deleted").unwrap();
+
+        let options = BackupOptions {
+            key: "project".to_string(),
+            root_path_string: source.to_string_lossy().to_string(),
+            storage: "test".to_string(),
+            fs: Arc::new(LocalFS::new(&storage)),
+            author: "tester <tester@example.com>".to_string(),
+            compress: 3,
+            password: None,
+            chunk_size: 1024,
+            ignore_patterns: Vec::new(),
+            concurrency: 1,
+        };
+
+        let first = run_backup(options.clone(), "[LIVE] initial".to_string(), None, None)
+            .await
+            .unwrap();
+        let untouched_before = first.backup.tree["untouched.txt"].clone();
+
+        std::fs::write(source.join("changed.txt"), b"after").unwrap();
+        std::fs::remove_file(source.join("deleted.txt")).unwrap();
+        std::fs::write(source.join("created.txt"), b"created").unwrap();
+        std::fs::write(source.join("nested/changed.txt"), b"after").unwrap();
+        std::fs::remove_file(source.join("nested/deleted.txt")).unwrap();
+
+        let second = run_incremental_backup_with_parents(
+            options,
+            "[LIVE] changed".to_string(),
+            vec![first.backup.hash.clone()],
+            BTreeSet::from([
+                "changed.txt".to_string(),
+                "created.txt".to_string(),
+                "deleted.txt".to_string(),
+                "nested".to_string(),
+            ]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(second.files_total, 3);
+        assert_eq!(
+            second.backup.tree["untouched.txt"].hash,
+            untouched_before.hash
+        );
+        assert_eq!(
+            second.backup.tree["untouched.txt"].chunks,
+            untouched_before.chunks
+        );
+        assert_eq!(
+            second.backup.tree["changed.txt"].hash,
+            format!("{:x}", Sha256::digest(b"after"))
+        );
+        assert!(second.backup.tree.contains_key("created.txt"));
+        assert!(!second.backup.tree.contains_key("deleted.txt"));
+        assert_eq!(
+            second.backup.tree["nested/changed.txt"].hash,
+            format!("{:x}", Sha256::digest(b"after"))
+        );
+        assert!(!second.backup.tree.contains_key("nested/deleted.txt"));
 
         let _ = std::fs::remove_dir_all(fixture);
     }

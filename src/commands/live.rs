@@ -1,12 +1,13 @@
 use crate::commands::backup::{
     BackupMode, BackupResult, ResolvedBackup, is_ignored_path, load_backup, resolve_backup,
-    run_backup_with_parents,
+    run_backup_with_parents, run_incremental_backup_with_parents,
 };
 use crate::core::indexes::read_or_initialize_repository_head;
 use crate::core::live_state::{LiveState, load_live_state, save_live_state};
 use crate::core::metadata::Backup;
 use crate::core::reconcile::{
     ReconcileConflict, apply_remote_change, reconcile_worktree, worktree_matches_backup,
+    worktree_matches_backup_paths,
 };
 use crate::output::{emit_named_event, is_json_mode};
 use crate::utils::handle_error;
@@ -84,6 +85,15 @@ impl ChangeBatch {
             ChangeKind::Changed => &self.changed,
             ChangeKind::Deleted => &self.deleted,
         }
+    }
+
+    fn affected_paths(&self) -> BTreeSet<String> {
+        self.created
+            .iter()
+            .chain(self.changed.iter())
+            .chain(self.deleted.iter())
+            .cloned()
+            .collect()
     }
 }
 
@@ -418,13 +428,14 @@ fn record_notify_result(
             continue;
         }
 
-        let relative_path = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/")
-            .trim_matches('/')
-            .to_string();
+        let relative_path = match path.strip_prefix(root) {
+            Ok(relative_path) => relative_path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .trim_matches('/')
+                .to_string(),
+            Err(_) => continue,
+        };
 
         if !relative_path.is_empty() {
             batch.record(relative_path, kind);
@@ -450,9 +461,18 @@ async fn process_batch(
     conflict_policy: Option<ConflictPolicy>,
 ) {
     let message = build_live_message(&resolved.message, batch);
+    let changed_paths = batch.affected_paths();
     emit_live_batch(batch, &message);
 
-    match synchronize_live(resolved, state, Some(message), conflict_policy).await {
+    match synchronize_live_with_paths(
+        resolved,
+        state,
+        Some(message),
+        conflict_policy,
+        Some(changed_paths),
+    )
+    .await
+    {
         Ok(outcome) => emit_sync_outcome(outcome),
         Err(error) => emit_live_error(format!("Backup failed: {}", error), true),
     }
@@ -470,6 +490,16 @@ async fn synchronize_live(
     state: &mut LiveState,
     message: Option<String>,
     conflict_policy: Option<ConflictPolicy>,
+) -> Result<SyncOutcome, String> {
+    synchronize_live_with_paths(resolved, state, message, conflict_policy, None).await
+}
+
+async fn synchronize_live_with_paths(
+    resolved: &ResolvedBackup,
+    state: &mut LiveState,
+    message: Option<String>,
+    conflict_policy: Option<ConflictPolicy>,
+    changed_paths: Option<BTreeSet<String>>,
 ) -> Result<SyncOutcome, String> {
     let root = PathBuf::from(&resolved.options.root_path_string);
 
@@ -512,13 +542,16 @@ async fn synchronize_live(
         let remote_changed = base_hash != remote_hash;
         let remote_tree = remote_backup.clone().unwrap_or_else(empty_backup);
         let mut outcome = SyncOutcome::default();
+        let mut use_incremental_backup = changed_paths.is_some();
 
         if !remote_changed && message.is_none() {
             return Ok(outcome);
         }
 
+        let mut backup_paths = changed_paths.clone().unwrap_or_default();
+
         if remote_changed {
-            let reconciliation = reconcile_worktree(
+            let mut reconciliation = reconcile_worktree(
                 &root,
                 &resolved.options.ignore_patterns,
                 base_backup.as_ref(),
@@ -530,24 +563,53 @@ async fn synchronize_live(
             .await?;
             outcome.applied_remote = reconciliation.applied_remote;
             outcome.merged_text = reconciliation.merged_text;
+            backup_paths = reconciliation.local_changes.clone();
 
             if !reconciliation.conflicts.is_empty() {
                 if let Some(policy) = conflict_policy.filter(|_| is_json_mode()) {
                     emit_live_conflicts(&reconciliation.conflicts, policy);
                 }
-                resolve_interactive_conflicts(
+                let remote_resolutions = resolve_interactive_conflicts(
                     &root,
-                    reconciliation.conflicts,
+                    std::mem::take(&mut reconciliation.conflicts),
                     Arc::clone(&resolved.options.fs),
                     &resolved.options.key,
                     resolved.options.password.as_deref(),
                     conflict_policy,
                 )
                 .await?;
+                for path in remote_resolutions {
+                    backup_paths.remove(&path);
+                }
             }
+
+            if backup_paths.is_empty() {
+                state.initialized = true;
+                state.base_backup = remote_hash;
+                save_live_state(
+                    &root,
+                    &resolved.options.storage,
+                    &resolved.options.key,
+                    state,
+                )?;
+                return Ok(outcome);
+            }
+
+            use_incremental_backup = true;
         }
 
-        if worktree_matches_backup(&root, &resolved.options.ignore_patterns, &remote_tree)? {
+        let worktree_matches = if use_incremental_backup {
+            worktree_matches_backup_paths(
+                &root,
+                &resolved.options.ignore_patterns,
+                &remote_tree,
+                &backup_paths,
+            )?
+        } else {
+            worktree_matches_backup(&root, &resolved.options.ignore_patterns, &remote_tree)?
+        };
+
+        if worktree_matches {
             state.initialized = true;
             state.base_backup = remote_hash;
             save_live_state(
@@ -578,9 +640,17 @@ async fn synchronize_live(
         });
         emit_live_backup_started(&backup_message);
 
-        let result =
-            run_backup_with_parents(resolved.options.clone(), backup_message, parents, None)
-                .await?;
+        let result = if use_incremental_backup {
+            run_incremental_backup_with_parents(
+                resolved.options.clone(),
+                backup_message,
+                parents,
+                backup_paths,
+            )
+            .await?
+        } else {
+            run_backup_with_parents(resolved.options.clone(), backup_message, parents, None).await?
+        };
 
         if result.head_published {
             state.initialized = true;
@@ -624,7 +694,9 @@ async fn resolve_interactive_conflicts(
     key: &str,
     password: Option<&str>,
     conflict_policy: Option<ConflictPolicy>,
-) -> Result<(), String> {
+) -> Result<BTreeSet<String>, String> {
+    let mut remote_resolutions = BTreeSet::new();
+
     for conflict in conflicts {
         let use_remote = match conflict_policy {
             Some(ConflictPolicy::Local) => false,
@@ -645,6 +717,7 @@ async fn resolve_interactive_conflicts(
         };
 
         if use_remote {
+            remote_resolutions.insert(conflict.path.clone());
             apply_remote_change(
                 root,
                 &conflict.path,
@@ -656,7 +729,8 @@ async fn resolve_interactive_conflicts(
             .await?;
         }
     }
-    Ok(())
+
+    Ok(remote_resolutions)
 }
 
 fn emit_live_batch(batch: &ChangeBatch, message: &str) {
@@ -870,6 +944,7 @@ mod tests {
     use super::*;
     use crate::commands::backup::{BackupOptions, run_backup};
     use crate::fs::LocalFS;
+    use sha2::Digest;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -897,6 +972,14 @@ mod tests {
         assert!(batch.deleted.contains("deleted.txt"));
         assert!(batch.created.contains("replaced.txt"));
         assert!(batch.changed.is_empty());
+        assert_eq!(
+            batch.affected_paths(),
+            BTreeSet::from([
+                "created.txt".to_string(),
+                "deleted.txt".to_string(),
+                "replaced.txt".to_string(),
+            ])
+        );
     }
 
     #[test]
@@ -931,6 +1014,78 @@ mod tests {
             root,
             &patterns
         ));
+    }
+
+    #[tokio::test]
+    async fn live_backup_processes_only_paths_from_the_change_batch() {
+        let fixture = temporary_directory();
+        let source = fixture.join("machine");
+        let storage = fixture.join("storage");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("changed.txt"), b"before").unwrap();
+        std::fs::write(source.join("untouched.txt"), b"untouched").unwrap();
+
+        let options = BackupOptions {
+            key: "project".to_string(),
+            root_path_string: source.to_string_lossy().to_string(),
+            storage: "test".to_string(),
+            fs: Arc::new(LocalFS::new(&storage)),
+            author: "tester <tester@example.com>".to_string(),
+            compress: 3,
+            password: None,
+            chunk_size: 1024,
+            ignore_patterns: Vec::new(),
+            concurrency: 1,
+        };
+        let initial = run_backup(options.clone(), "[LIVE] initial".to_string(), None, None)
+            .await
+            .unwrap();
+        let untouched = initial.backup.tree["untouched.txt"].clone();
+        let resolved = ResolvedBackup {
+            options,
+            message: String::new(),
+            parent_hash: None,
+            pending_backup: None,
+            live_debounce_ms: 300,
+            live_poll_ms: 2_000,
+        };
+        let mut state = LiveState {
+            version: 1,
+            initialized: true,
+            base_backup: Some(initial.backup.hash),
+        };
+
+        let unchanged_event = synchronize_live_with_paths(
+            &resolved,
+            &mut state,
+            Some("[LIVE] unchanged event".to_string()),
+            Some(ConflictPolicy::Local),
+            Some(BTreeSet::from(["changed.txt".to_string()])),
+        )
+        .await
+        .unwrap();
+        assert!(unchanged_event.backup.is_none());
+
+        std::fs::write(source.join("changed.txt"), b"after").unwrap();
+        let outcome = synchronize_live_with_paths(
+            &resolved,
+            &mut state,
+            Some("[LIVE] changed".to_string()),
+            Some(ConflictPolicy::Local),
+            Some(BTreeSet::from(["changed.txt".to_string()])),
+        )
+        .await
+        .unwrap();
+
+        let backup = outcome.backup.expect("live should publish a backup");
+        assert_eq!(backup.files_total, 1);
+        assert_eq!(backup.backup.tree["untouched.txt"].chunks, untouched.chunks);
+        assert_eq!(
+            backup.backup.tree["changed.txt"].hash,
+            format!("{:x}", sha2::Sha256::digest(b"after"))
+        );
+
+        let _ = std::fs::remove_dir_all(fixture);
     }
 
     #[tokio::test]

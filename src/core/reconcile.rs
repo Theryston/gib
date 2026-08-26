@@ -31,6 +31,7 @@ pub(crate) struct ReconcileConflict {
 pub(crate) struct ReconciliationResult {
     pub(crate) applied_remote: usize,
     pub(crate) merged_text: usize,
+    pub(crate) local_changes: BTreeSet<String>,
     pub(crate) conflicts: Vec<ReconcileConflict>,
 }
 
@@ -129,6 +130,7 @@ pub(crate) async fn reconcile_worktree(
         }
 
         if backup_matches_backup(remote_file, base_file) {
+            result.local_changes.insert(path.clone());
             continue;
         }
 
@@ -165,12 +167,14 @@ pub(crate) async fn reconcile_worktree(
                     {
                         write_bytes_atomically(root, &path, &merged, local_file.permissions)?;
                         result.merged_text += 1;
+                        result.local_changes.insert(path.clone());
                         continue;
                     }
                 }
             }
         }
 
+        result.local_changes.insert(path.clone());
         result.conflicts.push(ReconcileConflict {
             path,
             reason: conflict_reason(local_file, base_file, remote_file),
@@ -288,6 +292,111 @@ pub(crate) fn worktree_matches_backup(
             .get(path)
             .is_some_and(|remote| local_matches_backup(Some(local_file), Some(remote)))
     }))
+}
+
+pub(crate) fn worktree_matches_backup_paths(
+    root: &Path,
+    ignore_patterns: &[String],
+    backup: &Backup,
+    changed_paths: &BTreeSet<String>,
+) -> Result<bool, String> {
+    let scopes = changed_paths
+        .iter()
+        .map(|path| {
+            let target = root.join(path);
+            (path.trim_matches('/').to_string(), !target.is_file())
+        })
+        .collect::<Vec<_>>();
+    let local = scan_worktree_scopes(root, ignore_patterns, &scopes)?;
+    let expected: HashMap<String, &BackupObject> = backup
+        .tree
+        .iter()
+        .filter(|(path, _)| {
+            !is_ignored_relative(path, ignore_patterns)
+                && scopes
+                    .iter()
+                    .any(|(scope, recursive)| path_in_scope(path, scope, *recursive))
+        })
+        .map(|(path, object)| (path.clone(), object))
+        .collect();
+
+    if local.len() != expected.len() {
+        return Ok(false);
+    }
+
+    Ok(local.iter().all(|(path, local_file)| {
+        expected
+            .get(path)
+            .is_some_and(|remote| local_matches_backup(Some(local_file), Some(remote)))
+    }))
+}
+
+fn scan_worktree_scopes(
+    root: &Path,
+    ignore_patterns: &[String],
+    scopes: &[(String, bool)],
+) -> Result<HashMap<String, LocalFile>, String> {
+    let mut files = HashMap::new();
+
+    for (scope, recursive) in scopes {
+        let target = root.join(scope);
+        if target.is_file() {
+            if is_ignored_path(&target, root, ignore_patterns) {
+                continue;
+            }
+            insert_local_file(&mut files, root, &target)?;
+            continue;
+        }
+
+        if !*recursive || !target.is_dir() {
+            continue;
+        }
+
+        let walker = WalkDir::new(&target)
+            .into_iter()
+            .filter_entry(|entry| !is_ignored_path(entry.path(), root, ignore_patterns));
+        for entry in walker {
+            let entry = entry.map_err(|error| {
+                format!("Failed to scan live root '{}': {}", root.display(), error)
+            })?;
+            if entry.file_type().is_file() {
+                insert_local_file(&mut files, root, entry.path())?;
+            }
+        }
+    }
+
+    Ok(files)
+}
+
+fn insert_local_file(
+    files: &mut HashMap<String, LocalFile>,
+    root: &Path,
+    path: &Path,
+) -> Result<(), String> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|error| format!("Failed to derive a relative path: {}", error))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let metadata = path
+        .metadata()
+        .map_err(|error| format!("Failed to inspect '{}': {}", relative, error))?;
+    let hash =
+        hash_file(path).map_err(|error| format!("Failed to hash '{}': {}", relative, error))?;
+
+    files.insert(
+        relative,
+        LocalFile {
+            hash,
+            size: metadata.len(),
+            permissions: get_file_permissions_with_path(&metadata, path.to_string_lossy().as_ref()),
+        },
+    );
+    Ok(())
+}
+
+fn path_in_scope(path: &str, scope: &str, recursive: bool) -> bool {
+    path == scope || (recursive && path.starts_with(&format!("{}/", scope)))
 }
 
 fn local_matches_backup(local: Option<&LocalFile>, backup: Option<&BackupObject>) -> bool {
