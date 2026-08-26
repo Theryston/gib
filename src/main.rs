@@ -497,6 +497,12 @@ fn cli() -> Command {
                         ),
                 )
                 .subcommand(
+                    Command::new("logs")
+                        .visible_alias("log")
+                        .about("Follow an autostart job's runtime logs")
+                        .arg(Arg::new("name").value_name("NAME").required(true)),
+                )
+                .subcommand(
                     Command::new("run")
                         .about("Run one registered live job")
                         .hide(true)

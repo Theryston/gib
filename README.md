@@ -551,10 +551,20 @@ gib autostart add \
 
 gib autostart update work-project --conflict local
 gib autostart status work-project
+gib autostart logs work-project
 gib autostart disable work-project
 gib autostart enable work-project
 gib autostart remove work-project --yes
 ```
+
+`autostart logs NAME` follows the job's runtime log in real time and includes
+entries already written before the command started. Press `Ctrl+C` to stop
+following. The active JSONL path remains stable while the logger rotates older
+files to `.1`, `.2`, and `.3`; the command follows the new active file
+automatically. Use `autostart log NAME` as a shorter alias. In JSON mode, the
+stream emits `autostart` events with `log_following`, `log_entry`, and
+`log_following_stopped` event names; each `log_entry` contains the original
+log record in its `entry` field.
 
 `add` and `update` accept the live backup options (`--message`, `--compress`,
 `--chunk-size`, `--ignore`, and `--concurrency`). A job's effective identity is

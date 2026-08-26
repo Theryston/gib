@@ -1,10 +1,11 @@
+use crate::autostart::logs::LogFollower;
 use crate::autostart::model::{
     AUTOSTART_JOB_VERSION, AutostartJob, LiveJobOverrides, SecretReferences, validate_name,
 };
 use crate::autostart::platform::{self, PlatformStatus};
 use crate::autostart::registry::{
-    RegistryPaths, ensure_registry, find_job_by_name, generate_job_id, list_jobs, registry_paths,
-    remove_job, touch_updated_at, write_job,
+    RegistryPaths, ensure_registry, find_job_by_name, generate_job_id, list_jobs, log_path,
+    registry_paths, remove_job, touch_updated_at, write_job,
 };
 use crate::autostart::runner;
 use crate::commands::backup::{LiveOverrides, resolve_live_overrides};
@@ -19,6 +20,7 @@ use dialoguer::{Confirm, Input, Password, Select};
 use serde_json::{Value, json};
 use std::env;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub async fn autostart(matches: &ArgMatches) {
     let result = match matches.subcommand() {
@@ -29,6 +31,7 @@ pub async fn autostart(matches: &ArgMatches) {
         Some(("enable", matches)) => enable(matches),
         Some(("disable", matches)) => disable(matches),
         Some(("remove", matches)) => remove(matches),
+        Some(("logs", matches)) => follow_logs(matches).await,
         Some(("run", matches)) => match matches.get_one::<String>("job-id") {
             Some(job_id) => runner::run(job_id).await,
             None => Err("Missing required autostart job ID".to_string()),
@@ -41,6 +44,77 @@ pub async fn autostart(matches: &ArgMatches) {
 
     if let Err(error) = result {
         handle_error(error, None);
+    }
+}
+
+async fn follow_logs(matches: &ArgMatches) -> Result<(), String> {
+    let paths = registry_paths()?;
+    ensure_registry(&paths)?;
+    let name = required_name(matches)?;
+    let job = find_job_by_name(&paths, &name)?
+        .ok_or_else(|| format!("Autostart job '{}' was not found", name))?;
+    let log = log_path(&paths, &job.id)?;
+    let mut follower = LogFollower::new(log.clone());
+
+    if is_json_mode() {
+        emit_named_event(
+            "autostart",
+            &json!({
+                "event": "log_following",
+                "id": job.id,
+                "name": job.name,
+                "log_path": log,
+            }),
+        );
+    } else {
+        println!(
+            "Following autostart logs for '{}' (press Ctrl+C to stop): {}",
+            job.name,
+            log.display()
+        );
+    }
+
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    loop {
+        for line in follower.read_available().await? {
+            if is_json_mode() {
+                let entry = serde_json::from_str::<Value>(&line)
+                    .unwrap_or_else(|_| Value::String(line.clone()));
+                emit_named_event(
+                    "autostart",
+                    &json!({
+                        "event": "log_entry",
+                        "id": job.id,
+                        "name": job.name,
+                        "log_path": log,
+                        "entry": entry,
+                    }),
+                );
+            } else {
+                println!("{}", line);
+            }
+        }
+
+        tokio::select! {
+            result = &mut ctrl_c => {
+                result.map_err(|error| format!("Failed to listen for Ctrl+C: {}", error))?;
+                if is_json_mode() {
+                    emit_named_event(
+                        "autostart",
+                        &json!({
+                            "event": "log_following_stopped",
+                            "id": job.id,
+                            "name": job.name,
+                            "log_path": log,
+                            "reason": "interrupted",
+                        }),
+                    );
+                }
+                return Ok(());
+            }
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
     }
 }
 
