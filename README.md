@@ -1,7 +1,7 @@
 <h1 align="center">GIB</h1>
 
 <p align="center">
-  <strong>⚡ A blazingly fast, modern backup tool with versioning, deduplication, and encryption.</strong>
+  <strong>⚡ A blazingly fast, modern backup tool with versioning, deduplication, and encryption!</strong>
 </p>
 
 <p align="center">
