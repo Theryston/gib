@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 
 pub(crate) fn password_reference(job_id: &str) -> String {

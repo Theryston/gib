@@ -14,9 +14,7 @@ struct FileIdentity {
     #[cfg(unix)]
     inode: u64,
     #[cfg(windows)]
-    volume_serial_number: u32,
-    #[cfg(windows)]
-    file_index: u64,
+    creation_time: u64,
 }
 
 struct DrainResult {
@@ -266,8 +264,7 @@ fn file_identity(metadata: &Metadata) -> Option<FileIdentity> {
         use std::os::windows::fs::MetadataExt;
 
         Some(FileIdentity {
-            volume_serial_number: metadata.volume_serial_number()?,
-            file_index: metadata.file_index(),
+            creation_time: metadata.creation_time(),
         })
     }
 
