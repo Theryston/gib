@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.30](https://github.com/Theryston/gib/compare/v0.0.29...v0.0.30) - 2026-08-26
+
+### Added
+
+- improve explorer status display with user-friendly wording
+- rank search results by relevance and support partial token matches
+- mark restorable deleted directories in explorer navigation
+- support parentless snapshot correction in read-only catalog
+- add explore command for browsing historical catalog
+
 ## [0.0.29](https://github.com/Theryston/gib/compare/v0.0.28...v0.0.29) - 2026-08-26
 
 ### Added
