@@ -30,6 +30,7 @@ pub(crate) struct ExplorerNavigator {
     password: Option<String>,
     current_snapshot: Option<CurrentSnapshot>,
     directories: HashMap<(String, ExplorerScope), LoadedDirectory>,
+    restorable_directories: HashMap<(String, ExplorerScope), bool>,
     entry_details: HashMap<String, EntryHistory>,
 }
 
@@ -41,6 +42,7 @@ impl ExplorerNavigator {
             password,
             current_snapshot: None,
             directories: HashMap::new(),
+            restorable_directories: HashMap::new(),
             entry_details: HashMap::new(),
         }
     }
@@ -52,6 +54,7 @@ impl ExplorerNavigator {
 
     pub(crate) fn clear_cache(&mut self) {
         self.directories.clear();
+        self.restorable_directories.clear();
         self.entry_details.clear();
     }
 
@@ -105,22 +108,29 @@ impl ExplorerNavigator {
         .await?;
         let mut new_entries = Vec::with_capacity(catalog_page.items.len());
         for child in catalog_page.items {
-            let child_path = if path.is_empty() {
-                child.name.clone()
+            let child_path = child_path(&path, &child.name);
+            let kind = ExplorerKind::from_catalog(child.kind);
+            let restorable = if kind == ExplorerKind::Directory {
+                self.directory_is_restorable(
+                    &child_path,
+                    scope,
+                    child.exists_in_latest_indexed_snapshot,
+                )
+                .await?
             } else {
-                format!("{}/{}", path, child.name)
+                false
             };
             let entry = ExplorerEntry {
                 entry_id: child.target_id,
                 path: child_path,
                 name: child.name,
-                kind: ExplorerKind::from_catalog(child.kind),
+                kind,
                 status: if child.exists_in_latest_indexed_snapshot {
                     ExplorerStatus::Current
                 } else {
                     ExplorerStatus::Deleted
                 },
-                restorable: false,
+                restorable,
                 last_backup: None,
                 latest_revision_id: None,
                 size: None,
@@ -150,6 +160,94 @@ impl ExplorerNavigator {
             entries: Vec::new(),
             next_cursor: None,
         }))
+    }
+
+    async fn directory_is_restorable(
+        &mut self,
+        path: &str,
+        scope: ExplorerScope,
+        current: bool,
+    ) -> Result<bool, String> {
+        let path = normalize_relative_path(path)?;
+        let cache_key = (path.clone(), scope);
+        if let Some(restorable) = self.restorable_directories.get(&cache_key) {
+            return Ok(*restorable);
+        }
+
+        // The catalog already tracks whether a directory contains a current
+        // file. This is the common case and avoids traversing a large current
+        // subtree just to render its parent row.
+        if current {
+            self.restorable_directories.insert(cache_key, true);
+            return Ok(true);
+        }
+
+        if scope == ExplorerScope::Current {
+            self.restorable_directories.insert(cache_key, false);
+            return Ok(false);
+        }
+
+        // Deleted directories do not have a single revision of their own.
+        // They are restorable when at least one historical file below them has
+        // a restorable revision. Walk metadata only; file chunks are never
+        // downloaded for this display calculation.
+        let mut pending_directories = vec![path.clone()];
+        while let Some(directory_path) = pending_directories.pop() {
+            let mut cursor = None;
+            loop {
+                let page = list_directory_children_with_snapshot(
+                    Arc::clone(&self.fs),
+                    self.key.clone(),
+                    self.password.clone(),
+                    &directory_path,
+                    scope.catalog_scope(),
+                    cursor.as_deref(),
+                    DIRECTORY_PAGE_SIZE,
+                    self.current_snapshot.as_ref(),
+                )
+                .await?;
+                let next_cursor = page.next_cursor.clone();
+
+                for child in page.items {
+                    let child_path = child_path(&directory_path, &child.name);
+                    match ExplorerKind::from_catalog(child.kind) {
+                        ExplorerKind::File => {
+                            let entry = ExplorerEntry {
+                                entry_id: child.target_id,
+                                path: child_path,
+                                name: child.name,
+                                kind: ExplorerKind::File,
+                                status: ExplorerStatus::Deleted,
+                                restorable: false,
+                                last_backup: None,
+                                latest_revision_id: None,
+                                size: None,
+                                content_type: None,
+                                permissions: None,
+                                newest_revision_timestamp: None,
+                            };
+                            if self
+                                .entry_details(&entry)
+                                .await?
+                                .is_some_and(|entry| entry.restorable)
+                            {
+                                self.restorable_directories.insert(cache_key, true);
+                                return Ok(true);
+                            }
+                        }
+                        ExplorerKind::Directory => pending_directories.push(child_path),
+                    }
+                }
+
+                match next_cursor {
+                    Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
+                    _ => break,
+                }
+            }
+        }
+
+        self.restorable_directories.insert(cache_key, false);
+        Ok(false)
     }
 
     pub(crate) async fn ensure_directory(
@@ -370,6 +468,14 @@ impl ExplorerNavigator {
     }
 }
 
+fn child_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
 fn entry_from_summary(summary: CatalogEntrySummary) -> Option<ExplorerEntry> {
     if summary
         .latest_restorable_backup
@@ -471,13 +577,17 @@ mod tests {
             1,
             HashMap::from([
                 ("current.txt".to_string(), object("current-one")),
+                ("current/nested.txt".to_string(), object("nested-one")),
                 ("old/old.txt".to_string(), object("old-one")),
             ]),
         );
         let mut second = backup(
             "backup-two",
             2,
-            HashMap::from([("current.txt".to_string(), object("current-two"))]),
+            HashMap::from([
+                ("current.txt".to_string(), object("current-two")),
+                ("current/nested.txt".to_string(), object("nested-one")),
+            ]),
         );
         second.parents = vec![first.hash.clone()];
         write_manifest(&fs, key, &first).await;
@@ -517,13 +627,29 @@ mod tests {
             .unwrap();
         assert_eq!(old_directory.kind, ExplorerKind::Directory);
         assert_eq!(old_directory.status, ExplorerStatus::Deleted);
+        assert!(old_directory.restorable);
         assert!(navigator.directory_exists("old").await.unwrap());
+
+        let current_directory = all_history
+            .entries
+            .iter()
+            .find(|entry| entry.path == "current")
+            .unwrap();
+        assert_eq!(current_directory.status, ExplorerStatus::Current);
+        assert!(current_directory.restorable);
 
         let current = navigator
             .ensure_directory("", ExplorerScope::Current)
             .await
             .unwrap();
         assert!(current.entries.iter().all(|entry| entry.path != "old"));
+        assert!(
+            current
+                .entries
+                .iter()
+                .find(|entry| entry.path == "current")
+                .is_some_and(|entry| entry.restorable)
+        );
 
         let old_file = navigator
             .ensure_directory("old", ExplorerScope::AllHistory)
