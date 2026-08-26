@@ -545,9 +545,9 @@ fn cli() -> Command {
                         .about("Add a new storage")
                         .arg(arg!(-n --name <NAME> "The name of the storage").required(false))
                         .arg(
-                            arg!(-t --type <TYPE> "The type of the storage ('local' or 's3')")
+                            arg!(-t --type <TYPE> "The type of the storage ('local', 's3', or 'webdav')")
                                 .required(false)
-                                .value_parser(["local", "s3"]),
+                                .value_parser(["local", "s3", "webdav"]),
                         )
                         .arg(arg!(-p --path <PATH> "The path for storing backups (only for local storage)").required(false))
                         .arg(arg!(-r --region <REGION> "The region for the S3 storage (only for S3 storage)").required(false))
@@ -569,6 +569,27 @@ fn cli() -> Command {
                                 .required(false),
                         )
                         .arg(arg!(-e --endpoint <ENDPOINT> "The endpoint for the S3 storage (only for S3 storage)").required(false))
+                        .arg(
+                            Arg::new("url")
+                                .long("url")
+                                .value_name("URL")
+                                .help("The HTTP or HTTPS collection URL for WebDAV storage (only for WebDAV storage)")
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("username")
+                                .long("username")
+                                .value_name("USERNAME")
+                                .help("The WebDAV username (only for WebDAV storage)")
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("password")
+                                .long("password")
+                                .value_name("PASSWORD")
+                                .help("The WebDAV app password (only for WebDAV storage)")
+                                .required(false),
+                        )
                 )
                 .subcommand(
                     Command::new("list")
@@ -649,9 +670,7 @@ async fn main() {
         },
         Some(("restore", matches)) => commands::restore(matches).await,
         Some(("storage", matches)) => match matches.subcommand() {
-            Some(("add", matches)) => {
-                commands::storage::add(matches);
-            }
+            Some(("add", matches)) => commands::storage::add(matches).await,
             Some(("list", _)) => {
                 commands::storage::list();
             }

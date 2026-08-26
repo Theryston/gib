@@ -611,6 +611,9 @@ fn local_storage_for(storage_path: &Path) -> Storage {
         access_key: None,
         secret_key: None,
         endpoint: None,
+        url: None,
+        username: None,
+        password: None,
     }
 }
 

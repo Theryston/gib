@@ -36,6 +36,10 @@ chrono = "0.4.43"
 num_cpus = "1.17.0"
 notify = "8.2.0"
 toml = "0.8.23"
+percent-encoding = "2.3.1"
+quick-xml = "0.37.5"
+reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls"] }
+url = "2.5.7"
 
 [profile.release]
 opt-level = 3

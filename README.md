@@ -114,11 +114,13 @@ derivation:
 
 ### ☁️ Direct Cloud Upload (Zero Disk Overhead)
 
-Upload directly to **S3-compatible storage** without writing temporary files:
+Upload directly to **S3-compatible or WebDAV storage** without writing
+temporary files:
 
 - No need for 2x disk space
 - Stream chunks directly to the cloud
-- Works with AWS S3, MinIO, Backblaze B2, Cloudflare R2, and more
+- Works with AWS S3, MinIO, Backblaze B2, Cloudflare R2, Nextcloud, ownCloud,
+  Synology, QNAP, and more
 
 ### 💾 Local & Remote Storage
 
@@ -126,6 +128,8 @@ Choose where your backups live:
 
 - **Local**: Any folder on your filesystem (support smb:// folders)
 - **S3**: Any S3-compatible object storage
+- **WebDAV**: Any HTTP or HTTPS WebDAV collection, including Nextcloud, ownCloud,
+  Synology, and QNAP, without mounting it locally
 
 ### 🔒 File Permissions Preserved
 
@@ -223,6 +227,29 @@ gib storage add --name cloud \
   --access-key YOUR_ACCESS_KEY \
   --secret-key YOUR_SECRET_KEY
 ```
+
+**WebDAV storage:**
+
+```bash
+gib storage add --name home-cloud \
+  --type webdav \
+  --url https://cloud.example.com/remote.php/dav/files/theryston/gib-backups/ \
+  --username theryston \
+  --password YOUR_APP_PASSWORD
+```
+
+WebDAV storage uses Basic authentication with the configured username and app
+password. Both HTTP and HTTPS collection URLs are accepted; use HTTPS whenever
+the connection is not otherwise protected because Basic authentication sends
+credentials with each request. GIB validates the collection with a read-only
+request before saving the storage. The URL is normalized to one trailing slash
+and the remote collection is used directly; no local mount or temporary
+repository copy is required.
+
+The WebDAV server must expose usable ETags and honor conditional PUT requests
+for concurrent repository updates. GIB reports a clear unsupported-server
+error when a file has no ETag and treats a failed precondition as a
+concurrent-write conflict.
 
 ### 4. Create your first backup
 
@@ -650,8 +677,11 @@ gib uses industry-standard cryptography:
   attacks
 - **SHA-256**: For content-addressable storage and integrity verification
 
-Your password is used to derive an encryption key locally. The password itself
-is never stored or transmitted.
+The repository encryption password is used to derive an encryption key locally;
+it is never stored or transmitted. A WebDAV app password is a separate
+transport credential: it is stored with the local WebDAV storage configuration
+and sent only over the configured HTTP or HTTPS connection. Prefer HTTPS so
+the transport credential is encrypted in transit.
 
 ---
 
@@ -693,8 +723,8 @@ is never stored or transmitted.
                |
                v
 +-------------------------------+
-| Upload to Storage (Local/S3)  |
-| (streamed, no temp files)     |
+| Upload to Storage             |
+| (Local/S3/WebDAV, no temp)    |
 +-------------------------------+
 ```
 

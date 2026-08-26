@@ -1,5 +1,7 @@
-use crate::commands::storage::add::Storage;
-use crate::fs::{FS, LocalFS, S3FS, S3FSConfig};
+use crate::commands::storage::add::{
+    LOCAL_STORAGE_TYPE, S3_STORAGE_TYPE, Storage, WEBDAV_STORAGE_TYPE,
+};
+use crate::fs::{FS, LocalFS, S3FS, S3FSConfig, WebDavFS, WebDavFSConfig};
 use argon2::Argon2;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
@@ -122,14 +124,30 @@ pub fn handle_error(error: String, pb: Option<&ProgressBar>) -> ! {
 
 pub fn get_fs(storage: &Storage, pb: Option<&ProgressBar>) -> Arc<dyn FS> {
     let fs: Arc<dyn FS> = match storage.storage_type {
-        0 => Arc::new(LocalFS::new(storage.path.as_ref().unwrap().clone())),
-        1 => Arc::new(S3FS::new(S3FSConfig {
+        LOCAL_STORAGE_TYPE => Arc::new(LocalFS::new(storage.path.as_ref().unwrap().clone())),
+        S3_STORAGE_TYPE => Arc::new(S3FS::new(S3FSConfig {
             region: storage.region.clone(),
             bucket: storage.bucket.clone(),
             access_key: storage.access_key.clone(),
             secret_key: storage.secret_key.clone(),
             endpoint: storage.endpoint.clone(),
         })),
+        WEBDAV_STORAGE_TYPE => {
+            let config = WebDavFSConfig {
+                url: storage
+                    .url
+                    .clone()
+                    .unwrap_or_else(|| handle_error("WebDAV storage has no URL".to_string(), pb)),
+                username: storage.username.clone().unwrap_or_else(|| {
+                    handle_error("WebDAV storage has no username".to_string(), pb)
+                }),
+                password: storage.password.clone().unwrap_or_else(|| {
+                    handle_error("WebDAV storage has no password".to_string(), pb)
+                }),
+            };
+            let webdav = WebDavFS::new(config).unwrap_or_else(|error| handle_error(error, pb));
+            Arc::new(webdav)
+        }
         _ => handle_error("Invalid storage type".to_string(), pb),
     };
 

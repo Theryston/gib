@@ -1,3 +1,4 @@
+use crate::commands::storage::add::{LOCAL_STORAGE_TYPE, S3_STORAGE_TYPE, WEBDAV_STORAGE_TYPE};
 use crate::output::{emit_output, is_json_mode};
 use crate::utils::{get_storage, handle_error};
 use dirs::home_dir;
@@ -39,20 +40,26 @@ pub fn list() {
         let storage = get_storage(storage_name);
 
         let storage_type = match storage.storage_type {
-            0 => "local",
-            1 => "s3",
+            LOCAL_STORAGE_TYPE => "local",
+            S3_STORAGE_TYPE => "s3",
+            WEBDAV_STORAGE_TYPE => "webdav",
             _ => "unknown",
         };
 
         let details = match storage.storage_type {
-            0 => format!("path: {}", storage.path.clone().unwrap_or_default()),
-            1 => format!(
+            LOCAL_STORAGE_TYPE => format!("path: {}", storage.path.clone().unwrap_or_default()),
+            S3_STORAGE_TYPE => format!(
                 "region: {}, bucket: {}, access_key: {}, secret_key: {}, endpoint: {}",
                 storage.region.clone().unwrap_or_default(),
                 storage.bucket.clone().unwrap_or_default(),
                 "********",
                 "********",
                 storage.endpoint.clone().unwrap_or_default()
+            ),
+            WEBDAV_STORAGE_TYPE => format!(
+                "url: {}, username: {}, password: ********",
+                storage.url.clone().unwrap_or_default(),
+                storage.username.clone().unwrap_or_default(),
             ),
             _ => "unknown".to_string(),
         };
@@ -70,6 +77,8 @@ pub fn list() {
             region: storage.region,
             bucket: storage.bucket,
             endpoint: storage.endpoint,
+            url: storage.url,
+            username: storage.username,
         });
     }
 
@@ -89,4 +98,6 @@ struct StorageInfo {
     region: Option<String>,
     bucket: Option<String>,
     endpoint: Option<String>,
+    url: Option<String>,
+    username: Option<String>,
 }

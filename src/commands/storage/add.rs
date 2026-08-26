@@ -1,16 +1,21 @@
 use clap::ArgMatches;
-use dialoguer::{Input, Select};
+use dialoguer::{Input, Password, Select};
 use dirs::home_dir;
 use indicatif::{ProgressBar, ProgressStyle};
 use rmp_serde::Serializer;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::time::Duration;
+use std::{fmt, path::Path};
 
+use crate::fs::{WebDavFS, WebDavFSConfig};
 use crate::output::{JsonProgress, emit_output, is_json_mode};
 use crate::utils::handle_error;
 
-#[derive(Debug, PartialEq, Deserialize, Serialize)]
+pub const LOCAL_STORAGE_TYPE: u8 = 0;
+pub const S3_STORAGE_TYPE: u8 = 1;
+pub const WEBDAV_STORAGE_TYPE: u8 = 2;
+
+#[derive(PartialEq, Deserialize, Serialize)]
 pub struct Storage {
     pub storage_type: u8,
     pub path: Option<String>,
@@ -19,9 +24,39 @@ pub struct Storage {
     pub access_key: Option<String>,
     pub secret_key: Option<String>,
     pub endpoint: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
-pub fn add(matches: &ArgMatches) {
+impl fmt::Debug for Storage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Storage")
+            .field("storage_type", &self.storage_type)
+            .field("path", &self.path)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field(
+                "access_key",
+                &self.access_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "secret_key",
+                &self.secret_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("endpoint", &self.endpoint)
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
+}
+
+pub async fn add(matches: &ArgMatches) {
     let name = matches.get_one::<String>("name").map_or_else(
         || {
             if is_json_mode() {
@@ -64,7 +99,7 @@ pub fn add(matches: &ArgMatches) {
             let selected_storage_type: u8 = Select::new()
                 .with_prompt("Enter the type of the storage")
                 .default(0)
-                .items(&["local", "s3"])
+                .items(&["local", "s3", "webdav"])
                 .interact()
                 .unwrap_or_else(|e| {
                     handle_error(format!("Error: {}", e), None);
@@ -72,8 +107,9 @@ pub fn add(matches: &ArgMatches) {
             selected_storage_type
         },
         |storage_type| match storage_type.as_str() {
-            "local" => 0u8,
-            "s3" => 1u8,
+            "local" => LOCAL_STORAGE_TYPE,
+            "s3" => S3_STORAGE_TYPE,
+            "webdav" => WEBDAV_STORAGE_TYPE,
             _ => {
                 handle_error(format!("Unknown storage type '{}'", storage_type), None);
             }
@@ -88,9 +124,12 @@ pub fn add(matches: &ArgMatches) {
         access_key: None,
         secret_key: None,
         endpoint: None,
+        url: None,
+        username: None,
+        password: None,
     };
 
-    if storage_type == 0 {
+    if storage_type == LOCAL_STORAGE_TYPE {
         let path = matches.get_one::<String>("path").map_or_else(
             || {
                 if is_json_mode() {
@@ -116,7 +155,7 @@ pub fn add(matches: &ArgMatches) {
         }
 
         storage.path = Some(path);
-    } else {
+    } else if storage_type == S3_STORAGE_TYPE {
         let region = matches.get_one::<String>("region").map_or_else(
             || {
                 if is_json_mode() {
@@ -218,6 +257,73 @@ pub fn add(matches: &ArgMatches) {
         storage.access_key = Some(access_key);
         storage.secret_key = Some(secret_key);
         storage.endpoint = Some(endpoint);
+    } else {
+        let url = matches.get_one::<String>("url").map_or_else(
+            || {
+                if is_json_mode() {
+                    handle_error(
+                        "Missing required argument: --url (required in --mode json)".to_string(),
+                        None,
+                    );
+                }
+                Input::<String>::new()
+                    .with_prompt("Enter the WebDAV collection URL")
+                    .interact_text()
+                    .unwrap_or_else(|e| handle_error(format!("Error: {}", e), None))
+            },
+            |url| url.to_string(),
+        );
+
+        let username = matches.get_one::<String>("username").map_or_else(
+            || {
+                if is_json_mode() {
+                    handle_error(
+                        "Missing required argument: --username (required in --mode json)"
+                            .to_string(),
+                        None,
+                    );
+                }
+                Input::<String>::new()
+                    .with_prompt("Enter the WebDAV username")
+                    .interact_text()
+                    .unwrap_or_else(|e| handle_error(format!("Error: {}", e), None))
+            },
+            |username| username.to_string(),
+        );
+
+        let password = matches.get_one::<String>("password").map_or_else(
+            || {
+                if is_json_mode() {
+                    handle_error(
+                        "Missing required argument: --password (required in --mode json)"
+                            .to_string(),
+                        None,
+                    );
+                }
+                Password::new()
+                    .with_prompt("Enter the WebDAV app password")
+                    .interact()
+                    .unwrap_or_else(|e| handle_error(format!("Error: {}", e), None))
+            },
+            |password| password.to_string(),
+        );
+
+        let webdav = WebDavFS::new(WebDavFSConfig {
+            url,
+            username: username.clone(),
+            password: password.clone(),
+        })
+        .unwrap_or_else(|error| handle_error(error, None));
+        webdav.validate_root().await.unwrap_or_else(|error| {
+            handle_error(
+                format!("Failed to validate WebDAV storage: {}", error),
+                None,
+            )
+        });
+
+        storage.url = Some(webdav.normalized_url().to_string());
+        storage.username = Some(username);
+        storage.password = Some(password);
     }
 
     let json_progress = if is_json_mode() {
@@ -271,11 +377,14 @@ pub fn add(matches: &ArgMatches) {
             region: Option<String>,
             bucket: Option<String>,
             endpoint: Option<String>,
+            url: Option<String>,
+            username: Option<String>,
         }
 
         let storage_type_label = match storage.storage_type {
-            0 => "local",
-            1 => "s3",
+            LOCAL_STORAGE_TYPE => "local",
+            S3_STORAGE_TYPE => "s3",
+            WEBDAV_STORAGE_TYPE => "webdav",
             _ => "unknown",
         };
 
@@ -286,6 +395,8 @@ pub fn add(matches: &ArgMatches) {
             region: storage.region,
             bucket: storage.bucket,
             endpoint: storage.endpoint,
+            url: storage.url,
+            username: storage.username,
         };
         emit_output(&payload);
     } else {
@@ -294,5 +405,67 @@ pub fn add(matches: &ArgMatches) {
         pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
         pb.set_prefix("OK");
         pb.finish_with_message(format!("Storage written ({:.2?})", elapsed));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Serialize)]
+    struct LegacyStorage {
+        storage_type: u8,
+        path: Option<String>,
+        region: Option<String>,
+        bucket: Option<String>,
+        access_key: Option<String>,
+        secret_key: Option<String>,
+        endpoint: Option<String>,
+    }
+
+    #[test]
+    fn reads_storage_written_before_webdav_fields_existed() {
+        let legacy = LegacyStorage {
+            storage_type: LOCAL_STORAGE_TYPE,
+            path: Some("/tmp/backups".to_string()),
+            region: None,
+            bucket: None,
+            access_key: None,
+            secret_key: None,
+            endpoint: None,
+        };
+        let mut encoded = Vec::new();
+        legacy
+            .serialize(&mut Serializer::new(&mut encoded))
+            .expect("legacy storage should serialize");
+
+        let storage: Storage =
+            rmp_serde::from_slice(&encoded).expect("legacy storage should deserialize");
+        assert_eq!(storage.storage_type, LOCAL_STORAGE_TYPE);
+        assert_eq!(storage.path.as_deref(), Some("/tmp/backups"));
+        assert!(storage.url.is_none());
+        assert!(storage.username.is_none());
+        assert!(storage.password.is_none());
+    }
+
+    #[test]
+    fn storage_debug_redacts_all_secret_values() {
+        let storage = Storage {
+            storage_type: WEBDAV_STORAGE_TYPE,
+            path: None,
+            region: None,
+            bucket: None,
+            access_key: Some("access-secret".to_string()),
+            secret_key: Some("s3-secret".to_string()),
+            endpoint: None,
+            url: Some("https://example.test/dav/".to_string()),
+            username: Some("theryston".to_string()),
+            password: Some("webdav-secret".to_string()),
+        };
+        let rendered = format!("{storage:?}");
+        assert!(!rendered.contains("access-secret"));
+        assert!(!rendered.contains("s3-secret"));
+        assert!(!rendered.contains("webdav-secret"));
+        assert!(rendered.contains("[redacted]"));
     }
 }

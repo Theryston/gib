@@ -1,5 +1,5 @@
 use super::local::LocalConfigContext;
-use crate::commands::storage::add::Storage;
+use crate::commands::storage::add::{LOCAL_STORAGE_TYPE, Storage, WEBDAV_STORAGE_TYPE};
 use crate::core::crypto::get_password;
 use crate::fs::FS;
 use crate::output::{emit_named_event, is_json_mode};
@@ -140,11 +140,22 @@ pub(crate) fn resolve_repository_values(
     }
 
     let storage_config = load_storage_config(&storage_dir, &storage)?;
-    if storage_config.storage_type == 0 && storage_config.path.is_none() {
+    if storage_config.storage_type == LOCAL_STORAGE_TYPE && storage_config.path.is_none() {
         return Err(format!("Local storage '{}' has no path", storage));
     }
-    if storage_config.storage_type > 1 {
+    if storage_config.storage_type > WEBDAV_STORAGE_TYPE {
         return Err(format!("Storage '{}' has an invalid storage type", storage));
+    }
+    if storage_config.storage_type == WEBDAV_STORAGE_TYPE {
+        if storage_config.url.is_none()
+            || storage_config.username.is_none()
+            || storage_config.password.is_none()
+        {
+            return Err(format!(
+                "WebDAV storage '{}' is missing its URL, username, or password",
+                storage
+            ));
+        }
     }
 
     let fs = get_fs(&storage_config, None);
