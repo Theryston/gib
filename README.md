@@ -222,7 +222,7 @@ message = "Project backup"
 compress = 3
 chunk_size = "5 MB"
 concurrency = 8
-ignore = ["node_modules", ".git", "dist"]
+ignore = ["node_modules", "dist"]
 
 [live]
 message = "Project live synchronization"
@@ -274,6 +274,15 @@ same missing backup forever.
 Live-generated messages start with `[LIVE]` and contain only the number of
 created, changed, and deleted files, for example `[LIVE] created: 12 files;
 changed: 3 files`.
+
+Live discovers Git repositories recursively below the selected root, including
+repositories inside nested project directories. It never excludes `.git` as a
+whole: commit objects, pack files, refs, and packed refs are synchronized so a
+commit made on one device is available on the others without a push. Only
+machine-local Git state such as `HEAD`, the staging index, locks, reflogs,
+hooks, and temporary operation files is excluded from live synchronization.
+These rules apply only to `live`; add `.git` explicitly to `backup.ignore` or
+pass `--ignore .git` when a regular backup should omit Git metadata.
 
 Press `Ctrl+C` to stop live synchronization. In interactive mode, conflicts
 offer `Keep local` and `Use remote`; in JSON mode, pass the required

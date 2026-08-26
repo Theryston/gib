@@ -5,6 +5,7 @@ use crate::config::{
 };
 use crate::core::crypto::read_file_maybe_decrypt;
 use crate::core::crypto::write_file_maybe_encrypt;
+use crate::core::git_sync::GitSyncPolicy;
 use crate::core::indexes::{
     add_backup_summary, advance_repository_head, create_new_backup, list_backup_summaries,
     list_backup_summaries_strict, load_chunk_indexes_with_version,
@@ -48,6 +49,7 @@ pub(crate) struct BackupOptions {
     pub(crate) password: Option<String>,
     pub(crate) chunk_size: u64,
     pub(crate) ignore_patterns: Vec<String>,
+    pub(crate) git_policy: Option<Arc<GitSyncPolicy>>,
     pub(crate) concurrency: usize,
 }
 
@@ -181,6 +183,7 @@ async fn run_backup_with_scope(
         password,
         chunk_size,
         ignore_patterns,
+        git_policy,
         concurrency,
     } = options;
     let primary_parent = parent_hashes.first().cloned();
@@ -219,6 +222,7 @@ async fn run_backup_with_scope(
             password.clone(),
             Arc::clone(&prev_not_encrypted_but_now_yes),
             ignore_patterns.clone(),
+            git_policy.clone(),
             primary_parent.clone(),
             changed_paths.as_ref(),
         )
@@ -749,13 +753,19 @@ async fn backup_file(
     Ok(())
 }
 
-fn list_files(path: &str, ignore_patterns: &[String]) -> Vec<String> {
+fn list_files(
+    path: &str,
+    ignore_patterns: &[String],
+    git_policy: Option<&GitSyncPolicy>,
+) -> Vec<String> {
     let mut files = Vec::new();
     let root = Path::new(path);
 
     let walker = walkdir::WalkDir::new(path)
         .into_iter()
-        .filter_entry(|entry| !is_ignored_path(entry.path(), root, ignore_patterns));
+        .filter_entry(|entry| {
+            !is_ignored_path_with_git_policy(entry.path(), root, ignore_patterns, git_policy)
+        });
 
     for entry in walker.filter_map(|e| e.ok()).filter(|e| e.path().is_file()) {
         files.push(entry.path().display().to_string());
@@ -765,6 +775,18 @@ fn list_files(path: &str, ignore_patterns: &[String]) -> Vec<String> {
 }
 
 pub(crate) fn is_ignored_path(path: &Path, root: &Path, ignore_patterns: &[String]) -> bool {
+    is_ignored_path_with_git_policy(path, root, ignore_patterns, None)
+}
+
+pub(crate) fn is_ignored_path_with_git_policy(
+    path: &Path,
+    root: &Path,
+    ignore_patterns: &[String],
+    git_policy: Option<&GitSyncPolicy>,
+) -> bool {
+    if git_policy.is_some_and(|policy| policy.is_volatile_path(root, path)) {
+        return true;
+    }
     if ignore_patterns.is_empty() {
         return false;
     }
@@ -789,6 +811,17 @@ pub(crate) fn is_ignored_path(path: &Path, root: &Path, ignore_patterns: &[Strin
         .any(|component| ignore_patterns.iter().any(|pattern| pattern == component))
 }
 
+fn is_ignored_relative_path(
+    path: &str,
+    ignore_patterns: &[String],
+    git_policy: Option<&GitSyncPolicy>,
+) -> bool {
+    git_policy.is_some_and(|policy| policy.is_volatile_relative(path))
+        || path
+            .split('/')
+            .any(|component| ignore_patterns.iter().any(|pattern| pattern == component))
+}
+
 fn relative_path(file_path: &str, root_path: &str) -> String {
     let content = file_path.strip_prefix(root_path).unwrap_or(file_path);
     let mut content = content.replace('\\', "/");
@@ -806,6 +839,7 @@ fn remove_missing_backup_objects(
     root_files: &[String],
     root_path: &str,
     ignore_patterns: &[String],
+    git_policy: Option<&GitSyncPolicy>,
 ) {
     let current_paths: HashSet<String> = root_files
         .iter()
@@ -815,9 +849,7 @@ fn remove_missing_backup_objects(
         .keys()
         .filter(|path| {
             !current_paths.contains(*path)
-                && !path
-                    .split('/')
-                    .any(|component| ignore_patterns.iter().any(|pattern| pattern == component))
+                && !is_ignored_relative_path(path, ignore_patterns, git_policy)
         })
         .cloned()
         .collect();
@@ -835,6 +867,7 @@ fn remove_changed_backup_objects(
     root_files: &[String],
     root_path: &str,
     ignore_patterns: &[String],
+    git_policy: Option<&GitSyncPolicy>,
     changed_paths: &BTreeSet<String>,
 ) {
     let current_paths: HashSet<String> = root_files
@@ -845,10 +878,7 @@ fn remove_changed_backup_objects(
     let stale_paths: Vec<String> = tree
         .keys()
         .filter(|path| {
-            if path
-                .split('/')
-                .any(|component| ignore_patterns.iter().any(|pattern| pattern == component))
-            {
+            if is_ignored_relative_path(path, ignore_patterns, git_policy) {
                 return false;
             }
 
@@ -880,6 +910,7 @@ fn remove_changed_backup_objects(
 fn list_changed_files(
     root_path: &str,
     ignore_patterns: &[String],
+    git_policy: Option<&GitSyncPolicy>,
     changed_paths: &BTreeSet<String>,
 ) -> Vec<String> {
     let root = Path::new(root_path);
@@ -887,7 +918,9 @@ fn list_changed_files(
 
     for changed_path in changed_paths {
         let path = root.join(changed_path);
-        if path.is_file() && !is_ignored_path(&path, root, ignore_patterns) {
+        if path.is_file()
+            && !is_ignored_path_with_git_policy(&path, root, ignore_patterns, git_policy)
+        {
             files.insert(path.display().to_string());
             continue;
         }
@@ -898,7 +931,9 @@ fn list_changed_files(
 
         let walker = walkdir::WalkDir::new(&path)
             .into_iter()
-            .filter_entry(|entry| !is_ignored_path(entry.path(), root, ignore_patterns));
+            .filter_entry(|entry| {
+                !is_ignored_path_with_git_policy(entry.path(), root, ignore_patterns, git_policy)
+            });
 
         for entry in walker
             .filter_map(|entry| entry.ok())
@@ -920,6 +955,7 @@ async fn load_metadata(
     password: Option<String>,
     prev_not_encrypted_but_now_yes: Arc<Mutex<bool>>,
     ignore_patterns: Vec<String>,
+    git_policy: Option<Arc<GitSyncPolicy>>,
     parent_hash: Option<String>,
     changed_paths: Option<&BTreeSet<String>>,
 ) -> Result<
@@ -934,6 +970,7 @@ async fn load_metadata(
 > {
     let mut new_backup = create_new_backup(message, config.author);
 
+    let git_policy_for_listing = git_policy.clone();
     let root_files_future = if let Some(changed_paths) = changed_paths {
         let root_path_for_listing = root_path_string.clone();
         let ignore_patterns_for_listing = ignore_patterns.clone();
@@ -942,15 +979,20 @@ async fn load_metadata(
             list_changed_files(
                 &root_path_for_listing,
                 &ignore_patterns_for_listing,
+                git_policy_for_listing.as_deref(),
                 &changed_paths_for_listing,
             )
         })
     } else {
         let root_path_for_listing = root_path_string.clone();
         let ignore_patterns_for_listing = ignore_patterns.clone();
-        tokio::spawn(
-            async move { list_files(&root_path_for_listing, &ignore_patterns_for_listing) },
-        )
+        tokio::spawn(async move {
+            list_files(
+                &root_path_for_listing,
+                &ignore_patterns_for_listing,
+                git_policy_for_listing.as_deref(),
+            )
+        })
     };
 
     let parent_backup_future = tokio::spawn({
@@ -999,6 +1041,7 @@ async fn load_metadata(
                 &root_files,
                 &root_path_string,
                 &ignore_patterns,
+                git_policy.as_deref(),
                 changed_paths,
             );
         } else {
@@ -1008,6 +1051,7 @@ async fn load_metadata(
                 &root_files,
                 &root_path_string,
                 &ignore_patterns,
+                git_policy.as_deref(),
             );
         }
     }
@@ -1268,6 +1312,14 @@ pub(crate) async fn resolve_backup(
     } else {
         merge_ignore_patterns(&local_config.config.backup.ignore, &[])
     };
+    let git_policy = if mode == BackupMode::Live {
+        Some(Arc::new(GitSyncPolicy::discover(
+            Path::new(&root_path_string),
+            &ignore_patterns,
+        )?))
+    } else {
+        None
+    };
 
     let default_concurrency = num_cpus::get() * 2;
     let configured_concurrency = local_config
@@ -1318,6 +1370,7 @@ pub(crate) async fn resolve_backup(
             password,
             chunk_size,
             ignore_patterns,
+            git_policy,
             concurrency,
         },
         message,
@@ -1393,6 +1446,7 @@ pub(crate) async fn resolve_live_overrides(
     let ignore_patterns = overrides
         .ignore
         .unwrap_or_else(|| merge_ignore_patterns(&local_config.config.backup.ignore, &[]));
+    let git_policy = Some(Arc::new(GitSyncPolicy::discover(&root, &ignore_patterns)?));
     let concurrency = overrides
         .concurrency
         .or(local_config.config.backup.concurrency)
@@ -1412,6 +1466,7 @@ pub(crate) async fn resolve_live_overrides(
             password,
             chunk_size,
             ignore_patterns,
+            git_policy,
             concurrency,
         },
         message,
@@ -1679,6 +1734,7 @@ mod tests {
             &["/workspace/kept.txt".to_string()],
             "/workspace",
             &[],
+            None,
         );
 
         assert!(tree.contains_key("kept.txt"));
@@ -1702,6 +1758,7 @@ mod tests {
             &[],
             "/workspace",
             &["ignored".to_string()],
+            None,
         );
 
         assert!(tree.contains_key("ignored/file.txt"));
@@ -1727,6 +1784,7 @@ mod tests {
             password: None,
             chunk_size: 1024,
             ignore_patterns: Vec::new(),
+            git_policy: None,
             concurrency: 1,
         };
 
@@ -1776,6 +1834,7 @@ mod tests {
             password: None,
             chunk_size: 1024,
             ignore_patterns: Vec::new(),
+            git_policy: None,
             concurrency: 1,
         };
 
