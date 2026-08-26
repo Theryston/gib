@@ -9,7 +9,8 @@ use super::normalize::{
     directory_id, entry_id, normalize_file_path, normalize_relative_path, shard_id,
 };
 use super::storage::{
-    children_shard_path, entry_shard_path, read_catalog, read_object, token_shard_path,
+    children_shard_path, entry_shard_path, load_backup_manifest, read_catalog, read_object,
+    token_shard_path,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +26,12 @@ pub(crate) struct CatalogStatus {
     pub(crate) latest_indexed_backup: Option<String>,
     pub(crate) latest_indexed_timestamp: Option<u64>,
     pub(crate) pending_backups: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CurrentSnapshot {
+    pub(crate) backup_hash: String,
+    pub(crate) current_entry_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,11 +71,103 @@ pub(crate) async fn read_catalog_status(
     Ok(catalog.map(|catalog| status_from_catalog(&catalog.value)))
 }
 
+/// Loads the current file IDs from the latest parentless snapshot.
+///
+/// Parentless backups are complete snapshots. Reading their manifest lets
+/// read-only commands correct a stale catalog in memory without downloading
+/// any file chunks or changing repository data. Parent-based snapshots remain
+/// fully served by the incremental catalog index.
+pub(crate) async fn load_latest_parentless_snapshot(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+) -> Result<Option<CurrentSnapshot>, String> {
+    let Some(catalog) = read_catalog(&fs, &key, password.as_deref()).await? else {
+        return Ok(None);
+    };
+    let Some(backup_hash) = catalog.value.latest_indexed_backup else {
+        return Ok(None);
+    };
+
+    let backup = match load_backup_manifest(&fs, &key, password.as_deref(), &backup_hash).await {
+        Ok(backup) => backup,
+        Err(error) if error.contains("not found") || error.contains("is empty") => {
+            // Keep the catalog fallback available for repositories that do not
+            // retain a manifest for an older indexed backup.
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if !backup.parents.is_empty() {
+        return Ok(None);
+    }
+
+    let mut current_entry_ids = BTreeSet::new();
+    for raw_path in backup.tree.keys() {
+        let path = normalize_file_path(raw_path)?;
+        current_entry_ids.insert(entry_id(&path));
+    }
+
+    Ok(Some(CurrentSnapshot {
+        backup_hash,
+        current_entry_ids,
+    }))
+}
+
+/// Returns the paths that the catalog currently considers present.
+///
+/// A full snapshot can be created without a parent manifest. In that case the
+/// catalog updater uses this metadata-only view as the previous snapshot when
+/// it needs to record paths that disappeared from the new manifest.
+pub(crate) async fn list_current_entry_paths(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+) -> Result<BTreeSet<String>, String> {
+    let mut shard_paths = fs
+        .list_files(&format!("{}/{}/entries", key, super::storage::CATALOG_ROOT))
+        .await
+        .map_err(|error| format!("Failed to list catalog entry shards: {}", error))?;
+    shard_paths.sort();
+    shard_paths.dedup();
+
+    let mut paths = BTreeSet::new();
+    for shard_path in shard_paths {
+        let Some(shard_data) =
+            read_object::<EntryShard>(&fs, &shard_path, password.as_deref(), "catalog entry shard")
+                .await?
+        else {
+            continue;
+        };
+
+        for entry in shard_data
+            .value
+            .entries
+            .values()
+            .filter(|entry| entry.exists_in_latest_indexed_snapshot)
+        {
+            paths.insert(normalize_file_path(&entry.path)?);
+        }
+    }
+
+    Ok(paths)
+}
+
 pub(crate) async fn get_entry_history(
     fs: Arc<dyn FS>,
     key: String,
     password: Option<String>,
     path: &str,
+) -> Result<Option<EntryHistory>, String> {
+    get_entry_history_with_snapshot(fs, key, password, path, None).await
+}
+
+pub(crate) async fn get_entry_history_with_snapshot(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+    path: &str,
+    current_snapshot: Option<&CurrentSnapshot>,
 ) -> Result<Option<EntryHistory>, String> {
     let normalized = normalize_file_path(path)?;
     let Some(mut entry) =
@@ -76,6 +175,11 @@ pub(crate) async fn get_entry_history(
     else {
         return Ok(None);
     };
+
+    if let Some(current_snapshot) = current_snapshot {
+        entry.exists_in_latest_indexed_snapshot =
+            current_snapshot.current_entry_ids.contains(&entry.entry_id);
+    }
 
     if entry.exists_in_latest_indexed_snapshot
         && let Some(catalog) = read_catalog(&fs, &key, password.as_deref()).await?
@@ -100,6 +204,19 @@ pub(crate) async fn list_directory_children(
     scope: CatalogEntryScope,
     cursor: Option<&str>,
     limit: usize,
+) -> Result<CatalogPage<DirectoryChildSummary>, String> {
+    list_directory_children_with_snapshot(fs, key, password, path, scope, cursor, limit, None).await
+}
+
+pub(crate) async fn list_directory_children_with_snapshot(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+    path: &str,
+    scope: CatalogEntryScope,
+    cursor: Option<&str>,
+    limit: usize,
+    current_snapshot: Option<&CurrentSnapshot>,
 ) -> Result<CatalogPage<DirectoryChildSummary>, String> {
     let normalized = normalize_relative_path(path)?;
     let Some(directory) =
@@ -126,6 +243,7 @@ pub(crate) async fn list_directory_children(
             &key,
             password.as_deref(),
             child,
+            current_snapshot,
             &mut entry_shard_cache,
         )
         .await?;
@@ -287,6 +405,20 @@ pub(crate) async fn lookup_entries_by_tokens(
     cursor: Option<&str>,
     limit: usize,
 ) -> Result<CatalogPage<CatalogEntrySummary>, String> {
+    lookup_entries_by_tokens_with_snapshot(fs, key, password, tokens, scope, cursor, limit, None)
+        .await
+}
+
+pub(crate) async fn lookup_entries_by_tokens_with_snapshot(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+    tokens: &[String],
+    scope: CatalogEntryScope,
+    cursor: Option<&str>,
+    limit: usize,
+    current_snapshot: Option<&CurrentSnapshot>,
+) -> Result<CatalogPage<CatalogEntrySummary>, String> {
     let latest_indexed_backup = read_catalog(&fs, &key, password.as_deref())
         .await?
         .and_then(|catalog| catalog.value.latest_indexed_backup);
@@ -359,7 +491,11 @@ pub(crate) async fn lookup_entries_by_tokens(
         let Some(entry) = shard_data.entries.get(&id) else {
             continue;
         };
-        if scope == CatalogEntryScope::Current && !entry.exists_in_latest_indexed_snapshot {
+        let exists_in_latest_indexed_snapshot = current_snapshot
+            .map_or(entry.exists_in_latest_indexed_snapshot, |snapshot| {
+                snapshot.current_entry_ids.contains(&entry.entry_id)
+            });
+        if scope == CatalogEntryScope::Current && !exists_in_latest_indexed_snapshot {
             continue;
         }
 
@@ -372,10 +508,11 @@ pub(crate) async fn lookup_entries_by_tokens(
         results.push(CatalogEntrySummary {
             entry_id: entry.entry_id.clone(),
             path: entry.path.clone(),
-            exists_in_latest_indexed_snapshot: entry.exists_in_latest_indexed_snapshot,
-            latest_restorable_backup: if entry.exists_in_latest_indexed_snapshot {
-                latest_indexed_backup
-                    .clone()
+            exists_in_latest_indexed_snapshot,
+            latest_restorable_backup: if exists_in_latest_indexed_snapshot {
+                current_snapshot
+                    .map(|snapshot| snapshot.backup_hash.clone())
+                    .or_else(|| latest_indexed_backup.clone())
                     .or_else(|| entry.latest_restorable_backup.clone())
             } else {
                 entry.latest_restorable_backup.clone()
@@ -436,12 +573,23 @@ pub(crate) async fn collect_entries_by_tokens(
     tokens: &[String],
     scope: CatalogEntryScope,
 ) -> Result<Vec<CatalogEntrySummary>, String> {
+    collect_entries_by_tokens_with_snapshot(fs, key, password, tokens, scope, None).await
+}
+
+pub(crate) async fn collect_entries_by_tokens_with_snapshot(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+    tokens: &[String],
+    scope: CatalogEntryScope,
+    current_snapshot: Option<&CurrentSnapshot>,
+) -> Result<Vec<CatalogEntrySummary>, String> {
     const PAGE_SIZE: usize = 256;
 
     let mut cursor = None;
     let mut entries = Vec::new();
     loop {
-        let page = lookup_entries_by_tokens(
+        let page = lookup_entries_by_tokens_with_snapshot(
             Arc::clone(&fs),
             key.clone(),
             password.clone(),
@@ -449,6 +597,7 @@ pub(crate) async fn collect_entries_by_tokens(
             scope,
             cursor.as_deref(),
             PAGE_SIZE,
+            current_snapshot,
         )
         .await?;
         let next_cursor = page.next_cursor.clone();
@@ -478,6 +627,7 @@ async fn child_is_current(
     key: &str,
     password: Option<&str>,
     child: &super::model::DirectoryChild,
+    current_snapshot: Option<&CurrentSnapshot>,
     entry_shard_cache: &mut HashMap<String, EntryShard>,
 ) -> Result<bool, String> {
     match child.kind {
@@ -493,6 +643,18 @@ async fn child_is_current(
             else {
                 return Ok(false);
             };
+            if let Some(current_snapshot) = current_snapshot {
+                return Ok(shard_data
+                    .value
+                    .directories
+                    .get(&child.target_id)
+                    .is_some_and(|directory| {
+                        directory
+                            .current_entry_ids
+                            .iter()
+                            .any(|id| current_snapshot.current_entry_ids.contains(id))
+                    }));
+            }
             Ok(shard_data
                 .value
                 .directories
@@ -513,6 +675,12 @@ async fn child_is_current(
                     return Ok(false);
                 };
                 entry_shard_cache.insert(shard.clone(), shard_data);
+            }
+
+            if let Some(current_snapshot) = current_snapshot {
+                return Ok(current_snapshot
+                    .current_entry_ids
+                    .contains(&child.target_id));
             }
 
             Ok(entry_shard_cache

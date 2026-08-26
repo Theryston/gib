@@ -12,6 +12,7 @@ use super::normalize::{
     directory_id, directory_paths, entry_id, file_name, lookup_path, normalize_file_path,
     normalize_relative_path, parent_directory, path_tokens, revision_id, shard_id,
 };
+use super::query::list_current_entry_paths;
 use super::storage::{
     children_shard_path, empty_children_shard, empty_entry_shard, empty_token_shard,
     entry_shard_path, load_backup_manifest, mark_catalog_degraded, read_catalog, read_object,
@@ -88,11 +89,20 @@ pub(crate) async fn index_backup_after_finalize(
                     ),
                     None => None,
                 };
+                let pending_catalog_paths = if pending_parent.is_none() {
+                    Some(
+                        list_current_entry_paths(Arc::clone(&fs), key.clone(), password.clone())
+                            .await?,
+                    )
+                } else {
+                    None
+                };
                 let pending_changes = build_snapshot_changes(
                     false,
                     pending_parent.as_ref().map(|parent| &parent.tree),
                     &pending_backup.tree,
                     None,
+                    pending_catalog_paths.as_ref(),
                 )?;
 
                 apply_snapshot_shards(
@@ -160,11 +170,30 @@ pub(crate) async fn index_backup_after_finalize(
     let catalog_is_new = existing_catalog.as_ref().is_none_or(|catalog| {
         catalog.value.indexed_backup_count == 0 && catalog.value.latest_indexed_backup.is_none()
     });
+    let catalog_current_paths = if !catalog_is_new && parent.is_none() && changed_paths.is_none() {
+        match list_current_entry_paths(Arc::clone(&fs), key.clone(), password.clone()).await {
+            Ok(paths) => Some(paths),
+            Err(error) => {
+                let _ = mark_catalog_degraded(
+                    &fs,
+                    &key,
+                    password.as_deref(),
+                    compress,
+                    current_pending.clone(),
+                )
+                .await;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     let changes = match build_snapshot_changes(
         catalog_is_new,
         parent.as_ref().map(|parent| &parent.tree),
         &backup.tree,
         changed_paths,
+        catalog_current_paths.as_ref(),
     ) {
         Ok(changes) => changes,
         Err(error) => {
@@ -913,6 +942,7 @@ fn build_snapshot_changes(
     parent_tree: Option<&HashMap<String, BackupObject>>,
     new_tree: &HashMap<String, BackupObject>,
     changed_paths: Option<&BTreeSet<String>>,
+    catalog_current_paths: Option<&BTreeSet<String>>,
 ) -> Result<Vec<SnapshotChange>, String> {
     let mut paths = BTreeSet::new();
 
@@ -941,6 +971,9 @@ fn build_snapshot_changes(
     } else {
         if let Some(parent_tree) = parent_tree {
             paths.extend(parent_tree.keys().cloned());
+        }
+        if let Some(catalog_current_paths) = catalog_current_paths {
+            paths.extend(catalog_current_paths.iter().cloned());
         }
         paths.extend(new_tree.keys().cloned());
     }
@@ -974,6 +1007,7 @@ fn build_snapshot_changes(
         if catalog_is_new
             || before.as_ref().map(|object| &object.hash)
                 != after.as_ref().map(|object| &object.hash)
+            || (catalog_current_paths.is_some() && after.is_none())
         {
             changes.push(SnapshotChange {
                 path,
@@ -1392,8 +1426,10 @@ pub(crate) async fn catalog_exists(
 mod tests {
     use super::*;
     use crate::core::catalog::query::{
-        CatalogEntryScope, get_entry_history, list_directory_children, lookup_entries_by_tokens,
-        read_catalog_status,
+        CatalogEntryScope, get_entry_history, get_entry_history_with_snapshot,
+        list_directory_children, list_directory_children_with_snapshot,
+        load_latest_parentless_snapshot, lookup_entries_by_tokens,
+        lookup_entries_by_tokens_with_snapshot, read_catalog_status,
     };
     use crate::core::catalog::storage::catalog_path;
     use crate::core::metadata::{BackupObject, BackupSummary, ChunkIndex};
@@ -1457,7 +1493,7 @@ mod tests {
             ("src/main.rs".to_string(), object("one")),
             ("README.md".to_string(), object("readme")),
         ]);
-        let changes = build_snapshot_changes(true, None, &new_tree, None).unwrap();
+        let changes = build_snapshot_changes(true, None, &new_tree, None, None).unwrap();
 
         assert_eq!(changes.len(), 2);
         assert!(changes.iter().all(|change| change.before.is_none()));
@@ -1475,7 +1511,8 @@ mod tests {
             ("changed.txt".to_string(), object("after")),
             ("created.txt".to_string(), object("created")),
         ]);
-        let changes = build_snapshot_changes(false, Some(&parent_tree), &new_tree, None).unwrap();
+        let changes =
+            build_snapshot_changes(false, Some(&parent_tree), &new_tree, None, None).unwrap();
 
         assert_eq!(changes.len(), 3);
         assert!(changes.iter().any(|change| change.path == "created.txt"));
@@ -1775,6 +1812,189 @@ mod tests {
         assert_eq!(remaining_children.items[0].name, "main.rs");
 
         let _ = fs.delete_file(&catalog_path(&key)).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn full_snapshots_without_parents_mark_missing_entries_as_deleted() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("gib-catalog-empty-test-{suffix}"));
+        let fs: Arc<dyn FS> = Arc::new(LocalFS::new(&directory));
+        let key = "downloads".to_string();
+
+        let first = backup(
+            "backup-with-files",
+            1,
+            HashMap::from([
+                ("document.txt".to_string(), object("document")),
+                ("photo.jpg".to_string(), object("photo")),
+            ]),
+            Vec::new(),
+        );
+        let second = backup("empty-backup", 2, HashMap::new(), Vec::new());
+        write_manifest(&fs, &key, &first).await;
+        write_manifest(&fs, &key, &second).await;
+
+        index_backup_after_finalize(Arc::clone(&fs), key.clone(), None, 3, &first, None, None)
+            .await
+            .unwrap();
+        index_backup_after_finalize(Arc::clone(&fs), key.clone(), None, 3, &second, None, None)
+            .await
+            .unwrap();
+
+        for path in ["document.txt", "photo.jpg"] {
+            let history = get_entry_history(Arc::clone(&fs), key.clone(), None, path)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!history.exists_in_latest_indexed_snapshot);
+            assert_eq!(
+                history.latest_restorable_backup.as_deref(),
+                Some(first.hash.as_str())
+            );
+        }
+
+        let current = list_directory_children(
+            Arc::clone(&fs),
+            key.clone(),
+            None,
+            "",
+            CatalogEntryScope::Current,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(current.items.is_empty());
+
+        let history = list_directory_children(
+            Arc::clone(&fs),
+            key.clone(),
+            None,
+            "",
+            CatalogEntryScope::AllHistory,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(history.items.len(), 2);
+        assert!(
+            history
+                .items
+                .iter()
+                .all(|entry| !entry.exists_in_latest_indexed_snapshot)
+        );
+
+        let search = lookup_entries_by_tokens(
+            Arc::clone(&fs),
+            key.clone(),
+            None,
+            &[String::from("document")],
+            CatalogEntryScope::AllHistory,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(search.items.len(), 1);
+        assert!(!search.items[0].exists_in_latest_indexed_snapshot);
+        assert_eq!(
+            search.items[0].latest_restorable_backup.as_deref(),
+            Some(first.hash.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn read_queries_validate_a_stale_parentless_snapshot_against_its_manifest() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("gib-catalog-read-repair-test-{suffix}"));
+        let fs: Arc<dyn FS> = Arc::new(LocalFS::new(&directory));
+        let key = "downloads".to_string();
+
+        let first = backup(
+            "backup-with-files",
+            1,
+            HashMap::from([("document.txt".to_string(), object("document"))]),
+            Vec::new(),
+        );
+        let second = backup("empty-backup", 2, HashMap::new(), Vec::new());
+        write_manifest(&fs, &key, &first).await;
+        write_manifest(&fs, &key, &second).await;
+        index_backup_after_finalize(Arc::clone(&fs), key.clone(), None, 3, &first, None, None)
+            .await
+            .unwrap();
+
+        // Simulate the stale state produced by the old catalog updater: the
+        // catalog points at the empty snapshot, while the entry shard still
+        // says that document.txt is current.
+        commit_catalog_snapshot(&fs, &key, None, 3, &second)
+            .await
+            .unwrap();
+
+        let snapshot = load_latest_parentless_snapshot(Arc::clone(&fs), key.clone(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.current_entry_ids.is_empty());
+
+        let history = get_entry_history_with_snapshot(
+            Arc::clone(&fs),
+            key.clone(),
+            None,
+            "document.txt",
+            Some(&snapshot),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!history.exists_in_latest_indexed_snapshot);
+        assert_eq!(
+            history.latest_restorable_backup.as_deref(),
+            Some(first.hash.as_str())
+        );
+
+        let current = list_directory_children_with_snapshot(
+            Arc::clone(&fs),
+            key.clone(),
+            None,
+            "",
+            CatalogEntryScope::Current,
+            None,
+            10,
+            Some(&snapshot),
+        )
+        .await
+        .unwrap();
+        assert!(current.items.is_empty());
+
+        let search = lookup_entries_by_tokens_with_snapshot(
+            Arc::clone(&fs),
+            key.clone(),
+            None,
+            &[String::from("document")],
+            CatalogEntryScope::AllHistory,
+            None,
+            10,
+            Some(&snapshot),
+        )
+        .await
+        .unwrap();
+        assert_eq!(search.items.len(), 1);
+        assert!(!search.items[0].exists_in_latest_indexed_snapshot);
+        assert_eq!(
+            search.items[0].latest_restorable_backup.as_deref(),
+            Some(first.hash.as_str())
+        );
+
         let _ = std::fs::remove_dir_all(directory);
     }
 

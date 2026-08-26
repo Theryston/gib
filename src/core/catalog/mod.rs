@@ -15,9 +15,12 @@ pub(crate) use normalize::{
     normalize_relative_path, parent_directory, path_tokens, revision_id, shard_id,
 };
 pub(crate) use query::{
-    CatalogEntryScope, CatalogEntrySummary, CatalogPage, CatalogStatus, DirectoryChildSummary,
-    collect_entries_by_tokens, directory_exists, get_entry_history, list_directory_children,
-    lookup_entries_by_tokens, read_catalog_status,
+    CatalogEntryScope, CatalogEntrySummary, CatalogPage, CatalogStatus, CurrentSnapshot,
+    DirectoryChildSummary, collect_entries_by_tokens, collect_entries_by_tokens_with_snapshot,
+    directory_exists, get_entry_history, get_entry_history_with_snapshot, list_current_entry_paths,
+    list_directory_children, list_directory_children_with_snapshot,
+    load_latest_parentless_snapshot, lookup_entries_by_tokens,
+    lookup_entries_by_tokens_with_snapshot, read_catalog_status,
 };
 pub(crate) use update::index_backup_after_finalize;
 

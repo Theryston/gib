@@ -1,8 +1,8 @@
 use super::state::{ExplorerEntry, ExplorerKind, ExplorerScope, ExplorerStatus, SelectedFile};
 use crate::core::catalog::{
-    CatalogEntrySummary, EntryHistory, collect_entries_by_tokens, directory_exists,
-    get_entry_history, list_directory_children, lookup_path, normalize_file_path,
-    normalize_relative_path, path_tokens,
+    CatalogEntrySummary, CurrentSnapshot, EntryHistory, collect_entries_by_tokens_with_snapshot,
+    directory_exists, get_entry_history_with_snapshot, list_directory_children_with_snapshot,
+    lookup_path, normalize_file_path, normalize_relative_path, path_tokens,
 };
 use crate::fs::FS;
 use std::collections::HashMap;
@@ -28,6 +28,7 @@ pub(crate) struct ExplorerNavigator {
     fs: Arc<dyn FS>,
     key: String,
     password: Option<String>,
+    current_snapshot: Option<CurrentSnapshot>,
     directories: HashMap<(String, ExplorerScope), LoadedDirectory>,
     entry_details: HashMap<String, EntryHistory>,
 }
@@ -38,9 +39,15 @@ impl ExplorerNavigator {
             fs,
             key,
             password,
+            current_snapshot: None,
             directories: HashMap::new(),
             entry_details: HashMap::new(),
         }
+    }
+
+    pub(crate) fn set_current_snapshot(&mut self, current_snapshot: Option<CurrentSnapshot>) {
+        self.current_snapshot = current_snapshot;
+        self.clear_cache();
     }
 
     pub(crate) fn clear_cache(&mut self) {
@@ -85,7 +92,7 @@ impl ExplorerNavigator {
             }));
         }
 
-        let catalog_page = list_directory_children(
+        let catalog_page = list_directory_children_with_snapshot(
             Arc::clone(&self.fs),
             self.key.clone(),
             self.password.clone(),
@@ -93,6 +100,7 @@ impl ExplorerNavigator {
             scope.catalog_scope(),
             cursor,
             DIRECTORY_PAGE_SIZE,
+            self.current_snapshot.as_ref(),
         )
         .await?;
         let mut new_entries = Vec::with_capacity(catalog_page.items.len());
@@ -187,11 +195,12 @@ impl ExplorerNavigator {
             return Ok(Some(ExplorerEntry::from_history(history)));
         }
 
-        let Some(history) = get_entry_history(
+        let Some(history) = get_entry_history_with_snapshot(
             Arc::clone(&self.fs),
             self.key.clone(),
             self.password.clone(),
             &entry.path,
+            self.current_snapshot.as_ref(),
         )
         .await?
         else {
@@ -212,11 +221,12 @@ impl ExplorerNavigator {
             return Ok(Some(history.clone()));
         }
 
-        let history = get_entry_history(
+        let history = get_entry_history_with_snapshot(
             Arc::clone(&self.fs),
             self.key.clone(),
             self.password.clone(),
             &path,
+            self.current_snapshot.as_ref(),
         )
         .await?;
         if let Some(history) = &history {
@@ -236,12 +246,13 @@ impl ExplorerNavigator {
             return Ok(Vec::new());
         }
 
-        let summaries = collect_entries_by_tokens(
+        let summaries = collect_entries_by_tokens_with_snapshot(
             Arc::clone(&self.fs),
             self.key.clone(),
             self.password.clone(),
             &tokens,
             scope.catalog_scope(),
+            self.current_snapshot.as_ref(),
         )
         .await?;
         let mut entries = summaries

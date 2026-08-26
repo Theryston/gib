@@ -3,8 +3,9 @@ use crate::config::{
     resolve_repository,
 };
 use crate::core::catalog::{
-    CatalogEntryScope, CatalogEntrySummary, CatalogState, collect_entries_by_tokens, lookup_path,
-    normalize_relative_path, path_tokens, read_catalog_status,
+    CatalogEntryScope, CatalogEntrySummary, CatalogState, collect_entries_by_tokens_with_snapshot,
+    load_latest_parentless_snapshot, lookup_path, normalize_relative_path, path_tokens,
+    read_catalog_status,
 };
 use crate::output::{emit_output, is_json_mode};
 use crate::utils::handle_error;
@@ -217,12 +218,16 @@ async fn run_search(
         SearchIndexStatus::Ready
     };
 
-    let candidates = collect_entries_by_tokens(
+    let current_snapshot =
+        load_latest_parentless_snapshot(Arc::clone(&fs), key.clone(), password.clone()).await?;
+
+    let candidates = collect_entries_by_tokens_with_snapshot(
         Arc::clone(&fs),
         key,
         password,
         &request.tokens,
         CatalogEntryScope::AllHistory,
+        current_snapshot.as_ref(),
     )
     .await?;
 

@@ -4,8 +4,9 @@ use crate::config::{
     resolve_path, resolve_repository,
 };
 use crate::core::catalog::{
-    CatalogState, CatalogStatus, EntryHistory, FileRevision, lookup_path, normalize_file_path,
-    normalize_relative_path, parent_directory, read_catalog_status,
+    CatalogState, CatalogStatus, CurrentSnapshot, EntryHistory, FileRevision,
+    load_latest_parentless_snapshot, lookup_path, normalize_file_path, normalize_relative_path,
+    parent_directory, read_catalog_status,
 };
 use crate::core::explore::{
     ExplorerEntry, ExplorerKind, ExplorerNavigator, ExplorerScope, ExplorerSort, ExplorerState,
@@ -259,15 +260,27 @@ pub async fn explore(matches: &ArgMatches) {
         Ok(status) => status,
         Err(error) => handle_error(error, None),
     };
+    let current_snapshot = match load_latest_parentless_snapshot(
+        Arc::clone(&repository.fs),
+        repository.key.clone(),
+        repository.password.clone(),
+    )
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => handle_error(error, None),
+    };
 
     let mut request = request;
     request.target_path = target_path;
 
     if is_json_mode() {
-        if let Err(error) = run_json(repository, request, catalog_status).await {
+        if let Err(error) = run_json(repository, request, catalog_status, current_snapshot).await {
             handle_error(error, None);
         }
-    } else if let Err(error) = run_interactive(repository, request, catalog_status).await {
+    } else if let Err(error) =
+        run_interactive(repository, request, catalog_status, current_snapshot).await
+    {
         handle_error(error, None);
     }
 }
@@ -440,6 +453,7 @@ async fn run_json(
     repository: RepositoryOptions,
     request: ExploreRequest,
     catalog_status: Option<CatalogStatus>,
+    current_snapshot: Option<CurrentSnapshot>,
 ) -> Result<(), String> {
     let status = index_status(catalog_status.as_ref());
     let warning = index_warning(catalog_status.as_ref());
@@ -453,6 +467,7 @@ async fn run_json(
         repository.key.clone(),
         repository.password.clone(),
     );
+    navigator.set_current_snapshot(current_snapshot);
 
     if request.restore {
         return run_json_restore(&mut navigator, &repository, &request, status, warning).await;
@@ -1028,6 +1043,7 @@ async fn run_interactive(
     repository: RepositoryOptions,
     request: ExploreRequest,
     catalog_status: Option<CatalogStatus>,
+    current_snapshot: Option<CurrentSnapshot>,
 ) -> Result<(), String> {
     if !catalog_has_indexed_backups(catalog_status.as_ref()) {
         println!("{}", console::style(NO_INDEXED_BACKUPS_MESSAGE).yellow());
@@ -1040,6 +1056,7 @@ async fn run_interactive(
         repository.key.clone(),
         repository.password.clone(),
     );
+    navigator.set_current_snapshot(current_snapshot);
 
     if request.history {
         let history = navigator
