@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.26](https://github.com/Theryston/gib/compare/v0.0.25...v0.0.26) - 2026-08-26
+
+### Fixed
+
+- handle stale backup references in live sync cache
+
 ## [0.0.25](https://github.com/Theryston/gib/compare/v0.0.24...v0.0.25) - 2026-08-26
 
 ### Added
