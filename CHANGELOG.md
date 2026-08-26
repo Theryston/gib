@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.32](https://github.com/Theryston/gib/compare/v0.0.31...v0.0.32) - 2026-08-26
+
+### Added
+
+- add autostart log following command
+
 ## [0.0.31](https://github.com/Theryston/gib/compare/v0.0.30...v0.0.31) - 2026-08-26
 
 ### Added
