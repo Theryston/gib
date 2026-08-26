@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.31](https://github.com/Theryston/gib/compare/v0.0.30...v0.0.31) - 2026-08-26
+
+### Added
+
+- add WebDAV storage support
+
+### Other
+
+- Merge branch 'main' of github.com:Theryston/gib
+
 ## [0.0.30](https://github.com/Theryston/gib/compare/v0.0.29...v0.0.30) - 2026-08-26
 
 ### Added
