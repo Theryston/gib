@@ -10,7 +10,6 @@ use super::normalize::{
 };
 use super::storage::{
     children_shard_path, entry_shard_path, load_backup_manifest, read_catalog, read_object,
-    token_shard_path,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,6 +408,9 @@ pub(crate) async fn lookup_entries_by_tokens(
         .await
 }
 
+/// Looks up entries whose indexed path tokens contain every query token.
+/// Matching is case-insensitive because catalog tokens are normalized before
+/// they are stored.
 pub(crate) async fn lookup_entries_by_tokens_with_snapshot(
     fs: Arc<dyn FS>,
     key: String,
@@ -419,7 +421,51 @@ pub(crate) async fn lookup_entries_by_tokens_with_snapshot(
     limit: usize,
     current_snapshot: Option<&CurrentSnapshot>,
 ) -> Result<CatalogPage<CatalogEntrySummary>, String> {
-    let latest_indexed_backup = read_catalog(&fs, &key, password.as_deref())
+    let results = collect_matching_entries_with_snapshot(
+        &fs,
+        &key,
+        password.as_deref(),
+        tokens,
+        scope,
+        current_snapshot,
+    )
+    .await?;
+
+    let limit = limit.max(1);
+    let mut filtered = Vec::with_capacity(limit.min(results.len()));
+    let mut has_more = false;
+    for result in results {
+        if cursor.is_some_and(|cursor| result.path.as_str() <= cursor) {
+            continue;
+        }
+        if filtered.len() == limit {
+            has_more = true;
+            break;
+        }
+        filtered.push(result);
+    }
+
+    let next_cursor = if has_more {
+        filtered.last().map(|item| item.path.clone())
+    } else {
+        None
+    };
+
+    Ok(CatalogPage {
+        items: filtered,
+        next_cursor,
+    })
+}
+
+async fn collect_matching_entries_with_snapshot(
+    fs: &Arc<dyn FS>,
+    key: &str,
+    password: Option<&str>,
+    tokens: &[String],
+    scope: CatalogEntryScope,
+    current_snapshot: Option<&CurrentSnapshot>,
+) -> Result<Vec<CatalogEntrySummary>, String> {
+    let latest_indexed_backup = read_catalog(fs, key, password)
         .await?
         .and_then(|catalog| catalog.value.latest_indexed_backup);
 
@@ -431,53 +477,22 @@ pub(crate) async fn lookup_entries_by_tokens_with_snapshot(
     normalized_tokens.dedup();
 
     if normalized_tokens.is_empty() {
-        return Ok(CatalogPage {
-            items: Vec::new(),
-            next_cursor: None,
-        });
+        return Ok(Vec::new());
     }
 
-    let mut matching_ids: Option<BTreeSet<String>> = None;
-    for token in normalized_tokens {
-        let shard = shard_id(&token);
-        let Some(shard_data) = read_object::<TokenShard>(
-            &fs,
-            &token_shard_path(&key, &shard),
-            password.as_deref(),
-            "catalog token shard",
-        )
-        .await?
-        else {
-            return Ok(CatalogPage {
-                items: Vec::new(),
-                next_cursor: None,
-            });
-        };
-
-        let Some(posting) = shard_data.value.postings.get(&token) else {
-            return Ok(CatalogPage {
-                items: Vec::new(),
-                next_cursor: None,
-            });
-        };
-
-        matching_ids = Some(match matching_ids {
-            Some(current) => current.intersection(&posting.entry_ids).cloned().collect(),
-            None => posting.entry_ids.clone(),
-        });
-    }
+    let matching_ids = matching_entry_ids(fs, key, password, &normalized_tokens).await?;
 
     let mut results = Vec::new();
     let mut entry_cache = HashMap::<String, EntryShard>::new();
-    for id in matching_ids.unwrap_or_default() {
+    for id in matching_ids {
         let entry_shard = shard_id(&id);
         let shard_data = if let Some(shard_data) = entry_cache.get(&entry_shard) {
             shard_data.clone()
         } else {
             let Some(shard_data) = read_object::<EntryShard>(
-                &fs,
-                &entry_shard_path(&key, &entry_shard),
-                password.as_deref(),
+                fs,
+                &entry_shard_path(key, &entry_shard),
+                password,
                 "catalog entry shard",
             )
             .await?
@@ -540,30 +555,54 @@ pub(crate) async fn lookup_entries_by_tokens_with_snapshot(
             .then_with(|| left.entry_id.cmp(&right.entry_id))
     });
 
-    let limit = limit.max(1);
-    let mut filtered = Vec::with_capacity(limit);
-    let mut has_more = false;
-    for result in results {
-        if cursor.is_some_and(|cursor| result.path.as_str() <= cursor) {
-            continue;
+    Ok(results)
+}
+
+async fn matching_entry_ids(
+    fs: &Arc<dyn FS>,
+    key: &str,
+    password: Option<&str>,
+    tokens: &[String],
+) -> Result<BTreeSet<String>, String> {
+    // The catalog stores complete path tokens. Scan the token shards once so
+    // a query can match inside an existing token (for example, "pop" in
+    // "poppins") without rebuilding the catalog or downloading file data.
+    let mut shard_paths = fs
+        .list_files(&format!("{}/{}/tokens", key, super::storage::CATALOG_ROOT))
+        .await
+        .map_err(|error| format!("Failed to list catalog token shards: {}", error))?;
+    shard_paths.sort();
+    shard_paths.dedup();
+
+    let mut token_shards = Vec::with_capacity(shard_paths.len());
+    for shard_path in shard_paths {
+        if let Some(shard_data) =
+            read_object::<TokenShard>(fs, &shard_path, password, "catalog token shard").await?
+        {
+            token_shards.push(shard_data.value);
         }
-        if filtered.len() == limit {
-            has_more = true;
-            break;
-        }
-        filtered.push(result);
     }
 
-    let next_cursor = if has_more {
-        filtered.last().map(|item| item.path.clone())
-    } else {
-        None
-    };
+    let mut matching_ids: Option<BTreeSet<String>> = None;
+    for query_token in tokens {
+        let token_matches = token_shards
+            .iter()
+            .flat_map(|shard| shard.postings.values())
+            .filter(|posting| posting.token.contains(query_token))
+            .flat_map(|posting| posting.entry_ids.iter().cloned())
+            .collect::<BTreeSet<_>>();
 
-    Ok(CatalogPage {
-        items: filtered,
-        next_cursor,
-    })
+        if token_matches.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+
+        matching_ids = Some(match matching_ids {
+            Some(current) => current.intersection(&token_matches).cloned().collect(),
+            None => token_matches,
+        });
+    }
+
+    Ok(matching_ids.unwrap_or_default())
 }
 
 pub(crate) async fn collect_entries_by_tokens(
@@ -584,32 +623,15 @@ pub(crate) async fn collect_entries_by_tokens_with_snapshot(
     scope: CatalogEntryScope,
     current_snapshot: Option<&CurrentSnapshot>,
 ) -> Result<Vec<CatalogEntrySummary>, String> {
-    const PAGE_SIZE: usize = 256;
-
-    let mut cursor = None;
-    let mut entries = Vec::new();
-    loop {
-        let page = lookup_entries_by_tokens_with_snapshot(
-            Arc::clone(&fs),
-            key.clone(),
-            password.clone(),
-            tokens,
-            scope,
-            cursor.as_deref(),
-            PAGE_SIZE,
-            current_snapshot,
-        )
-        .await?;
-        let next_cursor = page.next_cursor.clone();
-        entries.extend(page.items);
-
-        match next_cursor {
-            Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
-            _ => break,
-        }
-    }
-
-    Ok(entries)
+    collect_matching_entries_with_snapshot(
+        &fs,
+        &key,
+        password.as_deref(),
+        tokens,
+        scope,
+        current_snapshot,
+    )
+    .await
 }
 
 fn status_from_catalog(catalog: &Catalog) -> CatalogStatus {

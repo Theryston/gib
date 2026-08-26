@@ -374,12 +374,14 @@ gib search "tax 2021 pdf" --path downloads --extension pdf
 gib search invoice --limit 25
 ```
 
-Search tokens are case-insensitive and use exact token matching across file and
-directory names. Multiple tokens must all be present. Use `--path` for a
-relative directory prefix and `--extension` without a leading dot. The command
-returns one result per logical path, including deleted paths with a restorable
-historical backup. Existing repositories without an indexed catalog report an
-empty successful result; new backups are indexed automatically.
+Search terms are case-insensitive and match partial text within file and
+directory names. Multiple terms must all be present. Results rank exact names
+first, then matching stems and prefixes, followed by broader substring matches.
+Use `--path` for a relative directory prefix and `--extension` without a
+leading dot. The command returns one result per logical path, including deleted
+paths with a restorable historical backup. Existing repositories without an
+indexed catalog report an empty successful result; new backups are indexed
+automatically.
 
 Use `--mode json` for a stable structured response. JSON results contain only
 the path, a short valid backup reference, and a ready-to-copy restore command.

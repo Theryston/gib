@@ -54,6 +54,7 @@ struct SearchResponse {
 
 #[derive(Debug, Clone)]
 struct RankedSearchResult {
+    relevance_score: i64,
     newest_revision_timestamp: u64,
     result: SearchResult,
 }
@@ -273,6 +274,11 @@ fn filter_sort_and_limit(
 
             let backup_short = short_backup_hash(&backup);
             Some(RankedSearchResult {
+                relevance_score: search_relevance_score(
+                    &summary.path,
+                    &request.query,
+                    &request.tokens,
+                ),
                 newest_revision_timestamp: summary.newest_revision_timestamp,
                 result: SearchResult {
                     restore_command: build_restore_command(&backup_short, &summary.path),
@@ -285,8 +291,13 @@ fn filter_sort_and_limit(
 
     ranked.sort_by(|left, right| {
         right
-            .newest_revision_timestamp
-            .cmp(&left.newest_revision_timestamp)
+            .relevance_score
+            .cmp(&left.relevance_score)
+            .then_with(|| {
+                right
+                    .newest_revision_timestamp
+                    .cmp(&left.newest_revision_timestamp)
+            })
             .then_with(|| left.result.path.cmp(&right.result.path))
     });
 
@@ -296,6 +307,84 @@ fn filter_sort_and_limit(
         ranked.into_iter().map(|ranked| ranked.result).collect(),
         truncated,
     )
+}
+
+fn search_relevance_score(path: &str, query: &str, query_tokens: &[String]) -> i64 {
+    let path = lookup_path(path);
+    let query = lookup_path(query);
+    let name = path.rsplit('/').next().unwrap_or(&path);
+    let stem = file_stem(name);
+    let mut score = 0;
+
+    if path == query {
+        score += 5_000_000;
+    }
+    if name == query {
+        score += 4_000_000;
+    }
+    if stem == query {
+        score += 3_000_000;
+    }
+    if !query.is_empty() {
+        if name.starts_with(&query) {
+            score += 2_000_000 + compactness_score(&query, name);
+        } else if name.contains(&query) {
+            score += 1_400_000 + compactness_score(&query, name);
+        }
+
+        if stem.starts_with(&query) {
+            score += 700_000 + compactness_score(&query, stem);
+        } else if stem.contains(&query) {
+            score += 450_000 + compactness_score(&query, stem);
+        }
+    }
+
+    let name_tokens = path_tokens(name);
+    let path_tokens = path_tokens(&path);
+    for query_token in query_tokens {
+        let name_match = best_token_match_score(query_token, &name_tokens);
+        let path_match = best_token_match_score(query_token, &path_tokens);
+        score += name_match;
+        score += if name_match == 0 {
+            path_match / 2
+        } else {
+            path_match / 10
+        };
+    }
+
+    score
+}
+
+fn file_stem(name: &str) -> &str {
+    name.rsplit_once('.')
+        .filter(|(stem, _)| !stem.is_empty())
+        .map_or(name, |(stem, _)| stem)
+}
+
+fn compactness_score(query: &str, candidate: &str) -> i64 {
+    let query_length = query.chars().count() as i64;
+    let candidate_length = candidate.chars().count().max(1) as i64;
+    (query_length * 100 / candidate_length).min(100)
+}
+
+fn best_token_match_score(query: &str, candidates: &[String]) -> i64 {
+    candidates
+        .iter()
+        .map(|candidate| token_match_score(query, candidate))
+        .max()
+        .unwrap_or_default()
+}
+
+fn token_match_score(query: &str, candidate: &str) -> i64 {
+    if candidate == query {
+        800_000 + compactness_score(query, candidate)
+    } else if candidate.starts_with(query) {
+        550_000 + compactness_score(query, candidate)
+    } else if candidate.contains(query) {
+        350_000 + compactness_score(query, candidate)
+    } else {
+        0
+    }
 }
 
 fn matches_path_prefix(path: &str, prefix: Option<&str>) -> bool {
@@ -464,6 +553,28 @@ mod tests {
             result.restore_command.contains(&result.last_backup)
                 && result.restore_command.contains(&result.path)
         }));
+    }
+
+    #[test]
+    fn ranks_exact_and_partial_file_name_matches() {
+        let request = parse_search_values("pop", None, None, 10).unwrap();
+        let (results, truncated) = filter_sort_and_limit(
+            vec![
+                summary("fonts/Poppins.ttf", 30, Some("poppins-backup")),
+                summary("pop.txt", 20, Some("pop-txt-backup")),
+                summary("pop", 10, Some("pop-backup")),
+            ],
+            &request,
+        );
+
+        assert!(!truncated);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pop", "pop.txt", "fonts/Poppins.ttf"]
+        );
     }
 
     #[test]
@@ -674,6 +785,43 @@ mod tests {
             response.results[1]
                 .restore_command
                 .contains("--only docs/old-invoice.pdf")
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn searches_partial_tokens_and_ranks_file_name_matches() {
+        let directory = test_directory("partial");
+        let fs: Arc<dyn FS> = Arc::new(LocalFS::new(&directory));
+        let key = "project";
+        let backup = backup(
+            "backup-one",
+            1,
+            HashMap::from([
+                (
+                    "fonts/Poppins.ttf".to_string(),
+                    object("poppins", "chunk-poppins"),
+                ),
+                ("pop.txt".to_string(), object("pop-txt", "chunk-pop-txt")),
+                ("pop".to_string(), object("pop", "chunk-pop")),
+            ]),
+            Vec::new(),
+        );
+        write_manifest(&fs, key, &backup, None).await;
+        index_backup(&fs, key, &backup, None, None).await;
+
+        let response = run_search(Arc::clone(&fs), key.to_string(), None, request("pop"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response
+                .results
+                .iter()
+                .map(|result| result.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pop", "pop.txt", "fonts/Poppins.ttf"]
         );
 
         let _ = std::fs::remove_dir_all(directory);

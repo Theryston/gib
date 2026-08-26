@@ -88,7 +88,7 @@ fn cli() -> Command {
                 .arg(
                     Arg::new("query")
                         .value_name("QUERY")
-                        .help("Case-insensitive tokens to search for in file paths")
+                        .help("Case-insensitive terms to search for in file paths")
                         .required(true),
                 )
                 .arg(
