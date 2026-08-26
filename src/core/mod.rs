@@ -1,3 +1,4 @@
+pub(crate) mod catalog;
 pub mod crypto;
 pub(crate) mod git_sync;
 pub mod indexes;

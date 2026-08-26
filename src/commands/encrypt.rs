@@ -82,6 +82,10 @@ pub async fn encrypt(matches: &ArgMatches) {
         files_to_encrypt.push(backup_file_path);
     }
 
+    if let Ok(catalog_files) = fs.list_files(&format!("{}/indexes/catalog/v1", key)).await {
+        files_to_encrypt.extend(catalog_files);
+    }
+
     pb.finish_and_clear();
 
     if !is_json_mode() {

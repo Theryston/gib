@@ -3,6 +3,7 @@ use crate::config::{
     PasswordPolicy, load_and_report_local_config, load_and_report_local_config_for_root,
     merge_ignore_patterns, resolve_path, resolve_repository, resolve_repository_values,
 };
+use crate::core::catalog::index_backup_after_finalize;
 use crate::core::crypto::read_file_maybe_decrypt;
 use crate::core::crypto::write_file_maybe_encrypt;
 use crate::core::git_sync::GitSyncPolicy;
@@ -478,6 +479,27 @@ async fn run_backup_with_scope(
                 &e, &continue_error_message
             ));
         }
+    }
+
+    let backup_for_catalog = new_backup.lock().unwrap().clone();
+    if let Err(error) = index_backup_after_finalize(
+        Arc::clone(&fs),
+        key.clone(),
+        password.clone(),
+        compress,
+        &backup_for_catalog,
+        primary_parent.as_deref(),
+        changed_paths.as_ref(),
+    )
+    .await
+    {
+        emit_warning(
+            &format!(
+                "Historical catalog update was deferred; the backup remains usable: {}",
+                error
+            ),
+            "catalog_degraded",
+        );
     }
 
     let backup_hash = new_backup.lock().unwrap().hash.clone();

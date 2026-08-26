@@ -1,6 +1,7 @@
 use crate::config::{
     PasswordPolicy, RepositoryOptions, load_and_report_local_config, resolve_repository,
 };
+use crate::core::catalog::{mark_catalog_degraded_state, remove_backup_from_catalog};
 use crate::core::crypto::read_file_maybe_decrypt;
 use crate::core::crypto::write_file_maybe_encrypt;
 use crate::core::indexes::{
@@ -9,7 +10,7 @@ use crate::core::indexes::{
 };
 use crate::core::metadata::Backup;
 use crate::fs::FS;
-use crate::output::{JsonProgress, emit_output, emit_progress_message, is_json_mode};
+use crate::output::{JsonProgress, emit_output, emit_progress_message, emit_warning, is_json_mode};
 use crate::utils::{compress_bytes, decompress_bytes, handle_error};
 use clap::ArgMatches;
 use dialoguer::Select;
@@ -228,6 +229,27 @@ pub async fn delete(matches: &ArgMatches) {
     let backup_file_path = format!("{}/backups/{}", key, full_backup_hash);
     if let Err(e) = fs.delete_file(&backup_file_path).await {
         handle_error(format!("Failed to delete backup file: {}", e), Some(&pb));
+    }
+
+    if let Err(error) = remove_backup_from_catalog(
+        Arc::clone(&fs),
+        key.clone(),
+        password.clone(),
+        3,
+        &backup,
+        &backup_summaries,
+        &chunk_indexes,
+    )
+    .await
+    {
+        let _ = mark_catalog_degraded_state(&fs, &key, password.as_deref(), 3).await;
+        emit_warning(
+            &format!(
+                "Historical catalog cleanup was deferred; the backup deletion completed: {}",
+                error
+            ),
+            "catalog_degraded",
+        );
     }
 
     pb.finish_and_clear();

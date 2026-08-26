@@ -147,6 +147,17 @@ Built with **Tokio** for maximum performance:
 - **Prune** unused chunks to reclaim storage space
 - Reference counting ensures nothing important is deleted
 
+### 🗂️ Automatic Historical Catalog
+
+After a backup is finalized, GIB incrementally maintains a metadata-only
+catalog of paths, revisions, directory relationships, and searchable name
+tokens, using the repository's compression and encryption pipeline. It updates
+only paths affected by the backup, never stores file contents, and is created
+lazily without rebuilding older snapshots. The catalog is repository data
+rather than a local cache; backup manifests and chunks remain authoritative.
+It is updated with version-aware writes and remains compatible with
+repositories created before this feature.
+
 ---
 
 ## 🎯 Quick Start
