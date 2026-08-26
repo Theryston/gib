@@ -1847,10 +1847,6 @@ fn format_visible_row(controller: &ExplorerController, row: &VisibleRow, focused
         SelectionMark::Partial => "~",
         SelectionMark::Selected => "*",
     };
-    let status = match row.entry.status {
-        ExplorerStatus::Current => "current",
-        ExplorerStatus::Deleted => "deleted",
-    };
     let branch = if row.entry.is_directory() {
         if controller.state.expanded.contains(&row.entry.path) {
             "▾"
@@ -1861,12 +1857,11 @@ fn format_visible_row(controller: &ExplorerController, row: &VisibleRow, focused
         "·"
     };
     format!(
-        "{}{} {}{} [{}] {}",
+        "{}{} {}{} {}",
         if focused { ">" } else { " " },
         marker,
         "  ".repeat(row.depth),
         branch,
-        status,
         row.entry.name
     )
 }
@@ -1875,8 +1870,11 @@ fn detail_lines(controller: &ExplorerController, entry: &ExplorerEntry) -> Vec<S
     let mut lines = vec![
         format!("path: {}", entry.path),
         format!("kind: {}", entry.kind.label()),
-        format!("status: {}", entry.status.label()),
-        format!("restorable: {}", entry.restorable),
+        format!(
+            "present in latest backup: {}",
+            yes_no(entry.status == ExplorerStatus::Current)
+        ),
+        format!("restorable: {}", yes_no(entry.restorable)),
     ];
     if let Some(backup) = &entry.last_backup {
         lines.push(format!("last backup: {}", short_hash(backup)));
@@ -1897,6 +1895,10 @@ fn detail_lines(controller: &ExplorerController, entry: &ExplorerEntry) -> Vec<S
         selection_label(selection_mark(controller, entry))
     ));
     lines
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 fn selection_mark(controller: &ExplorerController, entry: &ExplorerEntry) -> SelectionMark {
@@ -2241,5 +2243,11 @@ mod tests {
         assert_eq!(value["entries"][0]["status"], "current");
         assert_eq!(value["next_cursor"], "invoice.pdf");
         assert!(!serialized.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn renders_explorer_booleans_as_friendly_yes_or_no_values() {
+        assert_eq!(yes_no(true), "yes");
+        assert_eq!(yes_no(false), "no");
     }
 }
