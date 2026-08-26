@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const STATE_VERSION: u32 = 1;
@@ -9,6 +10,18 @@ pub(crate) struct LiveState {
     pub(crate) version: u32,
     pub(crate) initialized: bool,
     pub(crate) base_backup: Option<String>,
+    /// Advisory fingerprints used to avoid re-reading unchanged local files.
+    /// Repository objects and the worktree remain the sources of truth.
+    #[serde(default)]
+    pub(crate) files: BTreeMap<String, LiveFileCache>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct LiveFileCache {
+    pub(crate) size: u64,
+    pub(crate) modified_unix_nanos: Option<u64>,
+    pub(crate) permissions: u32,
+    pub(crate) hash: String,
 }
 
 fn state_directory() -> PathBuf {
@@ -100,11 +113,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn state_round_trip_contains_only_the_base_reference() {
+    fn state_round_trip_preserves_file_cache() {
+        let file_cache = LiveFileCache {
+            size: 42,
+            modified_unix_nanos: Some(123),
+            permissions: 0o644,
+            hash: "file-hash".to_string(),
+        };
         let state = LiveState {
             version: STATE_VERSION,
             initialized: true,
             base_backup: Some("abc123".to_string()),
+            files: BTreeMap::from([("file.txt".to_string(), file_cache.clone())]),
         };
         let bytes = rmp_serde::to_vec_named(&state).unwrap();
         let decoded: LiveState = rmp_serde::from_slice(&bytes).unwrap();
@@ -112,5 +132,26 @@ mod tests {
         assert_eq!(decoded.version, STATE_VERSION);
         assert!(decoded.initialized);
         assert_eq!(decoded.base_backup.as_deref(), Some("abc123"));
+        assert_eq!(decoded.files.get("file.txt"), Some(&file_cache));
+    }
+
+    #[test]
+    fn state_without_file_cache_remains_compatible() {
+        #[derive(Serialize)]
+        struct LegacyLiveState {
+            version: u32,
+            initialized: bool,
+            base_backup: Option<String>,
+        }
+
+        let bytes = rmp_serde::to_vec_named(&LegacyLiveState {
+            version: STATE_VERSION,
+            initialized: true,
+            base_backup: Some("abc123".to_string()),
+        })
+        .unwrap();
+        let decoded: LiveState = rmp_serde::from_slice(&bytes).unwrap();
+
+        assert!(decoded.files.is_empty());
     }
 }

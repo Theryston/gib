@@ -258,12 +258,18 @@ Run `gib live` on every active device that works on the same project. The
 devices automatically synchronize through the repository, so a change made on
 one device is received by the others even when they are running simultaneously.
 The live process keeps a small, machine-local state file containing the last
-synchronized backup hash. Before publishing a snapshot it compares that base
-with the current repository HEAD, automatically applies one-sided remote
-changes, and performs bounded three-way merges for text files. Binary changes
-and overlapping text changes are reported as conflicts instead of being
-silently overwritten. Remote changes are also polled periodically, so a device
-can receive updates even when no local file event occurs.
+synchronized backup hash and advisory per-file metadata plus content hashes.
+The cache never stores file contents and is never treated as repository truth:
+filesystem events invalidate affected entries, and a metadata mismatch
+invalidates an entry before it is reused. Before publishing a snapshot it
+compares that base with the current repository HEAD, automatically applies
+one-sided remote changes, and performs
+bounded three-way merges for text files. Binary changes and overlapping text
+changes are reported as conflicts instead of being silently overwritten. Remote
+changes are also polled periodically, so a device can receive updates even
+when no local file event occurs. Missing or invalid cached repository references
+are discarded and repaired instead of causing live synchronization to retry the
+same missing backup forever.
 
 Live-generated messages start with `[LIVE]` and contain only the number of
 created, changed, and deleted files, for example `[LIVE] created: 12 files;

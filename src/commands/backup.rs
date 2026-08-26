@@ -7,8 +7,9 @@ use crate::core::crypto::read_file_maybe_decrypt;
 use crate::core::crypto::write_file_maybe_encrypt;
 use crate::core::indexes::{
     add_backup_summary, advance_repository_head, create_new_backup, list_backup_summaries,
-    load_chunk_indexes_with_version, read_or_initialize_repository_head, resolve_backup_reference,
-    set_repository_head, write_chunk_indexes_with_merge,
+    list_backup_summaries_strict, load_chunk_indexes_with_version,
+    read_or_initialize_repository_head, resolve_backup_reference, set_repository_head,
+    write_chunk_indexes_with_merge,
 };
 use crate::core::metadata::PendingBackup;
 use crate::core::metadata::{Backup, BackupObject, ChunkIndex};
@@ -16,7 +17,7 @@ use crate::core::permissions::get_file_permissions_with_path;
 use crate::fs::FS;
 use crate::output::{JsonProgress, emit_output, emit_progress_message, emit_warning, is_json_mode};
 use crate::utils::decompress_bytes;
-use crate::utils::{compress_bytes, handle_error};
+use crate::utils::{compress_bytes, decrypt_bytes, handle_error, is_encrypted};
 use bytesize::ByteSize;
 use clap::ArgMatches;
 use console::style;
@@ -1523,6 +1524,81 @@ pub(crate) async fn load_backup(
         .map_err(|e| format!("Failed to deserialize backup: {}", e))?;
 
     Ok(backup)
+}
+
+pub(crate) async fn load_backup_if_available(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+    backup_hash: &str,
+) -> Result<Option<Backup>, String> {
+    let backup_path = format!("{}/backups/{}", key, backup_hash);
+    let raw_bytes = match fs.read_file(&backup_path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Failed to read backup '{}': {}",
+                backup_path, error
+            ));
+        }
+    };
+
+    if raw_bytes.is_empty() {
+        return Ok(None);
+    }
+
+    let bytes = if is_encrypted(&raw_bytes) {
+        let password = password
+            .as_deref()
+            .ok_or_else(|| "Backup is encrypted but no password provided".to_string())?;
+        decrypt_bytes(&raw_bytes, password.as_bytes())?
+    } else {
+        raw_bytes
+    };
+
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+
+    let decompressed_bytes = match zstd::decode_all(bytes.as_slice()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    let backup: Backup = match rmp_serde::from_slice(&decompressed_bytes) {
+        Ok(backup) => backup,
+        Err(_) => return Ok(None),
+    };
+
+    if backup.hash != backup_hash {
+        return Ok(None);
+    }
+
+    Ok(Some(backup))
+}
+
+pub(crate) async fn load_latest_available_backup(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+) -> Result<Option<(String, Backup)>, String> {
+    let summaries =
+        list_backup_summaries_strict(Arc::clone(&fs), key.clone(), password.clone()).await?;
+
+    for summary in summaries {
+        if let Some(backup) = load_backup_if_available(
+            Arc::clone(&fs),
+            key.clone(),
+            password.clone(),
+            &summary.hash,
+        )
+        .await?
+        {
+            return Ok(Some((summary.hash, backup)));
+        }
+    }
+
+    Ok(None)
 }
 
 fn increment_chunk_refcounts(

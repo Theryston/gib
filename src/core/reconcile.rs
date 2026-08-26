@@ -1,9 +1,11 @@
 use crate::core::crypto::read_file_maybe_decrypt;
+use crate::core::live_state::LiveFileCache;
 use crate::core::metadata::{Backup, BackupObject};
 use crate::core::permissions::{get_file_permissions_with_path, set_file_permissions};
 use crate::fs::FS;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::Metadata;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -35,11 +37,13 @@ pub(crate) struct ReconciliationResult {
     pub(crate) conflicts: Vec<ReconcileConflict>,
 }
 
-pub(crate) fn scan_worktree(
+pub(crate) fn scan_worktree_with_cache(
     root: &Path,
     ignore_patterns: &[String],
+    cache: &mut BTreeMap<String, LiveFileCache>,
 ) -> Result<HashMap<String, LocalFile>, String> {
     let mut files = HashMap::new();
+    let mut present_paths = BTreeSet::new();
     let walker = WalkDir::new(root)
         .into_iter()
         .filter_entry(|entry| !is_ignored_path(entry.path(), root, ignore_patterns));
@@ -60,22 +64,22 @@ pub(crate) fn scan_worktree(
         let metadata = entry
             .metadata()
             .map_err(|error| format!("Failed to inspect '{}': {}", relative, error))?;
-        let hash = hash_file(entry.path())
-            .map_err(|error| format!("Failed to hash '{}': {}", relative, error))?;
+        let permissions =
+            get_file_permissions_with_path(&metadata, entry.path().to_string_lossy().as_ref());
+        let hash = cached_or_hash_file(entry.path(), &relative, &metadata, permissions, cache)?;
 
+        present_paths.insert(relative.clone());
         files.insert(
             relative,
             LocalFile {
                 hash,
                 size: metadata.len(),
-                permissions: get_file_permissions_with_path(
-                    &metadata,
-                    entry.path().to_string_lossy().as_ref(),
-                ),
+                permissions,
             },
         );
     }
 
+    cache.retain(|path, _| present_paths.contains(path));
     Ok(files)
 }
 
@@ -87,8 +91,9 @@ pub(crate) async fn reconcile_worktree(
     fs: Arc<dyn FS>,
     key: &str,
     password: Option<&str>,
+    cache: &mut BTreeMap<String, LiveFileCache>,
 ) -> Result<ReconciliationResult, String> {
-    let local = scan_worktree(root, ignore_patterns)?;
+    let local = scan_worktree_with_cache(root, ignore_patterns, cache)?;
     let base_tree = base.map(|backup| &backup.tree);
     let remote_tree = &remote.tree;
     let mut paths = BTreeSet::new();
@@ -125,6 +130,7 @@ pub(crate) async fn reconcile_worktree(
 
         if local_matches_backup(local_file, base_file) {
             apply_remote_change(root, &path, remote_file, fs.clone(), key, password).await?;
+            update_cache_entry_from_backup(root, cache, &path, remote_file)?;
             result.applied_remote += 1;
             continue;
         }
@@ -141,6 +147,7 @@ pub(crate) async fn reconcile_worktree(
                 if local_file.permissions != remote_file.permissions {
                     apply_remote_change(root, &path, Some(remote_file), fs.clone(), key, password)
                         .await?;
+                    update_cache_entry_from_backup(root, cache, &path, Some(remote_file))?;
                     result.applied_remote += 1;
                 }
                 continue;
@@ -166,6 +173,14 @@ pub(crate) async fn reconcile_worktree(
                     if let Some(merged) = three_way_merge(&base_bytes, &local_bytes, &remote_bytes)
                     {
                         write_bytes_atomically(root, &path, &merged, local_file.permissions)?;
+                        update_cache_entry_from_hash(
+                            root,
+                            cache,
+                            &path,
+                            &format!("{:x}", Sha256::digest(&merged)),
+                            local_file.permissions,
+                            merged.len() as u64,
+                        )?;
                         result.merged_text += 1;
                         result.local_changes.insert(path.clone());
                         continue;
@@ -270,12 +285,13 @@ pub(crate) async fn apply_remote_change(
     Ok(())
 }
 
-pub(crate) fn worktree_matches_backup(
+pub(crate) fn worktree_matches_backup_with_cache(
     root: &Path,
     ignore_patterns: &[String],
     backup: &Backup,
+    cache: &mut BTreeMap<String, LiveFileCache>,
 ) -> Result<bool, String> {
-    let local = scan_worktree(root, ignore_patterns)?;
+    let local = scan_worktree_with_cache(root, ignore_patterns, cache)?;
     let expected: HashMap<String, &BackupObject> = backup
         .tree
         .iter()
@@ -294,11 +310,12 @@ pub(crate) fn worktree_matches_backup(
     }))
 }
 
-pub(crate) fn worktree_matches_backup_paths(
+pub(crate) fn worktree_matches_backup_paths_with_cache(
     root: &Path,
     ignore_patterns: &[String],
     backup: &Backup,
     changed_paths: &BTreeSet<String>,
+    cache: &mut BTreeMap<String, LiveFileCache>,
 ) -> Result<bool, String> {
     let scopes = changed_paths
         .iter()
@@ -307,7 +324,7 @@ pub(crate) fn worktree_matches_backup_paths(
             (path.trim_matches('/').to_string(), !target.is_file())
         })
         .collect::<Vec<_>>();
-    let local = scan_worktree_scopes(root, ignore_patterns, &scopes)?;
+    let local = scan_worktree_scopes(root, ignore_patterns, &scopes, cache)?;
     let expected: HashMap<String, &BackupObject> = backup
         .tree
         .iter()
@@ -335,6 +352,7 @@ fn scan_worktree_scopes(
     root: &Path,
     ignore_patterns: &[String],
     scopes: &[(String, bool)],
+    cache: &mut BTreeMap<String, LiveFileCache>,
 ) -> Result<HashMap<String, LocalFile>, String> {
     let mut files = HashMap::new();
 
@@ -344,7 +362,7 @@ fn scan_worktree_scopes(
             if is_ignored_path(&target, root, ignore_patterns) {
                 continue;
             }
-            insert_local_file(&mut files, root, &target)?;
+            insert_local_file(&mut files, root, &target, cache)?;
             continue;
         }
 
@@ -360,7 +378,7 @@ fn scan_worktree_scopes(
                 format!("Failed to scan live root '{}': {}", root.display(), error)
             })?;
             if entry.file_type().is_file() {
-                insert_local_file(&mut files, root, entry.path())?;
+                insert_local_file(&mut files, root, entry.path(), cache)?;
             }
         }
     }
@@ -372,6 +390,7 @@ fn insert_local_file(
     files: &mut HashMap<String, LocalFile>,
     root: &Path,
     path: &Path,
+    cache: &mut BTreeMap<String, LiveFileCache>,
 ) -> Result<(), String> {
     let relative = path
         .strip_prefix(root)
@@ -381,18 +400,185 @@ fn insert_local_file(
     let metadata = path
         .metadata()
         .map_err(|error| format!("Failed to inspect '{}': {}", relative, error))?;
-    let hash =
-        hash_file(path).map_err(|error| format!("Failed to hash '{}': {}", relative, error))?;
+    let permissions = get_file_permissions_with_path(&metadata, path.to_string_lossy().as_ref());
+    let hash = cached_or_hash_file(path, &relative, &metadata, permissions, cache)?;
 
     files.insert(
         relative,
         LocalFile {
             hash,
             size: metadata.len(),
-            permissions: get_file_permissions_with_path(&metadata, path.to_string_lossy().as_ref()),
+            permissions,
         },
     );
     Ok(())
+}
+
+fn cached_or_hash_file(
+    path: &Path,
+    relative: &str,
+    metadata: &Metadata,
+    permissions: u32,
+    cache: &mut BTreeMap<String, LiveFileCache>,
+) -> Result<String, String> {
+    let modified_unix_nanos = modified_unix_nanos(metadata);
+    if let Some(cached) = cache.get(relative).filter(|cached| {
+        cached.size == metadata.len()
+            && cached.permissions == permissions
+            && cached.modified_unix_nanos.is_some()
+            && cached.modified_unix_nanos == modified_unix_nanos
+            && !cached.hash.is_empty()
+    }) {
+        return Ok(cached.hash.clone());
+    }
+
+    let hash =
+        hash_file(path).map_err(|error| format!("Failed to hash '{}': {}", relative, error))?;
+    cache.insert(
+        relative.to_string(),
+        LiveFileCache {
+            size: metadata.len(),
+            modified_unix_nanos,
+            permissions,
+            hash: hash.clone(),
+        },
+    );
+    Ok(hash)
+}
+
+pub(crate) fn invalidate_worktree_cache_paths(
+    cache: &mut BTreeMap<String, LiveFileCache>,
+    changed_paths: &BTreeSet<String>,
+) {
+    let scopes = changed_paths
+        .iter()
+        .map(|path| path.trim_matches('/').to_string())
+        .collect::<Vec<_>>();
+    cache.retain(|path, _| !scopes.iter().any(|scope| path_in_scope(path, scope, true)));
+}
+
+pub(crate) fn update_worktree_cache_from_backup(
+    root: &Path,
+    ignore_patterns: &[String],
+    cache: &mut BTreeMap<String, LiveFileCache>,
+    backup: &Backup,
+    changed_paths: Option<&BTreeSet<String>>,
+) -> Result<(), String> {
+    match changed_paths {
+        Some(changed_paths) => {
+            let scopes = cache_scopes(root, changed_paths);
+            cache.retain(|path, _| {
+                !scopes
+                    .iter()
+                    .any(|(scope, recursive)| path_in_scope(path, scope, *recursive))
+            });
+
+            for (path, object) in backup.tree.iter().filter(|(path, _)| {
+                !is_ignored_relative(path, ignore_patterns)
+                    && scopes
+                        .iter()
+                        .any(|(scope, recursive)| path_in_scope(path, scope, *recursive))
+            }) {
+                update_cache_entry_from_backup(root, cache, path, Some(object))?;
+            }
+        }
+        None => {
+            cache.clear();
+            for (path, object) in backup
+                .tree
+                .iter()
+                .filter(|(path, _)| !is_ignored_relative(path, ignore_patterns))
+            {
+                update_cache_entry_from_backup(root, cache, path, Some(object))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn update_cache_entry_from_backup(
+    root: &Path,
+    cache: &mut BTreeMap<String, LiveFileCache>,
+    relative_path: &str,
+    backup: Option<&BackupObject>,
+) -> Result<(), String> {
+    match backup {
+        Some(backup) => {
+            let target = safe_target_path(root, relative_path)?;
+            if target.is_file() {
+                update_cache_entry_from_hash(
+                    root,
+                    cache,
+                    relative_path,
+                    &backup.hash,
+                    backup.permissions,
+                    backup.size,
+                )?;
+            } else {
+                remove_cache_scope(cache, relative_path);
+            }
+        }
+        None => remove_cache_scope(cache, relative_path),
+    }
+
+    Ok(())
+}
+
+fn update_cache_entry_from_hash(
+    root: &Path,
+    cache: &mut BTreeMap<String, LiveFileCache>,
+    relative_path: &str,
+    hash: &str,
+    permissions: u32,
+    size: u64,
+) -> Result<(), String> {
+    let target = safe_target_path(root, relative_path)?;
+    let metadata = match target.metadata() {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) | Err(_) => {
+            cache.remove(relative_path);
+            return Ok(());
+        }
+    };
+
+    cache.insert(
+        relative_path.to_string(),
+        LiveFileCache {
+            size,
+            modified_unix_nanos: modified_unix_nanos(&metadata),
+            permissions,
+            hash: hash.to_string(),
+        },
+    );
+    Ok(())
+}
+
+fn remove_cache_scope(cache: &mut BTreeMap<String, LiveFileCache>, relative_path: &str) {
+    let relative_path = relative_path.trim_matches('/');
+    cache.retain(|path, _| !path_in_scope(path, relative_path, true));
+}
+
+fn cache_scopes(root: &Path, changed_paths: &BTreeSet<String>) -> Vec<(String, bool)> {
+    changed_paths
+        .iter()
+        .map(|path| {
+            let path = path.trim_matches('/').to_string();
+            let target = root.join(&path);
+            (path, !target.is_file())
+        })
+        .collect()
+}
+
+fn modified_unix_nanos(metadata: &Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos()
+        .try_into()
+        .ok()
 }
 
 fn path_in_scope(path: &str, scope: &str, recursive: bool) -> bool {
@@ -777,6 +963,48 @@ fn is_ignored_relative(path: &str, ignore_patterns: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temporary_directory() -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("gib-reconcile-test-{suffix}"));
+        std::fs::create_dir_all(&path).expect("temporary directory should be created");
+        path
+    }
+
+    #[test]
+    fn cached_fingerprints_are_reused_until_file_metadata_changes() {
+        let root = temporary_directory();
+        let file = root.join("file.txt");
+        std::fs::write(&file, b"before").unwrap();
+        let metadata = file.metadata().unwrap();
+        let permissions =
+            get_file_permissions_with_path(&metadata, file.to_string_lossy().as_ref());
+        let mut cache = BTreeMap::from([(
+            "file.txt".to_string(),
+            LiveFileCache {
+                size: metadata.len(),
+                modified_unix_nanos: modified_unix_nanos(&metadata),
+                permissions,
+                hash: "cached-hash".to_string(),
+            },
+        )]);
+
+        let cached = scan_worktree_with_cache(&root, &[], &mut cache).unwrap();
+        assert_eq!(cached["file.txt"].hash, "cached-hash");
+
+        std::fs::write(&file, b"changed").unwrap();
+        let rescanned = scan_worktree_with_cache(&root, &[], &mut cache).unwrap();
+        assert_eq!(
+            rescanned["file.txt"].hash,
+            format!("{:x}", Sha256::digest(b"changed"))
+        );
+        assert_ne!(rescanned["file.txt"].hash, "cached-hash");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn merges_non_overlapping_text_changes() {

@@ -1,15 +1,19 @@
 use crate::commands::backup::{
-    BackupMode, BackupResult, ResolvedBackup, is_ignored_path, load_backup, resolve_backup,
-    run_backup_with_parents, run_incremental_backup_with_parents,
+    BackupMode, BackupResult, ResolvedBackup, is_ignored_path, load_backup_if_available,
+    load_latest_available_backup, resolve_backup, run_backup_with_parents,
+    run_incremental_backup_with_parents,
 };
-use crate::core::indexes::read_or_initialize_repository_head;
+use crate::core::indexes::{
+    RepositoryHeadSnapshot, read_or_initialize_repository_head, set_repository_head,
+};
 use crate::core::live_state::{LiveState, load_live_state, save_live_state};
 use crate::core::metadata::Backup;
 use crate::core::reconcile::{
-    ReconcileConflict, apply_remote_change, reconcile_worktree, worktree_matches_backup,
-    worktree_matches_backup_paths,
+    ReconcileConflict, apply_remote_change, invalidate_worktree_cache_paths, reconcile_worktree,
+    update_cache_entry_from_backup, update_worktree_cache_from_backup,
+    worktree_matches_backup_paths_with_cache, worktree_matches_backup_with_cache,
 };
-use crate::output::{emit_named_event, is_json_mode};
+use crate::output::{emit_named_event, emit_warning, is_json_mode};
 use crate::utils::handle_error;
 use clap::ArgMatches;
 use console::style;
@@ -485,6 +489,78 @@ struct SyncOutcome {
     merged_text: usize,
 }
 
+enum RemoteBackupResolution {
+    Ready {
+        hash: Option<String>,
+        backup: Option<Backup>,
+    },
+    Retry,
+}
+
+async fn load_authoritative_remote_backup(
+    resolved: &ResolvedBackup,
+    head: &RepositoryHeadSnapshot,
+) -> Result<RemoteBackupResolution, String> {
+    let Some(requested_hash) = head.head.backup.clone() else {
+        return Ok(RemoteBackupResolution::Ready {
+            hash: None,
+            backup: None,
+        });
+    };
+
+    if let Some(backup) = load_backup_if_available(
+        Arc::clone(&resolved.options.fs),
+        resolved.options.key.clone(),
+        resolved.options.password.clone(),
+        &requested_hash,
+    )
+    .await?
+    {
+        return Ok(RemoteBackupResolution::Ready {
+            hash: Some(requested_hash),
+            backup: Some(backup),
+        });
+    }
+
+    let fallback = load_latest_available_backup(
+        Arc::clone(&resolved.options.fs),
+        resolved.options.key.clone(),
+        resolved.options.password.clone(),
+    )
+    .await?;
+    let replacement_hash = fallback.as_ref().map(|(hash, _backup)| hash.clone());
+    let replacement_backup = fallback.map(|(_hash, backup)| backup);
+    let repaired = set_repository_head(
+        Arc::clone(&resolved.options.fs),
+        resolved.options.key.clone(),
+        resolved.options.password.clone(),
+        head,
+        replacement_hash.as_deref(),
+    )
+    .await?;
+
+    if !repaired {
+        return Ok(RemoteBackupResolution::Retry);
+    }
+
+    let message = match replacement_hash.as_deref() {
+        Some(replacement) => format!(
+            "Repository HEAD referenced a missing or invalid backup '{}'; recovered '{}'",
+            requested_hash, replacement
+        ),
+        None => format!(
+            "Repository HEAD referenced a missing or invalid backup '{}'; cleared the stale reference",
+            requested_hash
+        ),
+    };
+    emit_warning(&message, "stale_repository_reference");
+
+    Ok(RemoteBackupResolution::Ready {
+        hash: replacement_hash,
+        backup: replacement_backup,
+    })
+}
+
 async fn synchronize_live(
     resolved: &ResolvedBackup,
     state: &mut LiveState,
@@ -503,6 +579,10 @@ async fn synchronize_live_with_paths(
 ) -> Result<SyncOutcome, String> {
     let root = PathBuf::from(&resolved.options.root_path_string);
 
+    if let Some(changed_paths) = changed_paths.as_ref() {
+        invalidate_worktree_cache_paths(&mut state.files, changed_paths);
+    }
+
     for attempt in 0..3 {
         let head = read_or_initialize_repository_head(
             Arc::clone(&resolved.options.fs),
@@ -510,32 +590,41 @@ async fn synchronize_live_with_paths(
             resolved.options.password.clone(),
         )
         .await?;
-        let remote_hash = head.head.backup.clone();
-        let base_hash = state.base_backup.clone();
+        let (remote_hash, remote_backup) =
+            match load_authoritative_remote_backup(resolved, &head).await? {
+                RemoteBackupResolution::Ready { hash, backup } => (hash, backup),
+                RemoteBackupResolution::Retry => continue,
+            };
+        let mut base_hash = state.base_backup.clone();
 
-        let remote_backup = match remote_hash.as_deref() {
-            Some(hash) => Some(
-                load_backup(
-                    Arc::clone(&resolved.options.fs),
-                    resolved.options.key.clone(),
-                    resolved.options.password.clone(),
-                    hash,
-                )
-                .await?,
-            ),
-            None => None,
-        };
         let base_backup = match base_hash.as_deref() {
             Some(hash) if Some(hash) == remote_hash.as_deref() => remote_backup.clone(),
-            Some(hash) => Some(
-                load_backup(
-                    Arc::clone(&resolved.options.fs),
-                    resolved.options.key.clone(),
-                    resolved.options.password.clone(),
-                    hash,
-                )
-                .await?,
-            ),
+            Some(hash) => match load_backup_if_available(
+                Arc::clone(&resolved.options.fs),
+                resolved.options.key.clone(),
+                resolved.options.password.clone(),
+                hash,
+            )
+            .await?
+            {
+                Some(backup) => Some(backup),
+                None => {
+                    let message = format!(
+                        "Live state referenced a missing or invalid backup '{}'; discarded the stale base reference",
+                        hash
+                    );
+                    emit_warning(&message, "stale_live_reference");
+                    state.base_backup = None;
+                    save_live_state(
+                        &root,
+                        &resolved.options.storage,
+                        &resolved.options.key,
+                        state,
+                    )?;
+                    base_hash = None;
+                    None
+                }
+            },
             None => None,
         };
 
@@ -559,6 +648,7 @@ async fn synchronize_live_with_paths(
                 Arc::clone(&resolved.options.fs),
                 &resolved.options.key,
                 resolved.options.password.as_deref(),
+                &mut state.files,
             )
             .await?;
             outcome.applied_remote = reconciliation.applied_remote;
@@ -580,6 +670,12 @@ async fn synchronize_live_with_paths(
                 .await?;
                 for path in remote_resolutions {
                     backup_paths.remove(&path);
+                    update_cache_entry_from_backup(
+                        &root,
+                        &mut state.files,
+                        &path,
+                        remote_tree.tree.get(&path),
+                    )?;
                 }
             }
 
@@ -599,14 +695,20 @@ async fn synchronize_live_with_paths(
         }
 
         let worktree_matches = if use_incremental_backup {
-            worktree_matches_backup_paths(
+            worktree_matches_backup_paths_with_cache(
                 &root,
                 &resolved.options.ignore_patterns,
                 &remote_tree,
                 &backup_paths,
+                &mut state.files,
             )?
         } else {
-            worktree_matches_backup(&root, &resolved.options.ignore_patterns, &remote_tree)?
+            worktree_matches_backup_with_cache(
+                &root,
+                &resolved.options.ignore_patterns,
+                &remote_tree,
+                &mut state.files,
+            )?
         };
 
         if worktree_matches {
@@ -640,6 +742,11 @@ async fn synchronize_live_with_paths(
         });
         emit_live_backup_started(&backup_message);
 
+        let cache_paths = if use_incremental_backup {
+            Some(backup_paths.clone())
+        } else {
+            None
+        };
         let result = if use_incremental_backup {
             run_incremental_backup_with_parents(
                 resolved.options.clone(),
@@ -653,6 +760,13 @@ async fn synchronize_live_with_paths(
         };
 
         if result.head_published {
+            update_worktree_cache_from_backup(
+                &root,
+                &resolved.options.ignore_patterns,
+                &mut state.files,
+                &result.backup,
+                cache_paths.as_ref(),
+            )?;
             state.initialized = true;
             state.base_backup = Some(result.backup.hash.clone());
             save_live_state(
@@ -1053,6 +1167,7 @@ mod tests {
             version: 1,
             initialized: true,
             base_backup: Some(initial.backup.hash),
+            files: std::collections::BTreeMap::new(),
         };
 
         let unchanged_event = synchronize_live_with_paths(
@@ -1083,6 +1198,70 @@ mod tests {
         assert_eq!(
             backup.backup.tree["changed.txt"].hash,
             format!("{:x}", sha2::Sha256::digest(b"after"))
+        );
+
+        let _ = std::fs::remove_dir_all(fixture);
+    }
+
+    #[tokio::test]
+    async fn stale_live_references_are_repaired_before_synchronization() {
+        let fixture = temporary_directory();
+        let source = fixture.join("machine");
+        let storage = fixture.join("storage");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("file.txt"), b"local content").unwrap();
+
+        let options = BackupOptions {
+            key: "project".to_string(),
+            root_path_string: source.to_string_lossy().to_string(),
+            storage: "test".to_string(),
+            fs: Arc::new(LocalFS::new(&storage)),
+            author: "tester <tester@example.com>".to_string(),
+            compress: 3,
+            password: None,
+            chunk_size: 1024,
+            ignore_patterns: Vec::new(),
+            concurrency: 1,
+        };
+        let initial = run_backup(options.clone(), "[LIVE] initial".to_string(), None, None)
+            .await
+            .unwrap();
+        let stale_hash = initial.backup.hash.clone();
+        std::fs::remove_file(storage.join(format!("project/backups/{stale_hash}"))).unwrap();
+
+        let resolved = ResolvedBackup {
+            options,
+            message: String::new(),
+            parent_hash: None,
+            pending_backup: None,
+            live_debounce_ms: 300,
+            live_poll_ms: 2_000,
+        };
+        let mut state = LiveState {
+            version: 1,
+            initialized: true,
+            base_backup: Some(stale_hash.clone()),
+            files: std::collections::BTreeMap::new(),
+        };
+
+        let outcome = synchronize_live_with_paths(
+            &resolved,
+            &mut state,
+            Some("[LIVE] repaired stale state".to_string()),
+            Some(ConflictPolicy::Local),
+            Some(BTreeSet::from(["file.txt".to_string()])),
+        )
+        .await
+        .unwrap();
+
+        let backup = outcome
+            .backup
+            .expect("live should recover with a new backup");
+        assert_ne!(backup.backup.hash, stale_hash);
+        assert_eq!(backup.backup.tree["file.txt"].size, 13);
+        assert_eq!(
+            state.base_backup.as_deref(),
+            Some(backup.backup.hash.as_str())
         );
 
         let _ = std::fs::remove_dir_all(fixture);
@@ -1148,11 +1327,13 @@ mod tests {
             version: 1,
             initialized: true,
             base_backup: Some(initial.backup.hash.clone()),
+            files: std::collections::BTreeMap::new(),
         };
         let mut state_two = LiveState {
             version: 1,
             initialized: true,
             base_backup: Some(initial.backup.hash),
+            files: std::collections::BTreeMap::new(),
         };
 
         std::fs::write(source_one.join("shared.txt"), b"base\nfrom one\n").unwrap();

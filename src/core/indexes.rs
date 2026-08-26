@@ -79,16 +79,48 @@ pub(crate) async fn list_backup_summaries(
     )
     .await?;
 
-    let backup_summaries: Vec<BackupSummary> = if read_result.bytes.is_empty() {
-        Vec::new()
-    } else {
-        let decompressed_backup_summaries_bytes = decompress_bytes(&read_result.bytes);
+    deserialize_backup_summaries(&read_result.bytes)
+}
 
-        rmp_serde::from_slice(&decompressed_backup_summaries_bytes)
-            .map_err(|e| format!("Failed to deserialize backup summaries: {}", e))?
+/// Reads the backup index without hiding storage read failures.
+///
+/// The regular listing function intentionally preserves the historical
+/// best-effort behavior used by interactive commands. Live synchronization
+/// uses this strict variant while repairing stale references, so a temporary
+/// storage failure cannot be mistaken for an empty repository.
+pub(crate) async fn list_backup_summaries_strict(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+) -> Result<Vec<BackupSummary>, String> {
+    let index_path = format!("{}/indexes/backups", key);
+    let raw_bytes = match fs.read_file(&index_path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(format!("Failed to read backup index: {}", error)),
     };
 
-    Ok(backup_summaries)
+    let bytes = if is_encrypted(&raw_bytes) {
+        let password = password
+            .as_deref()
+            .ok_or_else(|| "Backup summaries are encrypted but no password provided".to_string())?;
+        decrypt_bytes(&raw_bytes, password.as_bytes())?
+    } else {
+        raw_bytes
+    };
+
+    deserialize_backup_summaries(&bytes)
+}
+
+fn deserialize_backup_summaries(bytes: &[u8]) -> Result<Vec<BackupSummary>, String> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let decompressed_backup_summaries_bytes = zstd::decode_all(bytes)
+        .map_err(|e| format!("Failed to decompress backup summaries: {}", e))?;
+    rmp_serde::from_slice(&decompressed_backup_summaries_bytes)
+        .map_err(|e| format!("Failed to deserialize backup summaries: {}", e))
 }
 
 pub(crate) async fn resolve_backup_reference(
