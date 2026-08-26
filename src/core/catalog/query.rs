@@ -39,6 +39,7 @@ pub(crate) struct CatalogEntrySummary {
     pub(crate) path: String,
     pub(crate) exists_in_latest_indexed_snapshot: bool,
     pub(crate) latest_restorable_backup: Option<String>,
+    pub(crate) newest_revision_timestamp: u64,
     pub(crate) revision_count: usize,
 }
 
@@ -355,6 +356,13 @@ pub(crate) async fn lookup_entries_by_tokens(
             } else {
                 entry.latest_restorable_backup.clone()
             },
+            newest_revision_timestamp: entry
+                .revisions
+                .iter()
+                .filter(|revision| revision.latest_restorable_backup.is_some())
+                .map(|revision| revision.present_from_timestamp)
+                .max()
+                .unwrap_or_default(),
             revision_count: entry.revisions.len(),
         });
     }

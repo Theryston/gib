@@ -83,6 +83,42 @@ fn cli() -> Command {
                 .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))
         )
         .subcommand(
+            Command::new("search")
+                .about("Search files in the historical filesystem catalog")
+                .arg(
+                    Arg::new("query")
+                        .value_name("QUERY")
+                        .help("Case-insensitive tokens to search for in file paths")
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("path")
+                        .long("path")
+                        .value_name("PREFIX")
+                        .help("Restrict results to this relative path prefix")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("extension")
+                        .long("extension")
+                        .value_name("EXT")
+                        .help("Restrict results to this file extension (without a leading dot)")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("limit")
+                        .long("limit")
+                        .value_name("N")
+                        .help("Maximum number of results to display (default: 100)")
+                        .value_parser(clap::value_parser!(usize))
+                        .default_value("100")
+                        .required(false),
+                )
+                .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
+                .arg(arg!(-s --storage <STORAGE> "The storage to use").required(false))
+                .arg(arg!(-p --password <PASSWORD> "The password to use for encrypted repositories").required(false))
+        )
+        .subcommand(
             Command::new("backup")
                 .about("Create a backup of a directory and store it in a storage")
                 .arg(arg!(-k --key <KEY> "An unique key for your repository (example: 'my-repository')").required(false))
@@ -505,6 +541,7 @@ async fn main() {
         Some(("autostart", matches)) => commands::autostart(matches).await,
         Some(("encrypt", matches)) => commands::encrypt(matches).await,
         Some(("log", matches)) => commands::log(matches).await,
+        Some(("search", matches)) => commands::search(matches).await,
         Some(("backup", matches)) => match matches.subcommand() {
             Some(("delete", matches)) => commands::delete(matches).await,
             Some(("pending", matches)) => commands::pending(matches).await,

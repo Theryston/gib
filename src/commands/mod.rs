@@ -7,6 +7,7 @@ pub(crate) mod live;
 mod log;
 mod pending;
 mod restore;
+mod search;
 mod setup;
 mod whoami;
 
@@ -21,5 +22,6 @@ pub use live::live;
 pub use log::log;
 pub use pending::pending;
 pub use restore::restore;
+pub use search::search;
 pub use setup::setup;
 pub use whoami::whoami;

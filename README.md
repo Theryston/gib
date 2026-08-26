@@ -149,14 +149,22 @@ Built with **Tokio** for maximum performance:
 
 ### 🗂️ Automatic Historical Catalog
 
-After a backup is finalized, GIB incrementally maintains a metadata-only
-catalog of paths, revisions, directory relationships, and searchable name
-tokens, using the repository's compression and encryption pipeline. It updates
-only paths affected by the backup, never stores file contents, and is created
-lazily without rebuilding older snapshots. The catalog is repository data
-rather than a local cache; backup manifests and chunks remain authoritative.
-It is updated with version-aware writes and remains compatible with
-repositories created before this feature.
+After a backup is finalized, GIB incrementally maintains a metadata-only catalog
+of paths, revisions, directory relationships, and searchable name tokens, using
+the repository's compression and encryption pipeline. It updates only paths
+affected by the backup, never stores file contents, and is created lazily
+without rebuilding older snapshots. The catalog is repository data rather than a
+local cache; backup manifests and chunks remain authoritative. It is updated
+with version-aware writes and remains compatible with repositories created
+before this feature.
+
+### 🔎 Historical Search
+
+Search every path known by the historical catalog without downloading file
+contents or scanning old backup manifests. Search is updated automatically after
+each backup, includes files that were deleted when an earlier revision remains
+restorable, and uses the same repository key, storage, password, and local
+configuration resolution as the other read-only commands.
 
 ---
 
@@ -269,22 +277,21 @@ Run `gib live` on every active device that works on the same project. The
 devices automatically synchronize through the repository, so a change made on
 one device is received by the others even when they are running simultaneously.
 The live process keeps a small, machine-local state file containing the last
-synchronized backup hash and advisory per-file metadata plus content hashes.
-The cache never stores file contents and is never treated as repository truth:
+synchronized backup hash and advisory per-file metadata plus content hashes. The
+cache never stores file contents and is never treated as repository truth:
 filesystem events invalidate affected entries, and a metadata mismatch
 invalidates an entry before it is reused. Before publishing a snapshot it
 compares that base with the current repository HEAD, automatically applies
-one-sided remote changes, and performs
-bounded three-way merges for text files. Binary changes and overlapping text
-changes are reported as conflicts instead of being silently overwritten. Remote
-changes are also polled periodically, so a device can receive updates even
-when no local file event occurs. Missing or invalid cached repository references
-are discarded and repaired instead of causing live synchronization to retry the
-same missing backup forever.
+one-sided remote changes, and performs bounded three-way merges for text files.
+Binary changes and overlapping text changes are reported as conflicts instead of
+being silently overwritten. Remote changes are also polled periodically, so a
+device can receive updates even when no local file event occurs. Missing or
+invalid cached repository references are discarded and repaired instead of
+causing live synchronization to retry the same missing backup forever.
 
 Live-generated messages start with `[LIVE]` and contain only the number of
-created, changed, and deleted files, for example `[LIVE] created: 12 files;
-changed: 3 files`.
+created, changed, and deleted files, for example
+`[LIVE] created: 12 files; changed: 3 files`.
 
 Live discovers Git repositories recursively below the selected root, including
 repositories inside nested project directories. It never excludes `.git` as a
@@ -300,8 +307,8 @@ offer `Keep local` and `Use remote`; in JSON mode, pass the required
 `--conflict local` or `--conflict remote` flag so conflicts are resolved without
 a prompt. JSON output includes the selected resolution in the `live` conflict
 event. Provide `--storage` explicitly in JSON mode or configure
-`repository.storage`; live lifecycle, batches, synchronization, backup
-progress, completions, and recoverable errors are emitted as structured events.
+`repository.storage`; live lifecycle, batches, synchronization, backup progress,
+completions, and recoverable errors are emitted as structured events.
 
 ### 7. Start live automatically
 
@@ -331,9 +338,9 @@ artifact invokes the absolute GIB executable with
 Job definitions are stored under the platform's user data directory at
 `gib/autostart/jobs`, with bounded JSONL runtime logs in `logs`. Repository
 passwords are kept only in the operating system credential store (Secret
-Service, macOS Keychain, or Windows Credential Manager). Removing a job
-disables and removes only its registration, artifact, registry entry, and
-credential; project files, `gib.toml`, backups, and logs are left untouched.
+Service, macOS Keychain, or Windows Credential Manager). Removing a job disables
+and removes only its registration, artifact, registry entry, and credential;
+project files, `gib.toml`, backups, and logs are left untouched.
 
 ### 8. View backup history
 
@@ -348,6 +355,24 @@ gib restore
 
 # it will list all the backups, and you can restore to any point
 ```
+
+### 10. Search historical files
+
+```bash
+gib search invoice
+gib search "tax 2021 pdf" --path downloads --extension pdf
+gib search invoice --limit 25
+```
+
+Search tokens are case-insensitive and use exact token matching across file and
+directory names. Multiple tokens must all be present. Use `--path` for a
+relative directory prefix and `--extension` without a leading dot. The command
+returns one result per logical path, including deleted paths with a restorable
+historical backup. Existing repositories without an indexed catalog report an
+empty successful result; new backups are indexed automatically.
+
+Use `--mode json` for a stable structured response. JSON results contain only
+the path, a short valid backup reference, and a ready-to-copy restore command.
 
 ---
 
@@ -379,22 +404,23 @@ Don't just take our word for it — try it yourself and feel the speed differenc
 
 ## 📖 Commands
 
-| Command              | Description                             |
-| -------------------- | --------------------------------------- |
-| `gib config`         | Configure your identity                 |
-| `gib whoami`         | Show your current identity              |
-| `gib setup`          | Discover and configure local storages   |
-| `gib backup`         | Create a new backup                     |
+| Command              | Description                                         |
+| -------------------- | --------------------------------------------------- |
+| `gib config`         | Configure your identity                             |
+| `gib whoami`         | Show your current identity                          |
+| `gib setup`          | Discover and configure local storages               |
+| `gib backup`         | Create a new backup                                 |
 | `gib live`           | Keep files backed up and synchronize active devices |
-| `gib autostart`      | Manage per-user background live jobs   |
-| `gib backup delete`  | Delete a backup and its orphaned chunks |
-| `gib restore`        | Restore files from a backup             |
-| `gib log`            | View backup history (paginated)         |
-| `gib encrypt`        | Encrypt all chunks in a repository      |
-| `gib storage add`    | Add a new storage location              |
-| `gib storage list`   | List all configured storages            |
-| `gib storage remove` | Remove a storage                        |
-| `gib storage prune`  | Remove unused chunks                    |
+| `gib autostart`      | Manage per-user background live jobs                |
+| `gib backup delete`  | Delete a backup and its orphaned chunks             |
+| `gib restore`        | Restore files from a backup                         |
+| `gib search`         | Search the historical filesystem catalog            |
+| `gib log`            | View backup history (paginated)                     |
+| `gib encrypt`        | Encrypt all chunks in a repository                  |
+| `gib storage add`    | Add a new storage location                          |
+| `gib storage list`   | List all configured storages                        |
+| `gib storage remove` | Remove a storage                                    |
+| `gib storage prune`  | Remove unused chunks                                |
 
 ### Backup Options
 
@@ -449,11 +475,11 @@ gib autostart remove work-project --yes
 ```
 
 `add` and `update` accept the live backup options (`--message`, `--compress`,
-`--chunk-size`, `--ignore`, and `--concurrency`). A job's effective identity
-is its canonical root, storage, and repository key; two enabled jobs cannot
+`--chunk-size`, `--ignore`, and `--concurrency`). A job's effective identity is
+its canonical root, storage, and repository key; two enabled jobs cannot
 register the same identity. The runner reloads the selected local config and
-revalidates the root and repository on every start, so configuration changes
-are picked up after the next login or restart.
+revalidates the root and repository on every start, so configuration changes are
+picked up after the next login or restart.
 
 ### Restore Options
 
@@ -469,6 +495,24 @@ gib restore \
 
 Tip: run `gib restore --only` (with no path) to open the interactive selector
 and pick exactly what you want to restore.
+
+### Search Options
+
+```bash
+gib search "tax 2021 pdf" \
+  --key my-project \
+  --storage cloud \
+  --password "secret" \
+  --path downloads \
+  --extension pdf \
+  --limit 50
+```
+
+`--key`, `--storage`, `--password`, `--config`, and `--no-config` follow the
+same resolution rules as `gib log` and `gib restore`. `--limit` defaults to
+100. In interactive mode, a degraded catalog is accompanied by a warning and
+the available results are shown. In JSON mode, the response includes
+`index_status: "degraded"` and a warning when results may be incomplete.
 
 ---
 
