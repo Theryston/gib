@@ -11,13 +11,64 @@
 
 <p align="center">
   <a href="#-why-gib">Why GIB?</a> •
-  <a href="#-installation">Installation</a> •
   <a href="#-quick-start">Quick Start</a> •
+  <a href="#-installation">Installation</a> •
   <a href="#-live-backup--sync">Live</a> •
   <a href="#-explore-your-files-through-time">Explore</a> •
   <a href="#-commands">Commands</a> •
   <a href="#-benchmarks">Benchmarks</a>
 </p>
+
+---
+
+## ⚡ Quick Start
+
+From install to your first restore in about a minute.
+
+### 1. Install GIB
+
+**Linux & macOS**
+
+```bash
+curl -fsSL https://trygib.org/unix.sh | bash
+```
+
+**Windows (PowerShell)**
+
+```powershell
+irm https://trygib.org/win.ps1 | iex
+```
+
+### 2. Configure your identity
+
+```bash
+gib config --author "Your Name <you@example.com>"
+```
+
+### 3. Create a local storage
+
+From the folder you want to back up, create a storage directory next to it:
+
+```bash
+mkdir ../gib-backups
+gib storage add --name quickstart --type local --path ../gib-backups
+```
+
+### 4. Create your first backup
+
+```bash
+gib backup --storage quickstart --message "First backup"
+```
+
+### 5. Restore it
+
+```bash
+gib restore --storage quickstart --backup latest --target-path ../gib-restore
+```
+
+That's it — you created a versioned backup and restored it.
+
+Want S3/WebDAV, `gib.toml`, Live sync, encryption and the full setup flow? **[Continue with the Detailed Setup Guide](#-detailed-setup-guide).**
 
 ---
 
@@ -496,7 +547,7 @@ gib --help
 
 ---
 
-# 🎯 Quick Start
+# 📚 Detailed Setup Guide
 
 ## 1. Configure your identity
 
