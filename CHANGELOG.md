@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.34](https://github.com/Theryston/gib/compare/v0.0.33...v0.0.34) - 2026-08-27
+
+### Other
+
+- add temporary marketing README
+
 ## [0.0.33](https://github.com/Theryston/gib/compare/v0.0.32...v0.0.33) - 2026-08-26
 
 ### Added
