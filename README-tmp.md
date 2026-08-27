@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-  <a href="#-why-gib">Why GIB?</a> •
   <a href="#-quick-start">Quick Start</a> •
+  <a href="#-why-gib">Why GIB?</a> •
   <a href="#-installation">Installation</a> •
   <a href="#-live-backup--sync">Live</a> •
   <a href="#-explore-your-files-through-time">Explore</a> •
