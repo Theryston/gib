@@ -1,5 +1,4 @@
 use crate::core::crypto::read_file_maybe_decrypt;
-use crate::core::git_sync::GitSyncPolicy;
 use crate::core::live_state::LiveFileCache;
 use crate::core::metadata::{Backup, BackupObject};
 use crate::core::permissions::{get_file_permissions_with_path, set_file_permissions};
@@ -41,14 +40,13 @@ pub(crate) struct ReconciliationResult {
 pub(crate) fn scan_worktree_with_cache(
     root: &Path,
     ignore_patterns: &[String],
-    git_policy: Option<&GitSyncPolicy>,
     cache: &mut BTreeMap<String, LiveFileCache>,
 ) -> Result<HashMap<String, LocalFile>, String> {
     let mut files = HashMap::new();
     let mut present_paths = BTreeSet::new();
     let walker = WalkDir::new(root)
         .into_iter()
-        .filter_entry(|entry| !is_ignored_path(entry.path(), root, ignore_patterns, git_policy));
+        .filter_entry(|entry| !is_ignored_path(entry.path(), root, ignore_patterns));
 
     for entry in walker {
         let entry = entry
@@ -88,7 +86,6 @@ pub(crate) fn scan_worktree_with_cache(
 pub(crate) async fn reconcile_worktree(
     root: &Path,
     ignore_patterns: &[String],
-    git_policy: Option<&GitSyncPolicy>,
     base: Option<&Backup>,
     remote: &Backup,
     fs: Arc<dyn FS>,
@@ -96,25 +93,25 @@ pub(crate) async fn reconcile_worktree(
     password: Option<&str>,
     cache: &mut BTreeMap<String, LiveFileCache>,
 ) -> Result<ReconciliationResult, String> {
-    let local = scan_worktree_with_cache(root, ignore_patterns, git_policy, cache)?;
+    let local = scan_worktree_with_cache(root, ignore_patterns, cache)?;
     let base_tree = base.map(|backup| &backup.tree);
     let remote_tree = &remote.tree;
     let mut paths = BTreeSet::new();
 
     for path in local.keys() {
-        if !is_ignored_relative(path, ignore_patterns, git_policy) {
+        if !is_ignored_relative(path, ignore_patterns) {
             paths.insert(path.clone());
         }
     }
     if let Some(tree) = base_tree {
         for path in tree.keys() {
-            if !is_ignored_relative(path, ignore_patterns, git_policy) {
+            if !is_ignored_relative(path, ignore_patterns) {
                 paths.insert(path.clone());
             }
         }
     }
     for path in remote_tree.keys() {
-        if !is_ignored_relative(path, ignore_patterns, git_policy) {
+        if !is_ignored_relative(path, ignore_patterns) {
             paths.insert(path.clone());
         }
     }
@@ -291,15 +288,14 @@ pub(crate) async fn apply_remote_change(
 pub(crate) fn worktree_matches_backup_with_cache(
     root: &Path,
     ignore_patterns: &[String],
-    git_policy: Option<&GitSyncPolicy>,
     backup: &Backup,
     cache: &mut BTreeMap<String, LiveFileCache>,
 ) -> Result<bool, String> {
-    let local = scan_worktree_with_cache(root, ignore_patterns, git_policy, cache)?;
+    let local = scan_worktree_with_cache(root, ignore_patterns, cache)?;
     let expected: HashMap<String, &BackupObject> = backup
         .tree
         .iter()
-        .filter(|(path, _)| !is_ignored_relative(path, ignore_patterns, git_policy))
+        .filter(|(path, _)| !is_ignored_relative(path, ignore_patterns))
         .map(|(path, object)| (path.clone(), object))
         .collect();
 
@@ -317,7 +313,6 @@ pub(crate) fn worktree_matches_backup_with_cache(
 pub(crate) fn worktree_matches_backup_paths_with_cache(
     root: &Path,
     ignore_patterns: &[String],
-    git_policy: Option<&GitSyncPolicy>,
     backup: &Backup,
     changed_paths: &BTreeSet<String>,
     cache: &mut BTreeMap<String, LiveFileCache>,
@@ -329,12 +324,12 @@ pub(crate) fn worktree_matches_backup_paths_with_cache(
             (path.trim_matches('/').to_string(), !target.is_file())
         })
         .collect::<Vec<_>>();
-    let local = scan_worktree_scopes(root, ignore_patterns, git_policy, &scopes, cache)?;
+    let local = scan_worktree_scopes(root, ignore_patterns, &scopes, cache)?;
     let expected: HashMap<String, &BackupObject> = backup
         .tree
         .iter()
         .filter(|(path, _)| {
-            !is_ignored_relative(path, ignore_patterns, git_policy)
+            !is_ignored_relative(path, ignore_patterns)
                 && scopes
                     .iter()
                     .any(|(scope, recursive)| path_in_scope(path, scope, *recursive))
@@ -356,7 +351,6 @@ pub(crate) fn worktree_matches_backup_paths_with_cache(
 fn scan_worktree_scopes(
     root: &Path,
     ignore_patterns: &[String],
-    git_policy: Option<&GitSyncPolicy>,
     scopes: &[(String, bool)],
     cache: &mut BTreeMap<String, LiveFileCache>,
 ) -> Result<HashMap<String, LocalFile>, String> {
@@ -365,7 +359,7 @@ fn scan_worktree_scopes(
     for (scope, recursive) in scopes {
         let target = root.join(scope);
         if target.is_file() {
-            if is_ignored_path(&target, root, ignore_patterns, git_policy) {
+            if is_ignored_path(&target, root, ignore_patterns) {
                 continue;
             }
             insert_local_file(&mut files, root, &target, cache)?;
@@ -376,9 +370,9 @@ fn scan_worktree_scopes(
             continue;
         }
 
-        let walker = WalkDir::new(&target).into_iter().filter_entry(|entry| {
-            !is_ignored_path(entry.path(), root, ignore_patterns, git_policy)
-        });
+        let walker = WalkDir::new(&target)
+            .into_iter()
+            .filter_entry(|entry| !is_ignored_path(entry.path(), root, ignore_patterns));
         for entry in walker {
             let entry = entry.map_err(|error| {
                 format!("Failed to scan live root '{}': {}", root.display(), error)
@@ -466,7 +460,6 @@ pub(crate) fn invalidate_worktree_cache_paths(
 pub(crate) fn update_worktree_cache_from_backup(
     root: &Path,
     ignore_patterns: &[String],
-    git_policy: Option<&GitSyncPolicy>,
     cache: &mut BTreeMap<String, LiveFileCache>,
     backup: &Backup,
     changed_paths: Option<&BTreeSet<String>>,
@@ -481,7 +474,7 @@ pub(crate) fn update_worktree_cache_from_backup(
             });
 
             for (path, object) in backup.tree.iter().filter(|(path, _)| {
-                !is_ignored_relative(path, ignore_patterns, git_policy)
+                !is_ignored_relative(path, ignore_patterns)
                     && scopes
                         .iter()
                         .any(|(scope, recursive)| path_in_scope(path, scope, *recursive))
@@ -494,7 +487,7 @@ pub(crate) fn update_worktree_cache_from_backup(
             for (path, object) in backup
                 .tree
                 .iter()
-                .filter(|(path, _)| !is_ignored_relative(path, ignore_patterns, git_policy))
+                .filter(|(path, _)| !is_ignored_relative(path, ignore_patterns))
             {
                 update_cache_entry_from_backup(root, cache, path, Some(object))?;
             }
@@ -939,15 +932,7 @@ fn cleanup_empty_parents(path: &Path, root: &Path) {
     }
 }
 
-fn is_ignored_path(
-    path: &Path,
-    root: &Path,
-    ignore_patterns: &[String],
-    git_policy: Option<&GitSyncPolicy>,
-) -> bool {
-    if git_policy.is_some_and(|policy| policy.is_volatile_path(root, path)) {
-        return true;
-    }
+fn is_ignored_path(path: &Path, root: &Path, ignore_patterns: &[String]) -> bool {
     if ignore_patterns.is_empty() {
         return false;
     }
@@ -970,15 +955,9 @@ fn is_ignored_path(
         .any(|component| ignore_patterns.iter().any(|pattern| pattern == component))
 }
 
-fn is_ignored_relative(
-    path: &str,
-    ignore_patterns: &[String],
-    git_policy: Option<&GitSyncPolicy>,
-) -> bool {
-    git_policy.is_some_and(|policy| policy.is_volatile_relative(path))
-        || path
-            .split('/')
-            .any(|component| ignore_patterns.iter().any(|pattern| pattern == component))
+fn is_ignored_relative(path: &str, ignore_patterns: &[String]) -> bool {
+    path.split('/')
+        .any(|component| ignore_patterns.iter().any(|pattern| pattern == component))
 }
 
 #[cfg(test)]
@@ -1013,11 +992,11 @@ mod tests {
             },
         )]);
 
-        let cached = scan_worktree_with_cache(&root, &[], None, &mut cache).unwrap();
+        let cached = scan_worktree_with_cache(&root, &[], &mut cache).unwrap();
         assert_eq!(cached["file.txt"].hash, "cached-hash");
 
         std::fs::write(&file, b"changed").unwrap();
-        let rescanned = scan_worktree_with_cache(&root, &[], None, &mut cache).unwrap();
+        let rescanned = scan_worktree_with_cache(&root, &[], &mut cache).unwrap();
         assert_eq!(
             rescanned["file.txt"].hash,
             format!("{:x}", Sha256::digest(b"changed"))

@@ -37,6 +37,8 @@ pub(crate) struct LiveJobOverrides {
     pub(crate) concurrency: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ignore: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) no_ignore_git: bool,
     #[serde(default = "default_conflict_policy")]
     pub(crate) conflict: String,
 }
@@ -51,6 +53,7 @@ impl Default for LiveJobOverrides {
             chunk_size: None,
             concurrency: None,
             ignore: None,
+            no_ignore_git: false,
             conflict: default_conflict_policy(),
         }
     }
@@ -73,6 +76,7 @@ impl AutostartJob {
             compress: self.overrides.compress,
             chunk_size: self.overrides.chunk_size.clone(),
             ignore: self.overrides.ignore.clone(),
+            no_ignore_git: self.overrides.no_ignore_git,
             concurrency: self.overrides.concurrency,
             password,
         }

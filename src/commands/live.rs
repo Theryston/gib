@@ -3,7 +3,6 @@ use crate::commands::backup::{
     load_latest_available_backup, resolve_backup, run_backup_with_parents,
     run_incremental_backup_with_parents,
 };
-use crate::core::git_sync::GitSyncPolicy;
 use crate::core::indexes::{
     RepositoryHeadSnapshot, read_or_initialize_repository_head, set_repository_head,
 };
@@ -109,7 +108,6 @@ struct LiveStartPayload {
     storage: String,
     key: String,
     conflict: &'static str,
-    git_repositories: usize,
     recursive: bool,
     debounce_ms: u64,
     poll_ms: u64,
@@ -207,11 +205,6 @@ fn resolve_conflict_policy(matches: &ArgMatches) -> Result<Option<ConflictPolicy
 
 pub(crate) fn emit_live_start(resolved: &ResolvedBackup, policy: ConflictPolicy) {
     let root = PathBuf::from(&resolved.options.root_path_string);
-    let git_repositories = resolved
-        .options
-        .git_policy
-        .as_ref()
-        .map_or(0, |policy| policy.repository_count());
     emit_named_event(
         "live",
         &LiveStartPayload {
@@ -220,7 +213,6 @@ pub(crate) fn emit_live_start(resolved: &ResolvedBackup, policy: ConflictPolicy)
             storage: resolved.options.storage.clone(),
             key: resolved.options.key.clone(),
             conflict: policy.as_str(),
-            git_repositories,
             recursive: true,
             debounce_ms: resolved.live_debounce_ms,
             poll_ms: resolved.live_poll_ms,
@@ -270,13 +262,6 @@ pub async fn live(matches: &ArgMatches) {
             resolved.options.storage,
             resolved.options.key
         );
-        if let Some(git_policy) = &resolved.options.git_policy {
-            println!(
-                "{} {} nested repositories (Git history enabled; local metadata excluded)",
-                style("Git sync").bold(),
-                git_policy.repository_count()
-            );
-        }
         if !resolved.options.ignore_patterns.is_empty() {
             println!(
                 "{} {}",
@@ -309,7 +294,6 @@ async fn live_loop(
 ) -> Result<(), String> {
     let root = PathBuf::from(&resolved.options.root_path_string);
     let ignore_patterns = resolved.options.ignore_patterns.clone();
-    let git_policy = resolved.options.git_policy.clone();
     let debounce_window = Duration::from_millis(resolved.live_debounce_ms);
     let (mut state, first_run) = initialize_live_state(&resolved, &root).await?;
     let startup_message = if first_run {
@@ -370,13 +354,7 @@ async fn live_loop(
         };
 
         let mut batch = ChangeBatch::default();
-        record_notify_result(
-            first_event,
-            &root,
-            &ignore_patterns,
-            git_policy.as_deref(),
-            &mut batch,
-        );
+        record_notify_result(first_event, &root, &ignore_patterns, &mut batch);
 
         loop {
             let quiet_period = tokio::time::sleep(debounce_window);
@@ -392,7 +370,6 @@ async fn live_loop(
                         event,
                         &root,
                         &ignore_patterns,
-                        git_policy.as_deref(),
                         &mut batch,
                     );
                 }
@@ -435,7 +412,6 @@ fn record_notify_result(
     result: notify::Result<Event>,
     root: &Path,
     ignore_patterns: &[String],
-    git_policy: Option<&GitSyncPolicy>,
     batch: &mut ChangeBatch,
 ) {
     let event = match result {
@@ -454,10 +430,7 @@ fn record_notify_result(
     };
 
     for path in event.paths {
-        if path == root
-            || is_ignored_path(&path, root, ignore_patterns)
-            || git_policy.is_some_and(|policy| policy.is_volatile_path(root, &path))
-        {
+        if path == root || is_ignored_path(&path, root, ignore_patterns) {
             continue;
         }
         if kind != ChangeKind::Deleted && path.is_dir() {
@@ -675,7 +648,6 @@ async fn synchronize_live_with_paths(
             let mut reconciliation = reconcile_worktree(
                 &root,
                 &resolved.options.ignore_patterns,
-                resolved.options.git_policy.as_deref(),
                 base_backup.as_ref(),
                 &remote_tree,
                 Arc::clone(&resolved.options.fs),
@@ -731,7 +703,6 @@ async fn synchronize_live_with_paths(
             worktree_matches_backup_paths_with_cache(
                 &root,
                 &resolved.options.ignore_patterns,
-                resolved.options.git_policy.as_deref(),
                 &remote_tree,
                 &backup_paths,
                 &mut state.files,
@@ -740,7 +711,6 @@ async fn synchronize_live_with_paths(
             worktree_matches_backup_with_cache(
                 &root,
                 &resolved.options.ignore_patterns,
-                resolved.options.git_policy.as_deref(),
                 &remote_tree,
                 &mut state.files,
             )?
@@ -798,7 +768,6 @@ async fn synchronize_live_with_paths(
             update_worktree_cache_from_backup(
                 &root,
                 &resolved.options.ignore_patterns,
-                resolved.options.git_policy.as_deref(),
                 &mut state.files,
                 &result.backup,
                 cache_paths.as_ref(),
@@ -1167,7 +1136,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_backup_keeps_nested_git_history_but_ignores_local_git_state() {
+    async fn live_backup_ignores_nested_git_directories_by_default_and_can_include_them() {
         let fixture = temporary_directory();
         let source = fixture.join("code");
         let storage = fixture.join("storage");
@@ -1182,7 +1151,6 @@ mod tests {
         std::fs::write(git_dir.join("index"), b"local staging state").unwrap();
         std::fs::write(git_dir.join("logs/HEAD"), b"local reflog").unwrap();
 
-        let git_policy = Arc::new(GitSyncPolicy::discover(&source, &[]).unwrap());
         let options = BackupOptions {
             key: "code".to_string(),
             root_path_string: source.to_string_lossy().to_string(),
@@ -1192,32 +1160,57 @@ mod tests {
             compress: 3,
             password: None,
             chunk_size: 1024,
-            ignore_patterns: Vec::new(),
-            git_policy: Some(git_policy),
+            ignore_patterns: vec![".git".to_string()],
+            include_git: false,
             concurrency: 1,
         };
 
-        let result = run_backup(options, "[LIVE] nested Git".to_string(), None, None)
-            .await
-            .unwrap();
+        let result = run_backup(
+            options.clone(),
+            "[LIVE] ignored Git".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.backup.tree.contains_key("group/project/main.rs"));
+        assert!(!result.backup.tree.contains_key("group/project/.git/HEAD"));
+
+        let included = run_backup(
+            BackupOptions {
+                ignore_patterns: Vec::new(),
+                include_git: true,
+                ..options
+            },
+            "[LIVE] included Git".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(
-            result
+            included
                 .backup
                 .tree
                 .contains_key("group/project/.git/objects/aa/object")
         );
         assert!(
-            result
+            included
                 .backup
                 .tree
                 .contains_key("group/project/.git/refs/heads/main")
         );
-        assert!(result.backup.tree.contains_key("group/project/main.rs"));
-        assert!(!result.backup.tree.contains_key("group/project/.git/HEAD"));
-        assert!(!result.backup.tree.contains_key("group/project/.git/index"));
+        assert!(included.backup.tree.contains_key("group/project/.git/HEAD"));
         assert!(
-            !result
+            included
+                .backup
+                .tree
+                .contains_key("group/project/.git/index")
+        );
+        assert!(
+            included
                 .backup
                 .tree
                 .contains_key("group/project/.git/logs/HEAD")
@@ -1245,7 +1238,7 @@ mod tests {
             password: None,
             chunk_size: 1024,
             ignore_patterns: Vec::new(),
-            git_policy: None,
+            include_git: false,
             concurrency: 1,
         };
         let initial = run_backup(options.clone(), "[LIVE] initial".to_string(), None, None)
@@ -1318,7 +1311,7 @@ mod tests {
             password: None,
             chunk_size: 1024,
             ignore_patterns: Vec::new(),
-            git_policy: None,
+            include_git: false,
             concurrency: 1,
         };
         let initial = run_backup(options.clone(), "[LIVE] initial".to_string(), None, None)
@@ -1388,7 +1381,7 @@ mod tests {
             password: None,
             chunk_size: 1024,
             ignore_patterns: Vec::new(),
-            git_policy: None,
+            include_git: false,
             concurrency: 1,
         };
         let options_two = BackupOptions {

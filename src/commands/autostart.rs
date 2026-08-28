@@ -142,6 +142,7 @@ async fn add(matches: &ArgMatches) -> Result<(), String> {
         compress: overrides.compress,
         chunk_size: overrides.chunk_size.clone(),
         ignore: overrides.ignore.clone(),
+        no_ignore_git: overrides.no_ignore_git,
         concurrency: overrides.concurrency,
         password: password.clone(),
     })
@@ -234,6 +235,7 @@ async fn update(matches: &ArgMatches) -> Result<(), String> {
         compress: overrides.compress,
         chunk_size: overrides.chunk_size.clone(),
         ignore: overrides.ignore.clone(),
+        no_ignore_git: overrides.no_ignore_git,
         concurrency: overrides.concurrency,
         password: password.clone(),
     })
@@ -566,6 +568,7 @@ fn live_overrides(
             .get_many::<String>("ignore")
             .map(|values| values.map(ToString::to_string).collect())
             .or(current.ignore),
+        no_ignore_git: matches.get_flag("no-ignore-git") || current.no_ignore_git,
         conflict,
     })
 }

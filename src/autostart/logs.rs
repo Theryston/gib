@@ -168,15 +168,6 @@ impl InteractiveLogRenderer {
                 {
                     println!("{} {} / {}", style("Target").bold(), storage, key);
                 }
-                if let Some(count) = data.get("git_repositories").and_then(Value::as_u64)
-                    && count > 0
-                {
-                    println!(
-                        "{} {} nested repositories (Git history enabled; local metadata excluded)",
-                        style("Git sync").bold(),
-                        count
-                    );
-                }
                 if let Some(ignore) = string_array(data, "ignore")
                     && !ignore.is_empty()
                 {
