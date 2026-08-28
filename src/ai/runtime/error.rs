@@ -48,6 +48,7 @@ pub(crate) enum AiBackendError {
     GenerationFailed {
         model_id: String,
     },
+    GrammarInitializationFailed,
     Cancelled,
     RequestAlreadyActive {
         request_id: String,
@@ -119,6 +120,7 @@ impl AiBackendError {
             Self::ContextCreationFailed { .. } => "context_creation_failed",
             Self::ContextExhausted { .. } => "context_exhausted",
             Self::GenerationFailed { .. } => "generation_failed",
+            Self::GrammarInitializationFailed => "grammar_initialization_failed",
             Self::Cancelled => "cancelled",
             Self::RequestAlreadyActive { .. } => "request_already_active",
             Self::RequestNotFound { .. } => "request_not_found",
@@ -192,6 +194,9 @@ impl fmt::Display for AiBackendError {
                 formatter,
                 "llama.cpp generation failed for AI model '{model_id}'"
             ),
+            Self::GrammarInitializationFailed => {
+                formatter.write_str("llama.cpp could not initialize the requested output grammar")
+            }
             Self::Cancelled => formatter.write_str("AI generation was cancelled"),
             Self::RequestAlreadyActive { request_id } => {
                 write!(formatter, "AI request '{request_id}' is already active")

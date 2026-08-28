@@ -652,15 +652,6 @@ fn generate_tokens(
             usage: AiUsage::default(),
         };
     }
-    if request.grammar.is_some() {
-        return GenerationEnd::Failed {
-            error: AiBackendError::UnsupportedFeature {
-                feature: "grammar-constrained generation".to_string(),
-            },
-            usage: AiUsage::default(),
-        };
-    }
-
     let context_limit = options.context_size_for(request.context_limit);
     let prompt = match render_prompt(&loaded_model.model, &request.messages) {
         Ok(prompt) => prompt,
@@ -805,7 +796,22 @@ fn generate_tokens(
         }
     }
 
-    let mut sampler = build_sampler(&request.sampling);
+    let mut sampler = match build_sampler(
+        &loaded_model.model,
+        &request.sampling,
+        request.grammar.as_ref(),
+    ) {
+        Ok(sampler) => sampler,
+        Err(error) => {
+            return GenerationEnd::Failed {
+                error,
+                usage: AiUsage {
+                    prompt_tokens: prompt_token_count,
+                    ..AiUsage::default()
+                },
+            };
+        }
+    };
     let max_stop_bytes = request
         .stop_sequences
         .iter()
@@ -979,7 +985,11 @@ fn generate_tokens(
     })
 }
 
-fn build_sampler(settings: &super::api::AiSamplingSettings) -> LlamaSampler {
+fn build_sampler(
+    model: &LlamaModel,
+    settings: &super::api::AiSamplingSettings,
+    grammar: Option<&super::api::AiGrammar>,
+) -> Result<LlamaSampler, AiBackendError> {
     let mut samplers = Vec::new();
     if settings.top_k > 0 {
         samplers.push(LlamaSampler::top_k(
@@ -992,13 +1002,19 @@ fn build_sampler(settings: &super::api::AiSamplingSettings) -> LlamaSampler {
     if settings.min_p > 0.0 {
         samplers.push(LlamaSampler::min_p(settings.min_p, 1));
     }
+    if let Some(grammar) = grammar {
+        samplers.push(
+            LlamaSampler::grammar(model, &grammar.grammar, &grammar.root)
+                .map_err(|_| AiBackendError::GrammarInitializationFailed)?,
+        );
+    }
     if settings.temperature == 0.0 {
         samplers.push(LlamaSampler::greedy());
     } else {
         samplers.push(LlamaSampler::temp(settings.temperature));
         samplers.push(LlamaSampler::dist(settings.seed.unwrap_or(0)));
     }
-    LlamaSampler::chain(samplers, true)
+    Ok(LlamaSampler::chain(samplers, true))
 }
 
 fn matching_stop_length(text: &str, stop_sequences: &[String]) -> Option<usize> {

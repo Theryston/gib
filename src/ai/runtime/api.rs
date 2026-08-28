@@ -69,11 +69,11 @@ impl Default for AiSamplingSettings {
     }
 }
 
-/// A grammar payload reserved for the structured-generation layer.
+/// A compiled GBNF grammar supplied by the structured-generation layer.
 ///
-/// Task 02 keeps the field at the backend boundary so callers do not need a
-/// breaking API change when grammar-constrained generation is added. The
-/// initial llama backend deliberately rejects it; Task 03 owns its semantics.
+/// The grammar is created locally from a registered JSON Schema. Keeping this
+/// payload at the backend boundary lets the runtime enforce the contract while
+/// higher layers remain independent of llama.cpp types.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AiGrammar {

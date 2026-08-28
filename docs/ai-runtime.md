@@ -5,7 +5,8 @@ and matching `llama-cpp-sys-2` crates. Both crates are pinned to exactly
 `0.1.154` in `Cargo.toml`. The binding follows llama.cpp closely and is not a
 stable-semver API, so updating either crate is an intentional runtime change:
 review the upstream API and native llama.cpp revision before changing the
-pin.
+pin. The common feature is enabled because Task 03 uses llama.cpp's
+JSON-Schema-to-GBNF compiler and grammar sampler.
 
 ## Native build requirements
 
@@ -90,10 +91,11 @@ reconstructs the successful result. Stop-sequence suffixes are held back until
 they are disambiguated, so a configured stop sequence is not included in the
 successful final text.
 
-The initial runtime supports plain text generation and model-provided chat
-templates. The `grammar` request field is reserved at the boundary but is
-rejected until Task 03 defines structured-generation semantics. Tool calling,
-reasoning, agent loops, and persistence are intentionally outside this layer.
+The runtime supports plain text generation, model-provided chat templates, and
+caller-supplied GBNF grammars. Task 03 owns the JSON Schema registry that
+produces those grammars; the runtime only validates the non-empty payload and
+installs it in llama.cpp's sampler. Tool calling, reasoning, agent loops, and
+persistence are intentionally outside this layer.
 
 ## Verification
 
