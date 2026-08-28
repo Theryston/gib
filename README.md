@@ -303,6 +303,11 @@ Backup manifests and chunks remain the authoritative source of data.
 `.git` directories and files are ignored automatically by backups and Live
 synchronization. Use `--no-ignore-git` when you explicitly want to include them.
 
+Local cleanup is Git-safe: `restore --delete` (also available as
+`--prune-local`) never removes files inside a `.git` directory, even when those
+files are absent from the selected backup. Live synchronization also ignores
+remote deletion requests inside `.git` directories.
+
 ---
 
 ### 🕒 Every Backup Is a Snapshot

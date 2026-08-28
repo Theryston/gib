@@ -1,6 +1,7 @@
 pub(crate) mod catalog;
 pub mod crypto;
 pub(crate) mod explore;
+pub(crate) mod git;
 pub mod indexes;
 pub(crate) mod live_state;
 pub mod metadata;
