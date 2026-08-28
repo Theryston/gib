@@ -1,4 +1,5 @@
 use crate::core::crypto::read_file_maybe_decrypt;
+use crate::core::git::is_git_path;
 use crate::core::live_state::LiveFileCache;
 use crate::core::metadata::{Backup, BackupObject};
 use crate::core::permissions::{get_file_permissions_with_path, set_file_permissions};
@@ -274,6 +275,9 @@ pub(crate) async fn apply_remote_change(
             })?;
         }
         None => {
+            if is_git_path(relative_path) {
+                return Ok(());
+            }
             if target.exists() {
                 std::fs::remove_file(&target)
                     .map_err(|error| format!("Failed to remove '{}': {}", relative_path, error))?;
@@ -1028,5 +1032,23 @@ mod tests {
             three_way_merge(b"one\n", b"ONE\n", b"ONE\n").unwrap(),
             b"ONE\n"
         );
+    }
+
+    #[tokio::test]
+    async fn remote_deletions_never_remove_git_paths() {
+        let root = temporary_directory();
+        let storage = temporary_directory();
+        let git_head = root.join("projects/app/.git/HEAD");
+        std::fs::create_dir_all(git_head.parent().unwrap()).unwrap();
+        std::fs::write(&git_head, b"ref: refs/heads/main\n").unwrap();
+
+        let fs: Arc<dyn FS> = Arc::new(crate::fs::LocalFS::new(&storage));
+        apply_remote_change(&root, "projects/app/.git/HEAD", None, fs, "project", None)
+            .await
+            .unwrap();
+
+        assert!(git_head.exists());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(storage);
     }
 }

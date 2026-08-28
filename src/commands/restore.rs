@@ -2,6 +2,7 @@ use crate::config::{
     PasswordPolicy, load_and_report_local_config, resolve_path, resolve_repository,
 };
 use crate::core::crypto::read_file_maybe_decrypt;
+use crate::core::git::is_git_path;
 use crate::core::indexes::{list_backup_summaries, resolve_backup_reference};
 use crate::core::metadata::Backup;
 use crate::core::only::OnlyRequest;
@@ -356,6 +357,13 @@ fn cleanup_extra_files(
 
     for entry in WalkDir::new(&target_path_buf)
         .into_iter()
+        .filter_entry(|entry| {
+            let relative = entry
+                .path()
+                .strip_prefix(&target_path_buf)
+                .unwrap_or(entry.path());
+            !is_git_path(&relative.to_string_lossy())
+        })
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_file())
     {
@@ -367,6 +375,10 @@ fn cleanup_extra_files(
         };
 
         let relative_path_str = relative_path.to_string_lossy().replace('\\', "/");
+
+        if is_git_path(&relative_path_str) {
+            continue;
+        }
 
         if !backup_paths.contains(&relative_path_str) {
             match std::fs::remove_file(file_path) {
@@ -449,4 +461,73 @@ fn get_params(
         prune_local,
         only_request,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::metadata::BackupObject;
+    use std::collections::HashMap;
+
+    fn temporary_directory(label: &str) -> PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("gib-restore-command-{label}-{suffix}"));
+        std::fs::create_dir_all(&path).expect("temporary directory should be created");
+        path
+    }
+
+    #[test]
+    fn prune_local_preserves_git_files_at_any_depth() {
+        let target = temporary_directory("prune");
+        std::fs::create_dir_all(target.join(".git/objects/aa")).unwrap();
+        std::fs::create_dir_all(target.join("projects/app/.git/refs")).unwrap();
+        std::fs::write(target.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::write(target.join(".git/objects/aa/object"), b"git object").unwrap();
+        std::fs::write(target.join("projects/app/.git/refs/main"), b"commit-hash\n").unwrap();
+        std::fs::write(target.join("extra.txt"), b"remove me").unwrap();
+        std::fs::write(target.join("projects/app/extra.txt"), b"remove me too").unwrap();
+
+        let backup_tree = HashMap::new();
+        let deleted = cleanup_extra_files(&target.to_string_lossy(), &backup_tree).unwrap();
+
+        assert_eq!(deleted, 2);
+        assert!(target.join(".git/HEAD").exists());
+        assert!(target.join(".git/objects/aa/object").exists());
+        assert!(target.join("projects/app/.git/refs/main").exists());
+        assert!(!target.join("extra.txt").exists());
+        assert!(!target.join("projects/app/extra.txt").exists());
+
+        let _ = std::fs::remove_dir_all(target);
+    }
+
+    #[test]
+    fn prune_local_keeps_git_paths_even_when_the_backup_contains_other_files() {
+        let target = temporary_directory("mixed");
+        std::fs::create_dir_all(target.join("repo/.git")).unwrap();
+        std::fs::write(target.join("repo/.git/config"), b"git config").unwrap();
+        std::fs::write(target.join("keep.txt"), b"keep").unwrap();
+        std::fs::write(target.join("remove.txt"), b"remove").unwrap();
+
+        let backup_tree = HashMap::from([(
+            "keep.txt".to_string(),
+            BackupObject {
+                hash: String::new(),
+                size: 4,
+                content_type: "text/plain".to_string(),
+                permissions: 0o644,
+                chunks: Vec::new(),
+            },
+        )]);
+        let deleted = cleanup_extra_files(&target.to_string_lossy(), &backup_tree).unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(target.join("repo/.git/config").exists());
+        assert!(target.join("keep.txt").exists());
+        assert!(!target.join("remove.txt").exists());
+
+        let _ = std::fs::remove_dir_all(target);
+    }
 }

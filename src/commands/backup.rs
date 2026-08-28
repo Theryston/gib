@@ -820,17 +820,13 @@ fn is_ignored_relative_path(path: &str, ignore_patterns: &[String]) -> bool {
         .any(|component| ignore_patterns.iter().any(|pattern| pattern == component))
 }
 
-fn is_git_path(path: &str) -> bool {
-    path.split('/').any(|component| component == ".git")
-}
-
 fn remove_automatically_ignored_git_objects(
     tree: &mut HashMap<String, BackupObject>,
     chunk_indexes: &mut HashMap<String, ChunkIndex>,
 ) {
     let stale_paths: Vec<String> = tree
         .keys()
-        .filter(|path| is_git_path(path))
+        .filter(|path| crate::core::git::is_git_path(path))
         .cloned()
         .collect();
 
