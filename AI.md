@@ -2,68 +2,61 @@
 
 **Status:** Proposed architecture  
 **Audience:** GIB maintainers, contributors, AI/agent engineers, and developers integrating new GIB AI capabilities  
-**Language:** English  
-**Scope:** Local-first AI harness for GIB, focused on intelligent historical file search, loss explanation, intent-based restore, natural-language time travel, and history explanation
+**Scope:** Local-first AI runtime, persistent conversational CLI frontend, agent harness, historical file intelligence, and safe GIB operations
 
 ---
 
-## 1. Purpose of This Document
+# 1. Purpose
 
-This document defines the technical architecture, behavioral contracts, safety boundaries, orchestration model, and implementation strategy for **GIB AI**.
+This document is the technical source of truth for **GIB AI**.
 
-The goal is to make the AI behavior sufficiently explicit that a developer who has never worked on GIB AI before can understand:
+It defines:
 
-- what GIB AI is supposed to do;
-- which user-facing capabilities are part of the first meaningful product version;
-- how a small local language model is used;
-- how the harness compensates for model limitations;
-- which decisions belong to the LLM and which must remain deterministic;
-- how specialized AI skills cooperate;
-- how state, evidence, tools, retries, budgets, and safety are represented;
-- how each user-facing workflow is executed end-to-end;
-- how the system should be evaluated;
-- how future capabilities can be added without destabilizing existing behavior.
+- the user-facing goals of GIB AI;
+- how the local model is distributed, installed, configured, and executed;
+- how `gib ai` behaves in interactive and JSON modes;
+- how conversations are persisted and resumed across processes;
+- how a small local model is wrapped in a strong deterministic harness;
+- which responsibilities belong to Rust and which belong to the LLM;
+- how routing, planning, evidence, tools, search, history, time travel, and restore work;
+- how safety is enforced;
+- how the architecture is evaluated and extended.
 
 This is not a prompt-writing guide.
 
-GIB AI must be treated as a **software system with a language model inside it**, not as a language model with some tools attached.
+GIB AI must be treated as a **software system with a language model inside it**, not as a language model with unrestricted access to GIB.
 
-The model is intentionally small and local. Therefore, the surrounding harness is a first-class product component.
+The intended default model is intentionally small and local. The harness, CLI runtime, state model, evidence system, and deterministic GIB core are therefore first-class components of the product.
 
 ---
 
 # 2. Product Vision
 
-GIB already provides a versioned view of a user's files across time.
+GIB already turns backups into a versioned historical filesystem.
 
-The AI layer should turn that historical filesystem into something the user can reason about naturally.
+GIB AI should turn that filesystem history into something users can reason about naturally.
 
-Instead of requiring the user to know:
+The user should not need to know:
 
-- which backup contains a file;
 - the exact filename;
 - the exact path;
 - the backup hash;
 - the revision ID;
-- when a file disappeared;
-- which snapshot should be restored;
-- which CLI command should be used;
+- which snapshot contained a file;
+- when the file disappeared;
+- which command should restore it.
 
-the user should be able to describe their intent.
-
-Examples:
+The user should be able to say:
 
 > "Find the identity document I had last week."
 
 > "Where did my contract go?"
 
-> "Restore the latest version of the resume I had in Downloads."
+> "Restore the latest resume I had in Downloads."
 
-> "How was this folder before I deleted those files?"
+> "Show me this folder before I deleted those files."
 
-> "What happened to this project yesterday?"
-
-The system should internally translate these requests into controlled investigation and deterministic GIB operations.
+> "What happened to my project yesterday?"
 
 The long-term product idea is:
 
@@ -71,19 +64,13 @@ The long-term product idea is:
 
 The AI is not merely a natural-language wrapper around CLI commands.
 
-It is a **historical filesystem agent**.
+It is a **local historical filesystem agent**.
 
 ---
 
 # 3. MVP Product Capabilities
 
-The first meaningful GIB AI version should focus on five capabilities.
-
-These capabilities are deliberately related. They share the same historical data model, search primitives, temporal reasoning, and evidence system.
-
-The MVP should not attempt to make the AI administer every GIB feature.
-
----
+The first meaningful GIB AI version should focus on five related capabilities.
 
 ## 3.1 Investigative Search
 
@@ -97,28 +84,21 @@ Examples:
 
 > "Find the file I deleted from Downloads yesterday."
 
-> "I had some resume in Documents that mentioned my old job."
-
-The system must not reduce the request to one literal search query.
+The system must not translate the request into one literal search and stop.
 
 It must be able to:
 
 1. interpret the target;
-2. extract temporal, path, type, and state hints;
-3. create multiple plausible hypotheses;
-4. perform a specific initial search;
+2. extract time, path, type, and historical-state hints;
+3. form a bounded set of hypotheses;
+4. run a specific search;
 5. evaluate the results;
-6. broaden the search if necessary;
-7. change search dimensions instead of repeating failed searches;
+6. broaden or change search strategy when necessary;
+7. avoid repeating searches that already failed;
 8. compare candidates;
-9. stop only when:
-   - a target is resolved with sufficient evidence;
-   - the user must disambiguate;
-   - the search space has been reasonably exhausted.
+9. stop when a target is resolved, ambiguity requires the user, or reasonable search strategies are exhausted.
 
-Investigative Search is the foundation of GIB AI.
-
-Most other capabilities depend on resolving a file, directory, or historical state first.
+Investigative Search is the foundation for the other capabilities.
 
 ---
 
@@ -132,22 +112,17 @@ The user should be able to ask:
 
 > "What happened to `contract.pdf`?"
 
-The system should explain the known historical facts.
-
-A good answer may contain:
+The system should explain known historical facts such as:
 
 - first known appearance;
 - last known presence;
-- first snapshot in which the file is absent;
-- number of revisions;
+- first historical state in which the path is absent;
+- available revisions;
 - latest restorable revision;
-- whether the same content appears elsewhere;
-- whether the system has evidence of a probable rename or move;
-- uncertainty where GIB cannot determine the exact real-world cause.
+- probable move/rename evidence;
+- uncertainty about the exact real-world cause.
 
-The system must distinguish **facts** from **inferences**.
-
-Example:
+The system must distinguish facts from inference.
 
 Fact:
 
@@ -155,17 +130,15 @@ Fact:
 
 Inference:
 
-> It was probably deleted, moved, renamed, or excluded from the backup scope during that interval.
+> It probably disappeared, moved, was renamed, or left the backup scope during that interval.
 
-The AI must never claim to know the exact physical cause unless GIB has evidence for it.
+The AI must never invent an exact deletion cause or timestamp that GIB did not observe.
 
 ---
 
 ## 3.3 Intent-Based Restore
 
-The user should not need to specify backup hashes or revision IDs.
-
-Examples:
+The user should be able to say:
 
 > "Restore the latest version of my driver's license."
 
@@ -175,44 +148,38 @@ Examples:
 
 The system should:
 
-1. resolve the user's target;
-2. resolve temporal constraints if any;
-3. resolve the correct historical revision;
-4. build a deterministic restore preview;
+1. resolve the target;
+2. resolve temporal constraints;
+3. deterministically resolve the correct historical revision;
+4. create a restore preview;
 5. run safety checks;
 6. request confirmation when required;
-7. execute a precomputed restore plan;
+7. execute an immutable precomputed plan;
 8. verify the result.
 
-The AI must never directly construct an arbitrary shell command and execute it.
-
-Restore execution must use typed, validated GIB core APIs.
+The LLM must never create and execute arbitrary shell commands.
 
 ---
 
 ## 3.4 Natural-Language Time Travel
 
-The user should be able to refer to history naturally:
+Users should be able to refer to time naturally:
 
 > "How was this file last Tuesday?"
 
 > "Give me the last version before yesterday."
 
-> "Show me the version before I deleted it."
+> "Show me the version before it disappeared."
 
-> "How did this folder look at the beginning of the month?"
+The model interprets language.
 
-Temporal language should become explicit temporal constraints.
-
-Whenever possible, revision selection must be deterministic.
-
-The LLM should interpret language such as "last week" or "before it disappeared", but GIB core should select the actual revision from timestamps and revision intervals.
+Rust resolves actual timestamp intervals and selects revisions.
 
 ---
 
 ## 3.5 History Explanation — "What Happened?"
 
-The user should be able to ask broad historical questions:
+The user should be able to ask:
 
 > "What happened in this folder this week?"
 
@@ -220,91 +187,73 @@ The user should be able to ask broad historical questions:
 
 > "What happened before this file disappeared?"
 
-The system should aggregate raw history into meaningful events.
+GIB should deterministically aggregate history into useful events such as:
 
-Possible events include:
+- additions;
+- removals;
+- modifications;
+- directory disappearance;
+- deletion bursts;
+- modification bursts;
+- large churn;
+- probable moves/renames.
 
-- file added;
-- file removed;
-- file modified;
-- directory appeared;
-- directory disappeared;
-- unusually large deletion;
-- large file churn;
-- burst of modifications;
-- probable rename or move;
-- repeated revisions of the same file.
-
-The LLM should explain and prioritize events after deterministic aggregation.
-
-It should not receive thousands of raw manifest records when GIB can summarize them first.
+The LLM explains and prioritizes those events instead of reading thousands of raw manifest records.
 
 ---
 
-# 4. Explicit MVP Non-Goals
+# 4. MVP Non-Goals
 
-The MVP should not attempt to solve everything.
+The architecture should support these later, but they must not block the initial MVP.
 
-The following features are intentionally outside the first core architecture, although the harness must remain extensible enough to support them later.
+## 4.1 Full content understanding
 
-### 4.1 Full semantic content search
-
-The current historical catalog is primarily metadata-oriented.
-
-A future version may understand:
+Future versions may index or inspect:
 
 - PDF text;
 - OCR from images;
 - Office documents;
 - source-code semantics;
-- image content;
+- image descriptions;
 - embeddings;
-- EXIF metadata;
-- audio/video metadata.
+- EXIF and rich media metadata.
 
-The MVP should be compatible with future content-aware search, but must not require it.
+This will eventually make requests such as:
 
-### 4.2 General system administration
+> "Restore the latest photo of my driver's license."
 
-The MVP AI does not need to be a universal natural-language interface for:
+work even if the file is called `IMG_20260817_142233.jpg`.
 
-- storage creation;
-- encryption setup;
-- pruning;
-- live configuration;
-- backup policy design;
-- repository repair.
+## 4.2 General natural-language administration
 
-These may be added later as separate skills.
+The first MVP does not need to expose every GIB operation through AI, including storage creation, prune, retention design, encryption setup, or repair.
 
-### 4.3 Autonomous destructive maintenance
+## 4.3 Autonomous destructive maintenance
 
-The AI should not independently delete backups, prune storage, overwrite large directory trees, or alter configuration without strong explicit user intent and deterministic safety controls.
+The AI must not independently delete backups, prune storage, or replace large filesystem states.
 
 ---
 
 # 5. Core Architectural Principle
 
-The most important design rule is:
+The central design rule is:
 
-> **Use the language model only for decisions that genuinely require semantic interpretation or ambiguous reasoning. Everything deterministic should be implemented in Rust.**
+> **Use the model only for decisions that genuinely require semantic interpretation or ambiguous reasoning. Everything deterministic should be implemented in Rust.**
 
 Examples:
 
 | Problem | Owner |
 |---|---|
-| Interpret "last week" | LLM + deterministic date normalization |
-| Check whether a revision covers a timestamp | Rust |
-| Decide that "CNH" is related to "driver's license" | LLM |
+| Interpret "last week" | LLM + date normalization |
+| Select a revision whose interval contains a timestamp | Rust |
+| Understand that "CNH" relates to a driver's license | LLM |
 | Sort candidates by timestamp | Rust |
-| Detect exact repeated tool calls | Rust |
-| Choose a promising next search strategy | LLM |
-| Check whether a file exists in the catalog | Rust |
-| Decide whether an overwrite requires confirmation | Rust |
-| Generate a natural-language historical explanation | LLM |
-| Verify restored file hash | Rust |
-
-The model must never be treated as authoritative about filesystem state.
+| Detect repeated tool calls | Rust |
+| Choose the next useful search strategy | LLM |
+| Verify that a file exists in the catalog | Rust |
+| Decide whether overwrite requires confirmation | Rust |
+| Explain historical evidence naturally | LLM |
+| Verify restored content hash | Rust |
 
 The model is a semantic decision engine.
 
@@ -312,64 +261,595 @@ GIB core is the source of truth.
 
 ---
 
-# 6. Why the Harness Must Be Strong
+# 6. Local Model Strategy
 
-The intended default model is a small local model such as a Qwen3.5 4B-class quantized model.
+The default runtime should use a local Qwen3.5-4B-class Q4 GGUF through llama.cpp bindings.
 
-A model of this size can be useful at:
+The AI subsystem must not require Ollama, LM Studio, a local HTTP server, or `llama-server`.
 
-- intent classification;
-- short structured planning;
-- semantic comparison;
-- synonym generation;
-- temporal interpretation;
-- candidate ranking;
-- concise explanation.
+The model should be loaded **in-process** from Rust.
 
-However, small local models are much less reliable when asked to:
+The exact model may change over time, so the architecture must expose a model abstraction rather than spread llama.cpp-specific code through the project.
 
-- maintain long multi-step plans;
-- remember every previous tool call;
-- avoid loops without assistance;
-- safely manage destructive operations;
-- reason over huge raw outputs;
-- choose among many tools;
-- preserve exact state across long conversations.
+Suggested interface:
 
-Therefore the harness must intentionally reduce the complexity of every individual model call.
+```rust
+pub trait AiBackend {
+    fn generate_structured<T: DeserializeOwned>(
+        &mut self,
+        request: StructuredGenerationRequest,
+    ) -> Result<T, AiError>;
 
-The system should not ask:
+    fn generate_text(
+        &mut self,
+        request: TextGenerationRequest,
+    ) -> Result<String, AiError>;
 
-> "Solve the entire task."
-
-Instead, it should ask questions such as:
-
-> "Which of these four search dimensions should be explored next?"
-
-> "Which candidate best matches the user's description?"
-
-> "What important search dimension has not yet been explored?"
-
-> "Does this historical evidence justify concluding that the file disappeared in this interval?"
-
-Every model call should be narrow enough that a small model can perform consistently.
+    fn capabilities(&self) -> ModelCapabilities;
+}
+```
 
 ---
 
-# 7. High-Level System Architecture
+# 7. Model Distribution and Installation
+
+Users should not need to know what GGUF, Hugging Face, llama.cpp, or quantization mean.
+
+The normal user flow should be:
+
+```bash
+gib ai
+```
+
+If the configured model is not installed, GIB should offer or automatically perform the supported installation flow.
+
+Suggested model location:
+
+```text
+~/.gib/ai/models/
+```
+
+Each supported model should have an immutable manifest.
+
+```rust
+pub struct ModelManifest {
+    pub id: String,
+    pub display_name: String,
+    pub version: String,
+    pub download_url: String,
+    pub sha256: String,
+    pub expected_size: u64,
+    pub quantization: String,
+    pub license: String,
+    pub source: String,
+}
+```
+
+Recommended model installation pipeline:
+
+```text
+resolve configured model
+        ->
+check local artifact
+        ->
+validate size/hash
+        ->
+resume/download if missing
+        ->
+verify SHA-256
+        ->
+atomically install
+        ->
+record installed model metadata
+```
+
+Downloads should support progress and resume where practical.
+
+A failed or partial download must not be treated as an installed model.
+
+Model URLs should be versioned and immutable.
+
+GIB may mirror supported GGUF artifacts on infrastructure controlled by the project while preserving model license and attribution requirements.
+
+---
+
+# 8. Runtime Profiles and Hardware Detection
+
+GIB should detect enough local hardware information to choose safe defaults.
+
+Possible inputs:
+
+- RAM;
+- CPU architecture;
+- CPU thread count;
+- supported acceleration backend;
+- available GPU/offload capabilities.
+
+Suggested profiles:
+
+```rust
+pub enum AiQualityProfile {
+    LowMemory,
+    Balanced,
+    HighQuality,
+}
+```
+
+Profiles may adjust:
+
+- context size;
+- inference threads;
+- GPU layers/offload;
+- search beam width;
+- optional critic calls;
+- self-consistency count;
+- maximum agent budget.
+
+Safety guarantees must never depend on the quality profile.
+
+---
+
+# 9. `gib ai` Is a Core Product Surface
+
+The `gib ai` command is not a final polish task.
+
+It must be introduced early and become the primary integration surface used while the rest of the harness is developed.
+
+The system has two presentation modes:
+
+```text
+Interactive terminal mode
+        +
+Machine-readable JSON mode
+```
+
+Both modes MUST use the same:
+
+- conversation service;
+- selected conversation;
+- local model runtime;
+- AgentSession construction;
+- orchestrator;
+- tools;
+- safety system;
+- GIB core.
+
+There must never be one implementation for interactive mode and another independent implementation for JSON mode.
 
 ```mermaid
 flowchart TD
-    U[User] --> C[Conversation Layer]
+    UI[Interactive CLI UI] --> AC[AI Command Controller]
+    JSON[JSON CLI Adapter] --> AC
+    AC --> CS[Conversation Service]
+    CS --> H[Agent Harness]
+    H --> LM[Local Model Runtime]
+    H --> GC[GIB Core]
+    CS --> CP[Conversation Persistence]
+    CS --> CFG[Active Conversation Config]
+```
+
+---
+
+# 10. Interactive `gib ai` Mode
+
+Running:
+
+```bash
+gib ai
+```
+
+should open the currently selected persistent conversation.
+
+The interface should feel like a modern terminal chat application, not like repeatedly executing isolated shell commands.
+
+At minimum, interactive mode should provide:
+
+- a clear GIB AI header;
+- active conversation title or short ID;
+- active model information;
+- repository context when relevant;
+- multiline input;
+- streamed assistant output;
+- high-level agent activity;
+- progress for long operations;
+- safe confirmation prompts;
+- readable tool/result summaries;
+- persistent chat history;
+- terminal resize handling;
+- clean Ctrl+C/Ctrl+D behavior;
+- graceful fallback for limited terminals.
+
+The frontend may display activity such as:
+
+```text
+Searching historical files...
+Expanding search to PDFs from last week...
+Comparing 6 candidates...
+Inspecting file history...
+Preparing restore...
+```
+
+It MUST NOT display hidden chain-of-thought or raw internal model reasoning.
+
+A first implementation can be a polished streaming chat interface. It does not need to start as a complex full-screen TUI.
+
+Suggested conceptual components:
+
+```text
+AiInteractiveApp
+├── Header
+├── ConversationViewport
+├── AgentActivityView
+├── ConfirmationView
+├── Composer
+└── StatusBar
+```
+
+The frontend should consume structured harness events rather than parse human-readable logs.
+
+---
+
+# 11. JSON Mode
+
+Automation and external tools must be able to use the same active conversation.
+
+Example:
+
+```bash
+gib ai --mode json --message "find the contract I had last week"
+```
+
+The command must:
+
+1. load the currently selected conversation;
+2. append the user message;
+3. execute the same runtime/harness used by interactive mode;
+4. append the resulting assistant turn;
+5. persist durable turn context;
+6. return a stable JSON result.
+
+A second process invocation:
+
+```bash
+gib ai --mode json --message "restore the latest one"
+```
+
+must continue the same conversation unless the caller explicitly selects another conversation.
+
+The caller must not need to resend prior chat history.
+
+JSON stdout must remain machine-readable.
+
+It must not contain:
+
+- ANSI escape codes;
+- spinners;
+- interactive prompts;
+- arbitrary human-only status lines.
+
+Suggested response envelope:
+
+```json
+{
+  "schema_version": 1,
+  "conversation": {
+    "id": "conv_01...",
+    "title": "Contract recovery"
+  },
+  "message": {
+    "id": "msg_01...",
+    "role": "assistant",
+    "content": "I found two likely files..."
+  },
+  "status": "completed",
+  "requires_confirmation": false,
+  "artifacts": [],
+  "events": [
+    {
+      "type": "search_completed",
+      "summary": "Found 6 historical PDF candidates"
+    }
+  ]
+}
+```
+
+The JSON contract must be versioned.
+
+---
+
+# 12. Persistent Conversations
+
+Conversation continuity must survive process exits.
+
+Each conversation should be stored in its own file.
+
+Suggested layout:
+
+```text
+~/.gib/
+└── ai/
+    ├── config.toml
+    ├── models/
+    │   └── ...
+    └── conversations/
+        ├── conv_01J....json
+        ├── conv_01K....json
+        └── conv_01M....json
+```
+
+The exact root may reuse existing GIB configuration conventions, but AI state must remain separate from repository backup data.
+
+Suggested conversation type:
+
+```rust
+pub struct PersistedConversation {
+    pub schema_version: u32,
+    pub id: ConversationId,
+    pub title: Option<String>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+    pub revision: u64,
+    pub messages: Vec<PersistedMessage>,
+    pub context: PersistedConversationContext,
+}
+```
+
+Messages should have stable IDs:
+
+```rust
+pub struct PersistedMessage {
+    pub id: MessageId,
+    pub role: ConversationRole,
+    pub content: String,
+    pub created_at: DateTime,
+    pub turn_metadata: Option<PersistedTurnMetadata>,
+}
+```
+
+Raw hidden reasoning must never be persisted.
+
+Large raw tool outputs should not be blindly copied into conversation files.
+
+Persist compact summaries, structured references, and useful artifacts instead.
+
+---
+
+# 13. Active Conversation Configuration
+
+The selected conversation must be stored separately from individual conversation files.
+
+Example:
+
+```toml
+version = 1
+
+[model]
+active = "qwen3.5-4b-q4-k-m-v1"
+
+[conversation]
+active = "conv_01J..."
+```
+
+This creates the required behavior:
+
+```bash
+gib ai
+```
+
+and:
+
+```bash
+gib ai --mode json --message "..."
+```
+
+resume the same logical conversation.
+
+Changing the selected conversation must update the config atomically.
+
+---
+
+# 14. Conversation Management
+
+The CLI architecture should support operations equivalent to:
+
+```bash
+gib ai conversation new
+gib ai conversation list
+gib ai conversation select <id>
+gib ai conversation show <id>
+gib ai conversation rename <id> <title>
+gib ai conversation delete <id>
+```
+
+Interactive mode should expose equivalent conveniences such as:
+
+```text
+/new
+/conversations
+/switch
+/rename
+/exit
+```
+
+Exact syntax may evolve, but both modes must call the same `ConversationService`.
+
+For automation, an explicit conversation override should be supported:
+
+```bash
+gib ai --mode json \
+  --conversation conv_01J... \
+  --message "restore the latest one"
+```
+
+Recommended semantics:
+
+- no `--conversation`: use active conversation;
+- `--conversation <id>`: use that conversation for the invocation;
+- selecting the global active conversation is a separate operation;
+- creating a new conversation must be explicit.
+
+This prevents automation from unexpectedly replacing the human user's selected conversation.
+
+---
+
+# 15. Conversation Persistence Safety
+
+Conversation writes must be safe.
+
+Recommended write path:
+
+```text
+serialize
+   ->
+write temporary file
+   ->
+flush/sync where appropriate
+   ->
+atomic rename
+```
+
+The selected-conversation config should use the same approach.
+
+Concurrent invocations must not silently overwrite each other.
+
+Use explicit locking and/or revision checks.
+
+For example, two simultaneous commands:
+
+```bash
+gib ai --mode json --message "A"
+gib ai --mode json --message "B"
+```
+
+must either serialize access or detect a revision conflict.
+
+A failed AI turn must not corrupt the conversation.
+
+The submitted user message and a structured failed-turn record may remain durable so the user can understand what happened and retry.
+
+---
+
+# 16. Conversation vs Agent Session
+
+A **Conversation** and an **AgentSession** are not the same thing.
+
+A Conversation is long-lived and user-facing.
+
+An AgentSession is bounded execution state for a single user turn/workflow.
+
+```text
+Conversation
+   |
+   +-- user message
+   |
+   +-- create AgentSession
+   |      |
+   |      +-- route
+   |      +-- search
+   |      +-- evidence
+   |      +-- planning
+   |      +-- optional restore
+   |
+   +-- assistant message
+   |
+   +-- compact durable turn context
+```
+
+Do not serialize the entire in-memory AgentSession into the conversation.
+
+Persist only what is useful for later turns.
+
+Suggested durable context:
+
+```rust
+pub struct PersistedConversationContext {
+    pub last_resolved_targets: Vec<ResolvedTargetReference>,
+    pub last_resolved_revision: Option<ResolvedRevisionReference>,
+    pub last_temporal_constraint: Option<TemporalConstraintReference>,
+    pub last_repository: Option<RepositoryReference>,
+    pub rolling_summary: Option<String>,
+}
+```
+
+This makes follow-ups such as:
+
+> "Restore it."
+
+> "Give me the previous one."
+
+> "What happened before that?"
+
+possible without re-running the entire previous investigation.
+
+---
+
+# 17. Conversation Context Resolver
+
+Before Intent Routing, the system should create a compact context for the new turn.
+
+It should resolve references such as:
+
+```text
+that file
+the latest one
+restore it
+before that
+show me the previous version
+```
+
+Structured references from previous turns should be preferred over re-reading an arbitrarily long transcript.
+
+As conversations grow, old history should be compacted into a rolling structured summary rather than continuously expanding model context.
+
+The raw transcript remains persisted for user history, but the model-facing context should be intentionally bounded.
+
+---
+
+# 18. Why the Harness Must Be Strong
+
+Small local models are useful for narrow semantic decisions but less reliable when asked to autonomously control long multi-step trajectories.
+
+Common weak points include:
+
+- maintaining long plans;
+- remembering every previous tool call;
+- avoiding loops;
+- choosing among many tools;
+- handling huge observations;
+- safely performing mutations;
+- keeping exact state across turns.
+
+Therefore the harness should reduce every model call to a narrow problem.
+
+Do not ask:
+
+> "Solve this entire recovery request."
+
+Prefer questions such as:
+
+> "Which search dimension should be explored next?"
+
+> "Which candidate best matches the description?"
+
+> "What important search dimension remains unexplored?"
+
+> "Does this evidence justify concluding that the path disappeared during this interval?"
+
+---
+
+# 19. High-Level Agent Architecture
+
+```mermaid
+flowchart TD
+    U[User / JSON Caller] --> C[Conversation Layer]
     C --> R[Intent Router]
     R --> TC[Task Compiler]
-
     TC --> O[Deterministic Orchestrator]
 
     O --> S[Search Skill]
     O --> T[Temporal Skill]
     O --> H[History Skill]
-    O --> L[Loss Explanation Skill]
+    O --> L[Loss Skill]
     O --> RS[Restore Skill]
 
     S --> TG[Tool Gateway]
@@ -382,110 +862,51 @@ flowchart TD
 
     O --> E[Evidence Ledger]
     O --> A[Artifact Store]
-    O --> B[Budgets and Loop Guards]
+    O --> B[Budgets + Loop Guards]
     O --> SG[Safety Gate]
-
-    SG --> GC
-
-    GC --> O
-    O --> F[Final Response Composer]
-    F --> U
 ```
 
-There is only one local language model runtime.
+There is one local model runtime.
 
-"Agents" or "skills" are logical roles, not separate model processes.
+"Agents" are logical roles using the same model with different:
 
-The same model weights may be called multiple times with different:
-
-- prompts;
+- system prompts;
 - schemas;
 - context builders;
-- tools;
-- temperature/sampling settings;
-- reasoning mode;
-- output limits.
+- allowed actions;
+- reasoning settings;
+- token limits.
 
 ---
 
-# 8. Main Runtime Components
+# 20. Structured Generation
 
-The architecture should be divided into the following layers.
+Critical model decisions should use constrained structured generation.
 
----
+The runtime should support:
 
-## 8.1 Local Model Runtime
-
-Responsibilities:
-
-- load the GGUF model;
-- manage llama.cpp bindings;
-- manage inference contexts;
-- perform constrained structured generation;
-- stream user-facing text when needed;
-- optionally enable/disable reasoning mode per skill;
-- expose one stable internal inference API to the harness.
-
-The rest of the AI subsystem should not depend directly on llama.cpp APIs.
-
-Suggested internal abstraction:
-
-```rust
-pub trait LocalLanguageModel {
-    fn generate_structured<T: DeserializeOwned>(
-        &mut self,
-        request: StructuredGenerationRequest,
-    ) -> Result<T, AiError>;
-
-    fn generate_text(
-        &mut self,
-        request: TextGenerationRequest,
-    ) -> Result<String, AiError>;
-}
-```
-
-The harness must depend on this interface, not directly on `llama_cpp_2`.
-
----
-
-## 8.2 Conversation Layer
-
-Responsibilities:
-
-- track the user's visible conversation;
-- resolve simple references from previous turns;
-- maintain current repository context;
-- know the active working directory if relevant;
-- distinguish conversational continuation from a new task;
-- forward only the relevant request to the AI harness.
+- typed schema generation;
+- JSON/grammar validation;
+- retry on malformed output;
+- bounded output sizes;
+- reasoning on/off per role;
+- model-independent internal interfaces.
 
 Example:
 
-User:
+```rust
+let intent: IntentGraph = ai.generate_structured(request)?;
+```
 
-> "Find my contract from last month."
-
-Then:
-
-> "Restore the latest one."
-
-The Conversation Layer should recognize that "the latest one" refers to the previously resolved candidate set or resolved target.
-
-The model should not need to rediscover the entire first request.
+The model should not be asked to produce arbitrary prose that Rust later tries to parse heuristically.
 
 ---
 
-## 8.3 Intent Router
+# 21. Intent Router
 
-The Intent Router is deliberately narrow.
+The Router has no filesystem tools.
 
-It does not have filesystem tools.
-
-It does not inspect backups.
-
-It only maps natural language into a structured intent graph.
-
-Primary intent types:
+Its job is only to map the user request into structured intent.
 
 ```rust
 pub enum IntentKind {
@@ -497,149 +918,91 @@ pub enum IntentKind {
 }
 ```
 
-A request may contain multiple intents.
+Requests may contain multiple intents.
 
 Example:
 
 > "Find the contract I had last month and restore the version before I edited it."
 
-May become:
+may become:
 
 ```json
 {
-  "intents": [
-    "locate",
-    "time_travel",
-    "restore"
-  ],
-  "subject": {
-    "description": "contract"
-  },
-  "temporal": {
-    "expression": "last month"
-  },
-  "revision_selector": {
-    "kind": "before_change"
-  }
+  "intents": ["locate", "time_travel", "restore"],
+  "subject": { "description": "contract" },
+  "temporal": { "expression": "last month" },
+  "revision_selector": { "kind": "before_change" }
 }
 ```
 
-The router should use constrained output.
-
-It must not generate arbitrary plans.
+The Router does not invent the complete workflow.
 
 ---
 
-## 8.4 Task Compiler
+# 22. Deterministic Task Compiler
 
-The Task Compiler is deterministic Rust.
+The Task Compiler is Rust.
 
-Its job is to convert the routed intent into a dependency graph.
+It converts intent into dependencies.
 
-For example:
+Example:
 
 ```text
 Restore
 requires:
-    ResolvedTarget
-    ResolvedRevision
+  ResolvedTarget
+  ResolvedRevision
 ```
 
-If neither exists:
+If target is unknown:
 
 ```text
 ResolvedTarget
 requires:
-    SearchSkill
+  InvestigativeSearch
 ```
 
-If the revision depends on natural language:
+If revision depends on an event:
 
 ```text
 ResolvedRevision
 requires:
-    TemporalConstraint
-    FileTimeline
+  FileTimeline
+  TemporalConstraint
 ```
 
-Therefore:
+The LLM identifies what the user means.
 
-```mermaid
-flowchart LR
-    S[Search] --> RT[Resolved Target]
-    T[Temporal Resolve] --> RV[Revision Resolver]
-    RT --> RV
-    H[History Lookup] --> RV
-    RV --> RP[Restore Preview]
-    RP --> SG[Safety Gate]
-    SG --> RC[Restore Commit]
-    RC --> V[Verify]
-```
-
-The LLM should never decide this dependency structure.
-
-The workflow graph belongs to the application.
+The application determines what workflow must run.
 
 ---
 
-## 8.5 Deterministic Orchestrator
+# 23. Agent Session
 
-The Orchestrator is the central harness component.
+The model is not the workflow memory.
 
-Responsibilities:
-
-- execute the task graph;
-- maintain session state;
-- decide which skill is called next;
-- enforce budgets;
-- supply skill-specific context;
-- store artifacts;
-- store evidence;
-- reject repeated actions;
-- run validators;
-- trigger critics only at defined checkpoints;
-- stop workflows that cannot make progress;
-- request user clarification when evidence remains ambiguous;
-- prevent AI calls from bypassing safety gates.
-
-The Orchestrator owns lifecycle and control flow.
-
-The language model proposes semantic decisions.
-
-The Orchestrator decides whether those proposals are allowed.
-
----
-
-# 9. Agent Session State
-
-The model must never be the primary memory of the workflow.
-
-State should be explicit and serializable.
-
-Suggested structure:
+State should be explicit and serializable when useful.
 
 ```rust
 pub struct AgentSession {
     pub id: SessionId,
+    pub conversation_id: ConversationId,
     pub repository: RepositoryContext,
     pub user_request: String,
     pub intent_graph: IntentGraph,
     pub phase: AgentPhase,
-
     pub constraints: ConstraintSet,
     pub hypotheses: Vec<Hypothesis>,
     pub candidates: CandidateStore,
-
     pub evidence: EvidenceLedger,
     pub artifacts: ArtifactStore,
     pub attempts: AttemptLog,
-
     pub budget: AgentBudget,
     pub safety: SafetyState,
 }
 ```
 
-Possible phases:
+Example phases:
 
 ```rust
 pub enum AgentPhase {
@@ -660,23 +1023,13 @@ pub enum AgentPhase {
 }
 ```
 
-The state machine should be explicit enough that a debugger can show exactly where the workflow is.
-
 ---
 
-# 10. Typed Artifacts
+# 24. Typed Artifacts
 
-Every skill should consume and produce typed artifacts.
+Skills should exchange typed artifacts instead of prose wherever possible.
 
-This is critical.
-
-Do not let information move between skills as unstructured prose whenever a type is possible.
-
-Examples follow.
-
----
-
-## 10.1 Search Goal
+## Search Goal
 
 ```rust
 pub struct SearchGoal {
@@ -688,9 +1041,7 @@ pub struct SearchGoal {
 }
 ```
 
----
-
-## 10.2 Candidate
+## File Candidate
 
 ```rust
 pub struct FileCandidate {
@@ -702,15 +1053,12 @@ pub struct FileCandidate {
     pub revision_count: usize,
     pub size: Option<u64>,
     pub content_type: Option<String>,
-
     pub deterministic_scores: CandidateScores,
     pub evidence_ids: Vec<EvidenceId>,
 }
 ```
 
----
-
-## 10.3 Resolved Target
+## Resolved Target
 
 ```rust
 pub struct ResolvedTarget {
@@ -721,29 +1069,12 @@ pub struct ResolvedTarget {
 }
 ```
 
-Avoid using an arbitrary `0.93 confidence` from the LLM as the primary decision signal.
-
-Use categorical or system-computed resolution quality:
-
-```rust
-pub enum ResolutionQuality {
-    Strong,
-    Acceptable,
-    Ambiguous,
-}
-```
-
----
-
-## 10.4 Temporal Constraint
+## Temporal Constraint
 
 ```rust
 pub enum TemporalConstraint {
     At(DateTime),
-    Between {
-        start: DateTime,
-        end: DateTime,
-    },
+    Between { start: DateTime, end: DateTime },
     Before(DateTime),
     After(DateTime),
     Latest,
@@ -752,24 +1083,7 @@ pub enum TemporalConstraint {
 }
 ```
 
----
-
-## 10.5 File Timeline
-
-```rust
-pub struct FileTimeline {
-    pub entry_id: EntryId,
-    pub first_seen: Option<HistoricalPoint>,
-    pub last_seen: Option<HistoricalPoint>,
-    pub revisions: Vec<HistoricalRevision>,
-    pub disappearance_windows: Vec<TimeWindow>,
-    pub probable_moves: Vec<ProbableMove>,
-}
-```
-
----
-
-## 10.6 Resolved Revision
+## Resolved Revision
 
 ```rust
 pub struct ResolvedRevision {
@@ -782,51 +1096,24 @@ pub struct ResolvedRevision {
 
 ---
 
-## 10.7 Restore Plan
+# 25. Evidence Ledger
 
-```rust
-pub struct RestorePlan {
-    pub id: RestorePlanId,
-    pub entries: Vec<RestorePlanEntry>,
-    pub target_root: PathBuf,
-    pub overwrite_count: usize,
-    pub total_bytes: u64,
-    pub requires_confirmation: bool,
-}
-```
-
-The restore commit API should consume the plan ID, not arbitrary paths generated by the model.
-
----
-
-# 11. Evidence Ledger
-
-All claims about user files must be grounded in tool output.
-
-The system should maintain an append-only evidence ledger.
+All claims about user files must originate from evidence.
 
 Example:
 
 ```text
 E1
 source: catalog_search
-claim:
-  query "identity document" returned 0 entries
+claim: query "identity document" returned 0 entries
 
 E2
 source: catalog_scan
-claim:
-  17 PDF files existed during 2026-08-17..2026-08-23
+claim: 17 PDFs existed during requested interval
 
 E3
 source: entry_history
-claim:
-  Downloads/CNH_Digital.pdf existed until 2026-08-21T18:32
-
-E4
-source: entry_history
-claim:
-  the next indexed historical state no longer contains that path
+claim: Downloads/CNH_Digital.pdf existed until 18:32
 ```
 
 Suggested type:
@@ -842,87 +1129,65 @@ pub struct EvidenceRecord {
 
 Model decisions should reference evidence IDs.
 
-Example:
-
-```json
-{
-  "decision": "resolve_candidate",
-  "entry_id": "entry:abc",
-  "evidence": ["E2", "E3"]
-}
-```
-
-Critical rule:
-
-> **A model-generated statement about repository state is not evidence.**
-
-Evidence can only originate from:
-
-- GIB core;
-- deterministic calculations based on GIB core data;
-- validated external local analysis tools added in the future.
+A statement produced by the model is not evidence.
 
 ---
 
-# 12. Tool Gateway
+# 26. Tool Gateway
 
-The model must not call GIB internals directly.
-
-All AI-accessible operations go through a Tool Gateway.
+All AI-accessible GIB operations must pass through a Tool Gateway.
 
 Responsibilities:
 
-- define tool schemas;
+- expose minimal typed operations;
 - validate arguments;
 - enforce skill-specific permissions;
-- normalize output;
-- add evidence records;
-- calculate fingerprints for loop prevention;
-- redact unnecessary fields;
+- normalize outputs;
+- create evidence records;
+- fingerprint actions;
 - enforce result limits;
-- prevent mutation tools outside approved phases.
+- prevent mutation tools from being called in read-only phases;
+- emit structured trace events.
 
-The Tool Gateway is also the natural boundary for adding future plugin-provided AI capabilities.
-
----
-
-# 13. Tool Exposure by Skill
-
-Do not expose every tool to every model call.
-
-The available action set should be minimal.
-
-Example:
-
-### Search Skill
-
-- `search_text`
-- `scan_catalog`
-- `get_entry_history`
-- `inspect_candidate_metadata`
-
-### History Skill
-
-- `get_entry_history`
-- `get_changes`
-- `get_neighbor_snapshots`
-- `find_same_content_hash`
-
-### Restore Skill
-
-- `restore_preview`
-
-The LLM should never receive `restore_commit`.
-
-Restore commit is invoked by Rust after safety validation.
-
-This reduces tool confusion and prevents capability escalation.
+The model must not call random GIB internals directly.
 
 ---
 
-# 14. Structured Decisions Instead of Generic Tool Calling
+# 27. Minimal Tool Exposure
 
-For critical planner calls, prefer skill-specific decision enums rather than generic function calling.
+Each skill receives only the capabilities it requires.
+
+Search:
+
+```text
+search_text
+scan_catalog
+get_entry_history
+inspect_candidate_metadata
+```
+
+History:
+
+```text
+get_entry_history
+get_changes
+get_neighbor_snapshots
+find_same_content_hash
+```
+
+Restore planning:
+
+```text
+restore_preview
+```
+
+The LLM never receives direct access to `restore_commit`.
+
+---
+
+# 28. Skill-Specific Decision DSLs
+
+Critical planner calls should prefer narrow enums over generic tool calling.
 
 Example:
 
@@ -934,7 +1199,6 @@ pub enum SearchDecision {
         terms: Vec<String>,
         path_prefixes: Vec<String>,
     },
-
     FilterScan {
         extensions: Vec<String>,
         content_types: Vec<String>,
@@ -942,47 +1206,27 @@ pub enum SearchDecision {
         time: Option<DateRange>,
         state: Option<EntryState>,
     },
-
     Inspect {
         entry_ids: Vec<EntryId>,
     },
-
     Resolve {
         entry_id: EntryId,
         evidence: Vec<EvidenceId>,
     },
-
     AskUser {
         question: String,
     },
-
     Exhausted {
         reason: String,
     },
 }
 ```
 
-Constrained generation should force the model to return only one of these valid forms.
-
-The model should not be able to invent:
-
-```text
-super_search_everything()
-```
-
-because the grammar does not permit such an action.
+Constrained generation makes unsupported actions impossible to emit.
 
 ---
 
-# 15. Search Architecture
-
-Investigative Search is the most complex MVP skill.
-
-It should be implemented as a controlled investigation loop.
-
----
-
-## 15.1 Search State
+# 29. Investigative Search State
 
 ```rust
 pub struct SearchState {
@@ -996,77 +1240,45 @@ pub struct SearchState {
 }
 ```
 
----
+The model may initially produce a bounded hypothesis set.
 
-## 15.2 Hypothesis Generation
-
-The first model call may produce a small hypothesis set.
-
-Example user request:
+Example request:
 
 > "I had an identity document last week."
 
 Possible hypotheses:
 
 ```text
-H1
-The filename contains identity-related terms:
-identity, identidade, id, RG, CNH, habilitacao.
-
-H2
-It is probably a PDF in Downloads or Documents.
-
-H3
-It may be an image in Downloads, Documents, Pictures, or a scanner-related folder.
-
-H4
-The file may currently be deleted but still historically restorable.
+H1 filename contains CNH/RG/identity/habilitacao
+H2 PDF in Downloads/Documents during requested period
+H3 image in likely folders during requested period
+H4 path may currently be deleted but historically restorable
 ```
 
-The harness should cap hypothesis count.
-
-Recommended MVP maximum:
-
-```text
-3 to 5 hypotheses
-```
-
-The model should not generate a huge brainstorming list.
+Recommended maximum: 3–5 active hypotheses.
 
 ---
 
-# 16. Search Escalation Ladder
+# 30. Search Escalation Ladder
 
-The investigation should progressively broaden.
+Search should progressively broaden.
 
-A suggested logical ladder:
+## Level 0 — exact
 
-### Level 0 — Exact / highly specific
-
-- direct filename;
-- exact path;
+- exact filename;
+- path;
 - exact phrase.
 
-### Level 1 — Lexical expansion
+## Level 1 — lexical expansion
 
-- abbreviations;
 - synonyms;
+- abbreviations;
 - translations;
-- common related terms.
+- domain-related names.
 
-Example:
+## Level 2 — likely paths
 
-```text
-driver's license
-CNH
-habilitacao
-identity
-RG
-```
-
-### Level 2 — Path expansion
-
-Likely directories:
+Examples:
 
 ```text
 Downloads
@@ -1076,7 +1288,7 @@ Desktop
 Scans
 ```
 
-### Level 3 — File-type expansion
+## Level 3 — likely file types
 
 Examples:
 
@@ -1088,83 +1300,62 @@ png
 webp
 doc
 docx
-txt
 ```
 
-### Level 4 — Temporal metadata scan
+## Level 4 — temporal metadata scan
 
-Search based primarily on:
+Search by:
 
-- existed during time window;
-- disappeared during time window;
-- changed during time window.
+- existed during;
+- changed during;
+- disappeared during.
 
-### Level 5 — Broad historical scan
+## Level 5 — broad historical scan
 
-Expand to:
+Include:
 
-- all historical entries;
 - deleted entries;
-- adjacent time window.
+- all-history scope;
+- adjacent time ranges.
 
-### Level 6 — Future content-aware search
+## Level 6 — future content-aware search
 
-When content understanding is implemented:
+Later:
 
-- extracted text;
 - OCR;
+- extracted text;
 - embeddings;
-- image classification.
+- image understanding.
 
-The LLM chooses which branch is appropriate.
+The model chooses a promising branch.
 
-The Rust harness controls which levels have already been attempted.
+Rust tracks which dimensions have already been explored.
 
 ---
 
-# 17. Search Beam
+# 31. Search Beam
 
-A single search path can become stuck.
-
-The harness should preserve a small number of parallel hypotheses.
-
-This is not a full Tree-of-Thought implementation.
-
-It is a bounded search beam.
+The search harness should preserve a small number of parallel hypotheses.
 
 Example:
 
 ```text
 Beam width: 3
 
-Branch A:
-filename/synonym search
-
-Branch B:
-PDF + time-range scan
-
-Branch C:
-image + time-range scan
+A: filename/synonyms
+B: PDF + requested time
+C: image + requested time
 ```
 
-A branch may be dropped when:
+This is a bounded search beam, not an unrestricted tree-of-thought implementation.
 
-- it repeatedly returns nothing;
-- all candidates are semantically weak;
-- another branch produces strong evidence;
-- the search budget is nearing exhaustion.
-
-The beam should be implemented in Rust.
-
-The model should score or propose branches, but should not own the tree structure.
+Rust owns branching and pruning.
 
 ---
 
-# 18. Search Attempt Fingerprints and Anti-Loop Controls
+# 32. Anti-Loop Controls
 
-Every search action must be canonicalized.
-
-Example:
+Every action must be canonicalized and fingerprinted.
 
 ```rust
 pub struct ActionFingerprint {
@@ -1173,108 +1364,64 @@ pub struct ActionFingerprint {
 }
 ```
 
-These should fingerprint as equivalent:
+These should be equivalent:
 
 ```text
-query="CNH"
-query=" cnh "
-query="Cnh"
+CNH
+ cnh 
+Cnh
 ```
 
-If the same action is requested again, the Orchestrator should reject it before executing.
+If an identical action is attempted again, reject it before tool execution.
 
-The next planner call receives:
-
-```text
-The exact requested search has already been attempted.
-Choose a different search dimension.
-```
-
-The model must not be trusted to remember its own repeated actions.
+The next planner observation should explicitly state that the action was already attempted.
 
 ---
 
-# 19. Search Gap Analyzer
+# 33. Search Gap Analyzer
 
-When an investigation stalls, do not simply call the Search Planner with the same context.
+When search stalls, use a specialized role instead of blindly rerunning the same planner.
 
-Use a distinct model role:
+The Gap Analyzer receives:
 
-> **Search Gap Analyzer**
+- goal;
+- attempted strategies;
+- explored dimensions;
+- candidate summary;
+- remaining useful dimensions.
 
-Its only job is to identify an important unexplored search dimension.
+It answers only:
 
-Input example:
+> What meaningful search direction remains unexplored?
 
-```text
-Goal:
-Find the user's identity document from last week.
-
-Already attempted:
-- identity -> 0 results
-- CNH -> 0 results
-- PDFs in Downloads -> 4 weak candidates
-
-Explored dimensions:
-- lexical synonyms
-- PDF
-- Downloads
-
-Unexplored dimensions:
-- images
-- Documents
-- Pictures
-- deleted-only scan
-
-Question:
-What meaningful search direction has not yet been explored?
-```
-
-Possible output:
+Example output:
 
 ```json
 {
   "dimension": "file_type",
   "proposal": {
-    "extensions": ["jpg", "jpeg", "png"],
-    "time": "requested_window"
+    "extensions": ["jpg", "jpeg", "png"]
   },
-  "reason": "An identity document may have been stored as a photo rather than a PDF."
+  "reason": "The document may have been stored as a photo."
 }
 ```
 
-The Gap Analyzer should be used only after a normal search round does not progress.
-
 ---
 
-# 20. Candidate Ranking Pipeline
+# 34. Candidate Ranking
 
-Candidate selection should combine deterministic ranking and semantic judgment.
+Candidate ranking should combine deterministic scoring and bounded semantic judgment.
 
-Recommended pipeline:
+Pipeline:
 
 ```text
-Raw search results
-        |
-        v
-Deterministic filters
-        |
-        v
-Deterministic scoring
-        |
-        v
-Top N candidates
-        |
-        v
-LLM Candidate Judge
-        |
-        v
-Resolved / Ambiguous / Continue Search
+raw results
+  -> deterministic filtering
+  -> deterministic scoring
+  -> top N
+  -> Candidate Judge
+  -> resolved / ambiguous / continue
 ```
-
----
-
-## 20.1 Deterministic Candidate Scores
 
 Possible score dimensions:
 
@@ -1288,187 +1435,83 @@ pub struct CandidateScores {
 }
 ```
 
-Examples:
+Rust should handle exact matches, path comparison, time windows, extensions, current/deleted state, and recency.
 
-- filename exact match;
-- filename prefix match;
-- path token match;
-- file existed during requested period;
-- file is deleted when the request implies loss;
-- extension matches expected type;
-- location matches user hint;
-- newest revision matches "latest".
-
-The current GIB search implementation already has useful lexical ranking concepts such as:
-
-- exact path;
-- exact filename;
-- exact stem;
-- prefix;
-- contains;
-- token matching;
-- recency tie-breaking.
-
-The AI-specific search layer should reuse or generalize this logic.
+The LLM should handle semantic interpretation such as whether `CNH_Digital.pdf` is a plausible identity document.
 
 ---
 
-## 20.2 Candidate Judge
+# 35. Candidate Judge and Ambiguity
 
-The Candidate Judge receives only a bounded set of candidates.
+The Candidate Judge should receive only a bounded set, normally around 5–12 candidates.
 
-Recommended:
+It decides:
 
-```text
-top 5 to 12 candidates
-```
+- best semantic match;
+- whether meaningful competitors remain;
+- whether more evidence is needed;
+- whether the user must disambiguate.
 
-It answers:
+Do not rely on an arbitrary self-reported probability such as `0.94`.
 
-- Which candidate best matches the user's natural-language description?
-- Is the top candidate sufficiently distinct from alternatives?
-- Is more evidence needed?
-- Is the request ambiguous enough to ask the user?
+Use system-derived quality categories:
 
-It does not perform searches.
-
-It does not execute restore.
-
-It does not invent new filesystem state.
-
----
-
-# 21. Confidence and Ambiguity
-
-Do not rely primarily on self-reported LLM probability.
-
-Bad:
-
-```json
-{
-  "confidence": 0.94
+```rust
+pub enum ResolutionQuality {
+    Strong,
+    Acceptable,
+    Ambiguous,
 }
 ```
 
-A small model may output a confident number without calibration.
+Signals may include:
 
-System confidence should instead combine observable signals.
-
-Possible signals:
-
-- exact lexical match;
+- lexical match;
 - temporal match;
 - path match;
 - file type match;
-- deleted/current state match;
-- candidate separation;
-- consistency across multiple judge calls;
-- supporting history evidence;
+- historical state match;
+- separation between top candidates;
+- supporting history;
 - contradictions.
 
-Example policy:
+---
 
-```text
-Strong:
-- several independent signals match
-- no close competing candidate
+# 36. Adaptive Self-Consistency and Critics
 
-Acceptable:
-- candidate is plausible
-- limited alternatives
-- safe read-only operation
+Multiple model calls should be used only when uncertainty justifies them.
 
-Ambiguous:
-- top candidates are close
-- missing important evidence
-- mutation would be unsafe without confirmation
-```
+If candidates A and B are very close, independent Candidate Judge passes may be used.
+
+A narrow Completeness Critic may run before concluding a difficult search.
+
+It answers:
+
+> Is there an important untested search dimension that could materially change the result?
+
+Critics are checkpoints, not supervisors of every step.
 
 ---
 
-# 22. Adaptive Self-Consistency
+# 37. Temporal Reasoning
 
-Multiple LLM calls should be used selectively.
-
-Do not run every request through three independent planners.
-
-Use additional calls only when ambiguity is detected.
-
-Example:
-
-```text
-Candidate A and B have very similar system scores.
-```
-
-Then run two or three independent Candidate Judge passes.
-
-Possible result:
-
-```text
-Judge 1 -> A
-Judge 2 -> A
-Judge 3 -> B
-```
-
-This strengthens A but does not automatically make A certain.
-
-If the evidence remains weak, ask the user.
-
-This mechanism should be budgeted.
-
----
-
-# 23. Completeness Critic
-
-Before declaring a difficult search complete, optionally run a narrow critic.
-
-Prompt intent:
-
-> Given the user's goal, attempted strategies, and evidence, is there an important untested search dimension that could materially change the result?
-
-Outputs:
-
-```rust
-pub enum SearchCriticVerdict {
-    Accept,
-    Continue {
-        missing_dimension: SearchDimension,
-    },
-    AskUser {
-        reason: String,
-    },
-}
-```
-
-The critic is a checkpoint, not a general supervisor.
-
-It should not run after every tool call.
-
----
-
-# 24. Temporal Reasoning Architecture
-
-Temporal reasoning should be split into two concerns:
+Temporal reasoning is split into:
 
 1. language interpretation;
-2. deterministic revision selection.
+2. deterministic historical selection.
 
----
-
-## 24.1 Temporal Interpreter
-
-The model may interpret expressions such as:
+The Temporal Interpreter can map:
 
 ```text
 last week
 yesterday
 before Tuesday
-at the beginning of the month
-the version before I deleted it
-the latest one
+beginning of the month
+before it disappeared
+latest
 ```
 
-Output should be structured.
+into typed constraints.
 
 Example:
 
@@ -1476,98 +1519,38 @@ Example:
 {
   "type": "between",
   "start": "2026-08-17T00:00:00-03:00",
-  "end": "2026-08-23T23:59:59-03:00",
-  "source_expression": "last week"
+  "end": "2026-08-23T23:59:59-03:00"
 }
 ```
 
-The application provides the current timezone and reference date.
+The application provides timezone and reference date.
 
-Do not let the model infer the user's timezone from memory.
+Event-relative expressions such as:
 
----
+> "before it disappeared"
 
-## 24.2 Event-Relative Temporal Expressions
+become dependencies on historical events.
 
-Example:
-
-> "the version before I deleted it"
-
-This is not directly a timestamp.
-
-It becomes:
-
-```text
-BeforeEvent(FileDisappearance)
-```
-
-Dependencies:
-
-```mermaid
-flowchart LR
-    R[Resolve Target] --> H[Read History]
-    H --> E[Extract Disappearance Event]
-    E --> T[Resolve Timestamp]
-    T --> V[Select Revision]
-```
-
-The LLM may help classify the phrase.
-
-The actual disappearance event comes from history.
+Once a timestamp or event is resolved, Rust selects the appropriate revision.
 
 ---
 
-## 24.3 Revision Resolver
+# 38. File Loss Explanation
 
-Once a target and temporal constraint are known, selection should be deterministic.
-
-Example:
-
-```rust
-fn revision_at(
-    revisions: &[HistoricalRevision],
-    target: DateTime,
-) -> Option<&HistoricalRevision> {
-    revisions.iter().find(|revision| {
-        revision.present_from <= target
-            && revision
-                .present_until
-                .map(|until| target < until)
-                .unwrap_or(true)
-    })
-}
-```
-
-No LLM is required to perform interval arithmetic.
-
----
-
-# 25. File Loss Explanation Architecture
-
-The Loss Explanation workflow should be one of the most reliable features.
-
-Why?
-
-Because GIB already has historical metadata that can support objective statements.
+Loss Explanation should rely primarily on deterministic timeline extraction.
 
 Suggested workflow:
 
-```mermaid
-flowchart TD
-    U[User asks where file went] --> R[Resolve Target]
-    R --> H[Load Entry History]
-    H --> E[Deterministic Event Extractor]
-    E --> M[Move/Rename Detector]
-    M --> L[Loss Explanation Composer]
-    L --> C[Evidence Critic]
-    C --> O[Answer]
+```text
+resolve target
+  -> load history
+  -> extract events
+  -> detect same-content move/rename candidates
+  -> compose explanation
+  -> evidence check
 ```
 
----
-
-## 25.1 Event Extractor
-
-Rust should extract events such as:
+Possible events:
 
 ```rust
 pub enum FileEvent {
@@ -1580,41 +1563,29 @@ pub enum FileEvent {
 }
 ```
 
----
-
-## 25.2 Loss Semantics
-
-The final explanation must use careful language.
-
-Allowed:
+Allowed statement:
 
 > "The file was present at 18:32 and absent from the next indexed state at 19:04."
 
-Allowed:
+Unsupported statement:
 
-> "It appears to have disappeared during that interval."
-
-Not allowed without evidence:
-
-> "You deleted the file at 18:47."
-
-The system cannot know this unless GIB captured an explicit deletion event with that timestamp.
+> "You deleted it at 18:47."
 
 ---
 
-## 25.3 Rename / Move Detection
+# 39. Probable Rename and Move Detection
 
-A future or near-MVP enhancement should use content hashes.
+Content hashes can support stronger explanations.
 
 If:
 
 ```text
 Path A disappears
-Path B appears shortly afterwards
-content_hash(A) == content_hash(B)
+Path B appears shortly afterward
+hash(A) == hash(B)
 ```
 
-then the system can mark:
+GIB can produce:
 
 ```rust
 pub struct ProbableMove {
@@ -1625,19 +1596,17 @@ pub struct ProbableMove {
 }
 ```
 
-The natural-language explanation may say:
+The explanation may say:
 
-> "The content does not appear to have been lost. The same content appears shortly afterward under a different path, so the file was probably moved or renamed."
+> "The content appears shortly afterward under another path, so the file was probably moved or renamed."
 
-The word "probably" is important unless the core records an explicit move operation.
+The word "probably" remains important unless GIB has an explicit move event.
 
 ---
 
-# 26. "What Happened?" History Explanation
+# 40. "What Happened?" History Aggregation
 
-Broad history queries should not feed raw manifests directly into the LLM.
-
-Instead create deterministic aggregation primitives.
+Raw manifests should be aggregated before model input.
 
 Example:
 
@@ -1655,50 +1624,66 @@ pub struct ChangeSummary {
 }
 ```
 
+Deterministic detectors can identify:
+
+- large deletion bursts;
+- large additions;
+- high churn;
+- directory disappearance;
+- repeatedly changing large files;
+- rename-like transitions.
+
+The LLM chooses which events are salient for the user's question and explains them.
+
 ---
 
-## 26.1 Event Detection
+# 41. AI-Oriented Catalog APIs
 
-Possible deterministic event detectors:
+The existing text search is not enough for agentic investigation.
 
-- large deletion burst;
-- large addition burst;
-- high file churn;
-- a directory completely disappearing;
-- a single large file repeatedly changing;
-- widespread same-extension modifications;
-- repeated rename-like content-hash transitions.
+GIB core should expose internal AI-oriented query APIs.
 
-The LLM then decides which of these events are most meaningful for the user's question.
+Suggested filter:
 
-Example:
-
-Raw:
-
-```text
-added = 14
-modified = 28
-removed = 83
-largest deletion burst = 79 files under photos/old
+```rust
+pub struct CatalogFilter {
+    pub text: Option<String>,
+    pub path_prefixes: Vec<String>,
+    pub extensions: Vec<String>,
+    pub content_types: Vec<String>,
+    pub existed_between: Option<DateRange>,
+    pub changed_between: Option<DateRange>,
+    pub disappeared_between: Option<DateRange>,
+    pub state: Option<EntryState>,
+    pub limit: usize,
+}
 ```
 
-Explanation:
+This must support requests such as:
 
-> "The biggest change happened Tuesday evening, when most of `photos/old` disappeared. The rest of the week was mostly small edits and additions."
+> All PDFs that existed last week.
+
+> Images deleted yesterday.
+
+> Files under Downloads that disappeared in August.
+
+Other useful APIs:
+
+```rust
+get_ai_entry_history(entry_id)
+summarize_changes(scope, range)
+find_entries_by_content_hash(hash, range)
+```
+
+The AI should call core APIs, not shell out to `gib search` and parse terminal output.
 
 ---
 
-# 27. Restore Architecture
+# 42. Restore Architecture
 
-Restore must be designed as a controlled transaction.
+Restore is a controlled transaction.
 
-The language model must not be the final authority over filesystem mutation.
-
----
-
-## 27.1 Restore Preconditions
-
-Restore requires:
+Required artifacts:
 
 ```text
 ResolvedTarget
@@ -1708,90 +1693,46 @@ ResolvedRevision
 ResolvedDestination
 ```
 
-If any is missing, the workflow must resolve it first.
-
----
-
-## 27.2 Restore Preview
-
-The AI-facing operation creates a plan.
-
-Example:
+The AI-facing step creates a plan.
 
 ```rust
-pub async fn create_restore_plan(
-    target: ResolvedTarget,
-    revision: ResolvedRevision,
-    destination: PathBuf,
-) -> Result<RestorePlan, RestoreError>;
-```
-
-The plan contains exactly what will happen.
-
-Example:
-
-```json
-{
-  "plan_id": "rp_7f9181",
-  "files": [
-    {
-      "path": "Downloads/CNH_Digital.pdf",
-      "backup": "abc123...",
-      "revision": "rev_19",
-      "destination": "/home/user/Downloads/CNH_Digital.pdf"
-    }
-  ],
-  "overwrite_count": 0,
-  "total_bytes": 2831832,
-  "requires_confirmation": false
+pub struct RestorePlan {
+    pub id: RestorePlanId,
+    pub entries: Vec<RestorePlanEntry>,
+    pub target_root: PathBuf,
+    pub overwrite_count: usize,
+    pub total_bytes: u64,
+    pub requires_confirmation: bool,
 }
 ```
 
----
-
-## 27.3 Restore Safety Gate
-
-Safety decisions belong to Rust.
-
-Example policy:
-
-### May execute without extra confirmation
-
-Only when all are true:
-
-- user explicitly asked for restore;
-- exactly one or a very small bounded set of files;
-- no existing file will be overwritten;
-- destination is inside an expected restore scope;
-- target and revision are strongly resolved.
-
-### Requires confirmation
-
-Examples:
-
-- overwrite existing files;
-- restore many files;
-- restore a directory tree;
-- replace current state;
-- restore to a sensitive root;
-- candidate resolution is only acceptable, not strong;
-- user intent is ambiguous.
-
-### Must reject
-
-Examples:
-
-- invalid path escaping configured destination;
-- unknown plan ID;
-- modified plan;
-- plan references unavailable backup;
-- evidence no longer matches current repository state.
+A plan contains exactly what will happen.
 
 ---
 
-## 27.4 Commit by Plan ID
+# 43. Restore Safety Gate
 
-Critical API design:
+Safety policy belongs entirely to Rust.
+
+A small, explicitly requested restore may execute without another prompt only when policy allows it.
+
+Confirmation should be required for cases such as:
+
+- overwrite of current files;
+- large multi-file restore;
+- directory-tree replacement;
+- sensitive destinations;
+- ambiguous candidate resolution.
+
+Invalid or unsafe plans must be rejected.
+
+The model never decides that a dangerous mutation is safe.
+
+---
+
+# 44. Commit Restore by Plan ID
+
+Critical API rule:
 
 ```rust
 pub async fn commit_restore(
@@ -1799,98 +1740,86 @@ pub async fn commit_restore(
 ) -> Result<RestoreResult, RestoreError>;
 ```
 
-Not:
+The commit call should not accept newly generated file paths or backup hashes from the model.
 
-```rust
-restore(path, backup_hash, revision, destination)
+The plan is immutable between preview and commit.
+
+---
+
+# 45. JSON Confirmation Flow
+
+Interactive mode can show a human confirmation prompt.
+
+JSON mode must never unexpectedly wait for terminal input.
+
+If confirmation is required, JSON mode should return a structured state such as:
+
+```json
+{
+  "status": "confirmation_required",
+  "requires_confirmation": true,
+  "confirmation": {
+    "id": "confirm_01...",
+    "summary": "Restore will overwrite 2 existing files"
+  }
+}
 ```
 
-The model never gets to change arguments after preview.
+A later explicit command/message can approve the immutable pending plan.
 
-The plan should be immutable and optionally short-lived.
-
----
-
-## 27.5 Restore Verification
-
-A successful write is not sufficient.
-
-Verification should check:
-
-- expected file exists;
-- expected size when available;
-- expected content hash where possible;
-- permissions where relevant.
-
-Only after verification should the user receive:
-
-> "Restored successfully."
+The confirmation token must reference a server-side/local persisted plan or validated immutable plan state; it must not allow the caller to mutate arbitrary restore arguments.
 
 ---
 
-# 28. Context Builder
+# 46. Restore Verification
 
-Each model role should receive a small, purpose-built context.
+After restore, GIB should verify:
 
-Do not resend the entire conversation and all tool output.
+- expected path exists;
+- size when available;
+- content hash when possible;
+- permissions when relevant.
+
+Only after verification should the assistant say the restore succeeded.
 
 ---
 
-## 28.1 Search Planner Context
+# 47. Context Builders
 
-May include:
+Each model role receives only relevant context.
+
+Search Planner:
 
 - user goal;
-- resolved temporal constraints;
-- top current hypotheses;
+- resolved temporal constraint;
+- active hypotheses;
 - previous search attempts;
 - explored dimensions;
 - summarized candidates;
 - remaining budget.
 
-Should not include:
-
-- irrelevant conversation turns;
-- raw backup manifests;
-- restore internals;
-- huge result payloads.
-
----
-
-## 28.2 Candidate Judge Context
-
-May include:
+Candidate Judge:
 
 - target description;
-- temporal constraint;
+- time constraint;
 - top candidates;
-- relevant metadata;
+- metadata;
 - evidence summaries.
 
-Should not include:
-
-- all failed searches;
-- unrelated candidate details;
-- entire repository history.
-
----
-
-## 28.3 Loss Explanation Context
-
-May include:
+Loss Explainer:
 
 - resolved target;
 - deterministic timeline;
-- probable move/rename findings;
+- probable move findings;
 - evidence IDs.
 
-The model should not need to search.
+Do not continuously resend the entire conversation or raw manifests.
 
 ---
 
-# 29. Reasoning Mode Policy
+# 48. Reasoning Mode Policy
 
-When the selected Qwen runtime supports an explicit reasoning/thinking mode, it should be enabled selectively.
+If the runtime supports a reasoning/thinking mode, use it selectively.
 
 Suggested policy:
 
@@ -1901,115 +1830,50 @@ Suggested policy:
 | Search Hypothesis Generator | On |
 | Search Planner | On |
 | Search Gap Analyzer | On |
-| Candidate Judge | Off by default |
-| Candidate Judge on ambiguity | On |
-| Loss Explanation Composer | Off or light |
+| Candidate Judge | Off normally |
+| Ambiguous Candidate Judge | On |
+| Loss Explanation | Off/light |
 | History Analyst | On |
 | Completeness Critic | On |
-| Final Response Composer | Off |
+| Final Response | Off |
 
-The raw internal reasoning should not be stored as session memory.
-
-Store only:
-
-- structured decisions;
-- evidence references;
-- produced artifacts;
-- concise decision reasons where useful.
+Raw hidden reasoning must not be persisted into conversations.
 
 ---
 
-# 30. Prompt Design Rules
+# 49. Prompt Design
 
-Prompts should be versioned resources.
+Prompts are versioned software resources.
 
-Each role should have its own prompt.
+Each role should have:
 
-Recommended properties:
-
-- clear role;
-- explicit allowed decisions;
+- a clear narrow responsibility;
 - explicit forbidden behavior;
-- compact relevant domain knowledge;
-- few-shot examples;
-- examples of bad behavior;
-- output schema;
+- allowed action schema;
+- relevant domain knowledge;
+- high-quality few-shot examples;
+- negative examples;
 - stopping conditions.
 
----
-
-## 30.1 Example Search Planner Rule Set
+Example Search Planner rules:
 
 ```text
-You are GIB's Search Planner.
-
-Your job is to choose the next useful search action.
-
-Rules:
 1. Never invent filesystem facts.
-2. Use only evidence supplied in context.
-3. Never repeat an already attempted search.
+2. Use only supplied evidence.
+3. Never repeat an attempted search.
 4. Prefer specific searches before broad scans.
-5. When a specific search fails, broaden one dimension at a time.
-6. Consider synonyms, likely paths, file types, historical state, and requested time.
-7. Do not resolve a candidate if strong competing candidates remain.
-8. Do not ask the user before reasonable automated investigation has been exhausted.
-9. Return exactly one action matching the schema.
+5. Broaden one meaningful dimension when a search fails.
+6. Consider synonyms, paths, file types, time, and historical state.
+7. Do not resolve while strong competitors remain.
+8. Investigate reasonably before asking the user.
+9. Return exactly one valid action.
 ```
 
 ---
 
-# 31. Few-Shot Trajectory Examples
+# 50. Budgets and Progress
 
-Small models benefit heavily from high-quality examples.
-
-For search planning, include examples of progression.
-
-Example:
-
-```text
-Goal:
-Find an identity document from last week.
-
-Attempt 1:
-query = "identity document"
-result = 0
-
-Good next action:
-search related identity terms such as CNH, RG, habilitacao,
-or scan likely document types inside the requested period.
-
-Bad next action:
-repeat "identity document".
-```
-
-Another:
-
-```text
-Goal:
-Find a contract from last month.
-
-Results:
-contract-final.pdf
-rental-contract.pdf
-old-contract-template.pdf
-
-Good behavior:
-compare path, date, state, and user description.
-
-Bad behavior:
-choose the first filename alphabetically.
-```
-
-Few-shot examples should come from the GIB eval corpus.
-
----
-
-# 32. Budgets
-
-The harness must have strict execution budgets.
-
-Suggested structure:
+All loops have explicit budgets.
 
 ```rust
 pub struct AgentBudget {
@@ -2023,46 +1887,18 @@ pub struct AgentBudget {
 }
 ```
 
-Example default:
-
-```text
-max_llm_calls = 10
-max_tool_calls = 20
-max_search_rounds = 6
-max_gap_analysis_rounds = 2
-max_candidate_judges = 3
-max_critic_calls = 2
-max_candidate_inspections = 20
-```
-
-Hard requests may receive an expanded budget.
-
-Never allow an unbounded agent loop.
-
----
-
-# 33. Progress and Stopping Conditions
-
-Every loop must be able to answer:
-
-> Did the last step create new information?
-
-Progress signals include:
+A step should count as progress only if it creates new useful information, for example:
 
 - new candidates;
 - reduced candidate set;
-- newly explored search dimension;
+- new search dimension;
 - new temporal constraint;
 - new historical evidence;
 - stronger candidate separation.
 
-If several iterations produce no progress:
+If repeated rounds produce no progress, stop.
 
-```text
-stop
-```
-
-Possible stop outcomes:
+Possible resolutions:
 
 ```rust
 pub enum WorkflowResolution {
@@ -2076,11 +1912,9 @@ pub enum WorkflowResolution {
 
 ---
 
-# 34. Error Recovery
+# 51. Error Handling
 
-Errors should be categorized.
-
-Example:
+Errors should be normalized before they reach planners.
 
 ```rust
 pub enum ToolFailure {
@@ -2095,215 +1929,19 @@ pub enum ToolFailure {
 }
 ```
 
-The planner should not receive raw internal stack traces.
+The orchestrator decides whether to retry, fall back, inform the user, or stop.
 
-It should receive normalized observations.
+JSON mode returns stable error codes.
 
-Example:
+Interactive mode renders readable equivalents.
 
-```text
-Search failed because the historical catalog is degraded.
-Results may be incomplete.
-```
-
-The Orchestrator decides whether:
-
-- retry is useful;
-- fallback is possible;
-- user must be informed;
-- workflow should stop.
+Both originate from the same underlying error object.
 
 ---
 
-# 35. Catalog API Changes Needed for AI
+# 52. Observability and Frontend Events
 
-The existing `gib search` behavior is optimized for CLI text search.
-
-GIB AI needs richer primitives.
-
-The AI should not be forced through the public CLI parser.
-
-Add internal catalog APIs.
-
----
-
-## 35.1 General Historical Scan
-
-Suggested interface:
-
-```rust
-pub struct CatalogFilter {
-    pub text: Option<String>,
-    pub path_prefixes: Vec<String>,
-    pub extensions: Vec<String>,
-    pub content_types: Vec<String>,
-
-    pub existed_between: Option<DateRange>,
-    pub changed_between: Option<DateRange>,
-    pub disappeared_between: Option<DateRange>,
-
-    pub state: Option<EntryState>,
-    pub limit: usize,
-}
-```
-
-This enables queries like:
-
-> All PDFs that existed last week.
-
-The current text-oriented search should remain available.
-
-The AI layer needs both.
-
----
-
-## 35.2 History Retrieval
-
-Suggested:
-
-```rust
-pub async fn get_ai_entry_history(
-    entry_id: EntryId,
-) -> Result<AiEntryHistory, CatalogError>;
-```
-
-Return normalized historical information without forcing the AI to interpret internal catalog structures.
-
----
-
-## 35.3 Scope Change Summary
-
-Suggested:
-
-```rust
-pub async fn summarize_changes(
-    scope: HistoricalScope,
-    range: DateRange,
-) -> Result<ChangeSummary, CatalogError>;
-```
-
----
-
-## 35.4 Same-Content Lookup
-
-Suggested:
-
-```rust
-pub async fn find_entries_by_content_hash(
-    hash: ContentHash,
-    range: Option<DateRange>,
-) -> Result<Vec<ContentMatch>, CatalogError>;
-```
-
-Useful for probable move/rename explanation.
-
----
-
-# 36. User Interaction Strategy
-
-The harness should investigate before asking unnecessary questions.
-
-Bad:
-
-> "What was the filename?"
-
-when the user clearly does not know it.
-
-Good:
-
-1. search automatically;
-2. broaden intelligently;
-3. compare candidates;
-4. ask only if ambiguity remains meaningful.
-
-Example:
-
-> "I found two equally plausible files from that period: `Documents/CNH.pdf` and `Downloads/CNH_Digital.pdf`. Which one do you mean?"
-
-The question should include useful evidence.
-
----
-
-# 37. Read-Only vs Mutating Capabilities
-
-All tools should be tagged.
-
-```rust
-pub enum ToolRisk {
-    ReadOnly,
-    ReversibleMutation,
-    DestructiveMutation,
-}
-```
-
-MVP search/history tools are read-only.
-
-Restore is a mutation but generally reversible if it does not overwrite data.
-
-Any future tools for deletion, prune, or configuration changes should use stricter controls.
-
-The model should not be able to transition directly from a read-only skill to an arbitrary mutation.
-
----
-
-# 38. Privacy
-
-GIB AI is intended to be local-first.
-
-Core privacy principles:
-
-- model inference occurs locally;
-- backup metadata remains local unless storage itself is remote;
-- prompts are not sent to external AI providers by default;
-- the model should receive only the minimum data necessary for each role;
-- future content indexing should be explicitly local by default;
-- temporary extracted content should follow repository security expectations.
-
-If encrypted repositories are used, the AI subsystem must not create an unencrypted permanent index that leaks protected filenames or content.
-
----
-
-# 39. Observability
-
-Every workflow should be inspectable.
-
-The user-facing UI can remain simple, but development/debug mode should expose structured traces.
-
-Example trace:
-
-```text
-session: ai_123
-
-router:
-  intents: [locate, restore]
-
-temporal:
-  "last week" -> 2026-08-17..2026-08-23
-
-search:
-  #1 text ["CNH", "habilitacao"] -> 0
-  #2 scan pdf in time range -> 8
-  #3 scan images in time range -> 23
-
-candidate_judge:
-  ambiguous
-
-result:
-  user input required
-```
-
-Do not log:
-
-- encryption passwords;
-- secret keys;
-- raw sensitive document contents unless explicitly enabled for debugging;
-- hidden model reasoning.
-
----
-
-# 40. Developer Trace Types
-
-Suggested:
+The harness should emit structured trace events.
 
 ```rust
 pub enum AgentTraceEvent {
@@ -2321,150 +1959,103 @@ pub enum AgentTraceEvent {
 }
 ```
 
-These traces are valuable for evaluation and bug reports.
+Interactive mode turns these into modern progress UI.
+
+JSON mode may include a bounded normalized event list or event summaries.
+
+Do not expose hidden reasoning.
+
+Do not log secrets or raw sensitive document content by default.
 
 ---
 
-# 41. Evaluation System
+# 53. Evaluation System
 
 A serious eval harness is mandatory.
 
-Do not evaluate only by manually chatting with the model.
-
 Create synthetic repositories with known histories.
 
-Each test defines:
+Each scenario should define:
 
 - filesystem states;
 - snapshot timeline;
-- user query;
+- user messages;
+- conversation history when relevant;
 - expected target;
 - expected revision;
 - expected facts;
 - forbidden claims;
 - expected tool behavior;
-- expected need for clarification.
+- expected clarification behavior.
 
----
-
-## 41.1 Example Search Eval
+Example:
 
 ```text
-Aug 10:
-Downloads/RG.pdf exists
-
-Aug 12:
-RG.pdf modified
-
-Aug 14:
-RG.pdf deleted
+Aug 10: Downloads/RG.pdf exists
+Aug 12: modified
+Aug 14: deleted
 
 User:
 "Find the identity document I had last week."
 
 Expected:
-resolved target = Downloads/RG.pdf
+Downloads/RG.pdf
 ```
 
----
-
-## 41.2 Example Loss Eval
-
-```text
-18:32:
-contract.pdf present
-
-19:04:
-contract.pdf absent
-
-User:
-"When did my contract disappear?"
-
-Expected:
-answer interval = 18:32..19:04
-
-Forbidden:
-claim exact deletion timestamp
-```
-
----
-
-## 41.3 Example Rename Eval
-
-```text
-15:30:
-Documents/foo.pdf present
-hash = H
-
-15:34:
-Documents/foo.pdf absent
-Downloads/foo-final.pdf present
-hash = H
-
-Expected:
-probable move/rename
-```
-
----
-
-## 41.4 Example Ambiguity Eval
+Ambiguity example:
 
 ```text
 Documents/CNH.pdf
 Downloads/CNH_Digital.pdf
 
-Both valid during requested period.
-
 User:
 "Restore my driver's license."
 
 Expected:
-ask user or gather more evidence.
+collect more evidence or ask user
 
 Forbidden:
-arbitrary restore.
+arbitrary restore
 ```
 
 ---
 
-# 42. Metrics
+# 54. Metrics
 
-Measure component-level quality.
+Track component quality.
 
-Suggested metrics:
-
-### Routing
+Routing:
 
 - intent accuracy;
 - compound intent recall.
 
-### Search
+Search:
 
 - recall@5;
 - recall@10;
-- mean reciprocal rank;
+- MRR;
 - average search rounds;
 - repeated-action rate;
 - exhaustion accuracy.
 
-### Candidate Resolution
+Candidate resolution:
 
 - top-1 accuracy;
 - ambiguity detection;
-- false confident resolution rate.
+- false-confident resolution rate.
 
-### Temporal
+Temporal:
 
-- date-range interpretation accuracy;
-- revision selection accuracy.
+- date interpretation accuracy;
+- revision-selection accuracy.
 
-### Loss Explanation
+Loss explanation:
 
 - factual timeline accuracy;
 - unsupported claim rate;
-- rename/move inference accuracy.
+- rename inference accuracy.
 
-### Restore
+Restore:
 
 - target accuracy;
 - revision accuracy;
@@ -2472,196 +2063,78 @@ Suggested metrics:
 - overwrite confirmation accuracy;
 - verification success rate.
 
-### System
+Conversation/frontend:
 
-- mean LLM calls;
-- mean tool calls;
+- persistence round-trip accuracy;
+- active-conversation continuity;
+- JSON schema compatibility;
+- concurrent-write safety;
+- follow-up reference resolution;
+- interactive/JSON behavioral parity.
+
+System:
+
+- LLM calls;
+- tool calls;
 - latency;
-- RAM usage;
+- RAM;
 - CPU time;
 - token count;
-- workflow completion rate.
+- completion rate.
 
 ---
 
-# 43. Prompt Optimization Workflow
+# 55. Privacy
 
-Prompts should be treated as versioned software assets.
+GIB AI is local-first.
 
-Recommended development process:
+Principles:
 
-```text
-eval corpus
-    |
-    v
-baseline prompt
-    |
-    v
-run metrics
-    |
-    v
-inspect failures
-    |
-    v
-modify instructions/examples
-    |
-    v
-repeat
-```
+- inference occurs locally;
+- prompts are not sent to remote AI providers by default;
+- model context is minimized;
+- future content indexing remains local by default;
+- temporary extracted content follows repository security expectations;
+- encrypted repository data must not create a permanently unencrypted AI index that leaks protected filenames/content.
 
-Optionally use external development-only prompt optimization tools.
-
-For example, DSPy-style optimization may be used offline during development to improve:
-
-- router instructions;
-- search few-shots;
-- candidate judge examples;
-- critic prompts.
-
-The runtime product remains Rust + local model.
-
-No Python prompt framework is required on the user's machine.
+Conversation files themselves may contain sensitive user messages and file references, so their filesystem permissions should be restrictive where supported.
 
 ---
 
-# 44. Model Abstraction and Future Models
-
-The harness must not assume Qwen forever.
-
-Suggested:
-
-```rust
-pub trait AiBackend {
-    fn infer_structured<T>(&mut self, task: AiTask<T>) -> Result<T, AiError>;
-    fn infer_text(&mut self, task: TextTask) -> Result<String, AiError>;
-    fn capabilities(&self) -> ModelCapabilities;
-}
-```
-
-Possible future models:
-
-- stronger local 8B model;
-- mobile 1.5B/3B model;
-- multimodal local model;
-- optional remote provider.
-
-The harness should remain model-agnostic.
-
----
-
-# 45. Capability Profiles
-
-Different hardware may use different model profiles.
-
-Example:
-
-```rust
-pub enum AiQualityProfile {
-    LowMemory,
-    Balanced,
-    HighQuality,
-}
-```
-
-The harness may adjust:
-
-- model size;
-- number of self-consistency calls;
-- search beam width;
-- critic usage;
-- context size.
-
-Important:
-
-The workflow semantics should remain the same.
-
-Lower hardware may be slower or use fewer optional evaluations, but should not bypass safety guarantees.
-
----
-
-# 46. Future Content Understanding
-
-The architecture should allow a future Content Understanding subsystem.
-
-Possible pipeline:
-
-```mermaid
-flowchart LR
-    F[Historical File] --> X[Extractor]
-    X --> T[Text/OCR]
-    X --> M[Metadata]
-    X --> I[Image Description]
-    T --> IDX[Local Index]
-    M --> IDX
-    I --> IDX
-    IDX --> ST[Semantic Search Tool]
-```
-
-Future tools:
-
-```text
-search_content
-search_ocr
-search_image_descriptions
-search_embeddings
-inspect_document_text
-```
-
-Then:
-
-> "Restore the latest photo of my driver's license."
-
-can work even when the file is named:
-
-```text
-IMG_20260817_142233.jpg
-```
-
-The existing Search Skill should not need to be redesigned.
-
-The new content search dimension simply becomes another branch in its escalation ladder.
-
----
-
-# 47. Future Skill Expansion
-
-The same harness can later support:
-
-- backup safety diagnosis;
-- storage health;
-- natural-language backup configuration;
-- intelligent retention planning;
-- storage optimization;
-- sync conflict explanation;
-- repository check/repair assistance;
-- anomaly investigation;
-- disaster recovery planning.
-
-Each should be implemented as a specialized skill with:
-
-- explicit inputs;
-- explicit outputs;
-- minimal tools;
-- deterministic safety rules.
-
-Do not turn the Router into an unrestricted general agent.
-
----
-
-# 48. Suggested Rust Module Structure
+# 56. Suggested Rust Module Structure
 
 ```text
 src/
 └── ai/
     ├── mod.rs
     │
+    ├── cli/
+    │   ├── mod.rs
+    │   ├── command.rs
+    │   ├── interactive.rs
+    │   ├── json.rs
+    │   ├── renderer.rs
+    │   └── confirmation.rs
+    │
+    ├── conversation/
+    │   ├── mod.rs
+    │   ├── model.rs
+    │   ├── store.rs
+    │   ├── service.rs
+    │   ├── active.rs
+    │   ├── context.rs
+    │   ├── locking.rs
+    │   └── migration.rs
+    │
     ├── runtime/
     │   ├── mod.rs
     │   ├── backend.rs
     │   ├── llama.rs
+    │   ├── model_manager.rs
+    │   ├── hardware.rs
+    │   ├── profile.rs
     │   ├── generation.rs
-    │   ├── structured.rs
-    │   └── model_manager.rs
+    │   └── structured.rs
     │
     ├── harness/
     │   ├── mod.rs
@@ -2684,10 +2157,7 @@ src/
     │   └── task_compiler.rs
     │
     ├── skills/
-    │   ├── mod.rs
-    │   │
     │   ├── search/
-    │   │   ├── mod.rs
     │   │   ├── goal.rs
     │   │   ├── hypotheses.rs
     │   │   ├── planner.rs
@@ -2696,28 +2166,20 @@ src/
     │   │   ├── ranker.rs
     │   │   ├── judge.rs
     │   │   └── critic.rs
-    │   │
     │   ├── temporal/
-    │   │   ├── mod.rs
     │   │   ├── parser.rs
     │   │   ├── constraint.rs
     │   │   └── revision_resolver.rs
-    │   │
     │   ├── history/
-    │   │   ├── mod.rs
     │   │   ├── timeline.rs
     │   │   ├── changes.rs
     │   │   ├── event_detector.rs
     │   │   └── explainer.rs
-    │   │
     │   ├── loss/
-    │   │   ├── mod.rs
     │   │   ├── analyzer.rs
     │   │   ├── rename_detector.rs
     │   │   └── explainer.rs
-    │   │
     │   └── restore/
-    │       ├── mod.rs
     │       ├── resolver.rs
     │       ├── preview.rs
     │       ├── policy.rs
@@ -2725,10 +2187,9 @@ src/
     │       └── verify.rs
     │
     ├── tools/
-    │   ├── mod.rs
     │   ├── gateway.rs
-    │   ├── search.rs
     │   ├── catalog.rs
+    │   ├── search.rs
     │   ├── history.rs
     │   └── restore.rs
     │
@@ -2747,399 +2208,85 @@ src/
 
 ---
 
-# 49. End-to-End Example: Investigative Search
+# 57. Recommended Implementation Order
 
-User:
+The frontend must exist early so the team can continuously dogfood the real product surface while the harness is implemented.
 
-> "I had an identity document last week."
-
-### Step 1 — Route
-
-```json
-{
-  "intents": ["locate"],
-  "subject": {
-    "description": "identity document"
-  },
-  "temporal": {
-    "expression": "last week"
-  }
-}
-```
-
-### Step 2 — Resolve time
-
-```text
-2026-08-17 00:00
-to
-2026-08-23 23:59
-```
-
-### Step 3 — Generate hypotheses
-
-```text
-H1 filename/synonym match
-H2 PDF during period
-H3 image during period
-```
-
-### Step 4 — Search
-
-```text
-search_text(["identity", "identidade", "CNH", "RG"])
-```
-
-Result:
-
-```text
-0
-```
-
-### Step 5 — Replan
-
-```text
-scan_catalog:
-  extensions = [pdf]
-  existed_between = last_week
-```
-
-Result:
-
-```text
-8 candidates
-```
-
-### Step 6 — Deterministic rank
-
-Top candidates:
-
-```text
-Downloads/CNH_Digital.pdf
-Documents/contract.pdf
-Downloads/form.pdf
-```
-
-### Step 7 — Candidate Judge
-
-Result:
-
-```text
-CNH_Digital.pdf = strong semantic match
-```
-
-### Step 8 — Completeness check
-
-No strong competitor.
-
-### Step 9 — Resolve
-
-```text
-ResolvedTarget:
-Downloads/CNH_Digital.pdf
-```
-
-User-visible answer:
-
-> "I found `Downloads/CNH_Digital.pdf`, which existed during the period you mentioned."
-
----
-
-# 50. End-to-End Example: File Loss Explanation
-
-User:
-
-> "Where did my contract go?"
-
-### Resolve target
-
-Search identifies:
-
-```text
-Documents/contracts/rental-contract.pdf
-```
-
-### Load history
-
-GIB core determines:
-
-```text
-last present snapshot:
-2026-08-24 18:32
-
-next indexed state:
-2026-08-24 19:04
-
-restorable revisions:
-4
-```
-
-### Same-content lookup
-
-No matching hash under a new path.
-
-### Explanation
-
-> "`Documents/contracts/rental-contract.pdf` was still present at 18:32 on August 24 and was already absent from the next indexed state at 19:04. GIB cannot determine the exact filesystem action that caused it, but the file disappeared during that interval. Four historical revisions are still restorable."
-
-No unsupported claim such as:
-
-> "You deleted it at 18:47."
-
----
-
-# 51. End-to-End Example: Intent-Based Restore
-
-User:
-
-> "Restore the latest resume I had in Downloads."
-
-### Route
-
-```text
-Locate + Restore
-```
-
-### Search
-
-Candidate:
-
-```text
-Downloads/resume-final.pdf
-```
-
-### Revision selector
-
-```text
-Latest
-```
-
-### Deterministic revision resolution
-
-```text
-revision = rev_7
-backup = abc123
-```
-
-### Restore preview
-
-```text
-destination:
-~/Downloads/resume-final.pdf
-
-overwrite:
-false
-```
-
-### Safety
-
-User explicitly requested restore.
-
-No overwrite.
-
-Strong resolution.
-
-Allowed.
-
-### Commit
-
-```text
-commit_restore(plan_id)
-```
-
-### Verify
-
-Hash matches.
-
-### Answer
-
-> "Restored the latest historical version of `Downloads/resume-final.pdf`."
-
----
-
-# 52. End-to-End Example: Time Travel
-
-User:
-
-> "Give me the version of this file from before Tuesday."
-
-### Route
-
-```text
-TimeTravel
-```
-
-### Resolve target
-
-Use current conversational target if available.
-
-### Temporal parser
-
-```text
-Before Tuesday 00:00
-```
-
-### History
-
-Load revisions.
-
-### Revision resolver
-
-Select newest revision whose valid interval begins before the cutoff and is historically valid.
-
-### Output
-
-If user asked only to identify:
-
-> "The latest version before Tuesday is revision X from Monday at 21:14."
-
-If restore is also requested, the Task Compiler extends the workflow into Restore.
-
----
-
-# 53. End-to-End Example: "What Happened?"
-
-User:
-
-> "What happened in this folder yesterday?"
-
-### Route
-
-```text
-ExplainHistory
-```
-
-### Resolve scope
-
-Current directory.
-
-### Resolve time
-
-Yesterday local timezone.
-
-### Change summary
-
-```text
-Added: 4
-Modified: 17
-Removed: 83
-```
-
-Detected event:
-
-```text
-79 of 83 removals occurred under photos/old within 3 minutes
-```
-
-### History Analyst
-
-Prioritizes the deletion burst.
-
-### Answer
-
-> "The major event yesterday was a large deletion under `photos/old`: 79 files disappeared within about three minutes. Outside that event, the folder had 17 modified files and four new files."
-
----
-
-# 54. Safety Invariants
-
-These are non-negotiable.
-
-### Invariant 1
-
-The LLM never executes shell commands.
-
-### Invariant 2
-
-The LLM never directly mutates repository state.
-
-### Invariant 3
-
-All file facts come from evidence.
-
-### Invariant 4
-
-All mutation arguments are validated by Rust.
-
-### Invariant 5
-
-Restore commits use immutable precomputed plans.
-
-### Invariant 6
-
-Overwrite policies are deterministic.
-
-### Invariant 7
-
-Repeated actions are detected outside the model.
-
-### Invariant 8
-
-Every loop has a budget.
-
-### Invariant 9
-
-Ambiguity is preferable to an unsafe guess.
-
-### Invariant 10
-
-The model cannot expand its own tool permissions.
-
----
-
-# 55. Quality Invariants
-
-### Quality Rule 1
-
-A failed specific search should normally broaden or change one search dimension.
-
-### Quality Rule 2
-
-The same failed search should never be executed repeatedly.
-
-### Quality Rule 3
-
-The user should not be asked for details the system can reasonably investigate.
-
-### Quality Rule 4
-
-Raw historical data should be summarized before entering model context.
-
-### Quality Rule 5
-
-The model should not perform deterministic timestamp or revision arithmetic.
-
-### Quality Rule 6
-
-The final answer should expose uncertainty when evidence is incomplete.
-
-### Quality Rule 7
-
-A difficult search should consider at least one materially different strategy before declaring exhaustion.
-
----
-
-# 56. Recommended Implementation Order
-
-The implementation should be incremental.
-
----
-
-## Phase 1 — Runtime and Contracts
+## Phase 1 — Model Distribution and Local Runtime
 
 Implement:
 
-- local model manager;
-- llama.cpp backend;
-- structured generation;
-- prompt loading;
-- schema validation;
-- common AI errors.
+- model registry;
+- automatic GGUF download;
+- resumable installation;
+- SHA-256 validation;
+- active-model config;
+- llama.cpp binding runtime;
+- model load/unload;
+- basic text generation.
 
-No user-facing agent yet.
+Outcome:
+
+GIB can install and execute the local model in-process.
 
 ---
 
-## Phase 2 — Harness Core
+## Phase 2 — Structured Generation and Early `gib ai`
+
+Implement:
+
+- schema-constrained generation;
+- prompt resource loading;
+- `gib ai` command;
+- conversation file model;
+- ConversationStore and ConversationService;
+- active conversation config;
+- basic interactive streaming chat;
+- `gib ai --mode json --message`;
+- conversation new/list/select primitives.
+
+Outcome:
+
+Developers can immediately use:
+
+```bash
+gib ai
+```
+
+and:
+
+```bash
+gib ai --mode json --message "hello"
+```
+
+and both continue the same selected conversation.
+
+This version may initially be direct local-model chat before the complete harness exists.
+
+---
+
+## Phase 3 — Modern Interactive Frontend and Runtime Profiles
+
+Implement:
+
+- polished terminal conversation viewport;
+- multiline composer;
+- streamed messages;
+- agent activity/status UI abstraction;
+- confirmation UI abstraction;
+- slash commands;
+- terminal resize/fallback behavior;
+- hardware detection;
+- quality/runtime profiles;
+- CPU/GPU/offload configuration.
+
+Outcome:
+
+`gib ai` becomes suitable for continuous internal use while features are still being built.
+
+---
+
+## Phase 4 — Harness Core
 
 Implement:
 
@@ -3149,212 +2296,305 @@ Implement:
 - AttemptLog;
 - AgentBudget;
 - Tool Gateway;
-- Trace events;
-- Orchestrator skeleton.
+- validation;
+- anti-loop framework;
+- trace events;
+- Orchestrator;
+- conversation-to-session context builder.
+
+The existing CLI begins consuming harness events instead of directly wrapping the model.
 
 ---
 
-## Phase 3 — Read-Only Search Foundation
+## Phase 5 — AI Catalog Foundation, Routing, and Search
 
 Implement:
 
-- internal `scan_catalog` API;
-- AI search tool wrappers;
-- deterministic candidate ranking;
-- SearchGoal;
-- SearchState;
-- SearchDecision;
-- anti-loop fingerprints.
-
-Then implement:
-
+- `scan_catalog` and historical filter APIs;
+- history lookup primitives;
+- same-content lookup foundation;
 - Intent Router;
-- Search Hypothesis Generator;
+- deterministic Task Compiler;
+- SearchGoal/SearchState;
+- hypothesis generation;
 - Search Planner;
+- search escalation;
+- search beam;
+- anti-loop fingerprints;
 - Gap Analyzer;
-- Candidate Judge.
+- deterministic ranking;
+- Candidate Judge;
+- Completeness Critic.
 
-At this stage, the first feature can ship:
+Outcome:
 
-> Investigative Search.
+**Investigative Search** works through both interactive and JSON mode.
 
 ---
 
-## Phase 4 — Temporal Reasoning
+## Phase 6 — Temporal Reasoning
 
 Implement:
 
 - TemporalConstraint;
 - Temporal Interpreter;
 - deterministic revision resolver;
-- time-window helpers.
+- event-relative time references;
+- durable conversation references to previous temporal/target artifacts.
 
-Ship:
+Outcome:
 
-> Natural-language Time Travel.
+**Natural-Language Time Travel** works, including follow-ups such as:
+
+> "Now show me the version before that."
 
 ---
 
-## Phase 5 — History and Loss
+## Phase 7 — History and Loss
 
 Implement:
 
 - normalized timeline API;
-- disappearance-window extractor;
-- change summary;
-- event detector;
-- loss explanation;
-- history explanation.
+- disappearance windows;
+- change aggregation;
+- event detection;
+- probable rename/move inference;
+- history explanation;
+- loss explanation.
 
-Ship:
+Outcome:
 
-> File Loss Explanation.
-
-and:
-
-> What Happened?
+**File Loss Explanation** and **What Happened?** work.
 
 ---
 
-## Phase 6 — Safe Restore
+## Phase 8 — Safe Restore
 
 Implement:
 
+- ResolvedRevision integration;
 - RestorePlan;
-- restore preview;
-- safety policy;
-- confirmation flow;
+- preview;
+- deterministic safety policy;
+- immutable confirmation state;
+- interactive confirmation renderer;
+- JSON `confirmation_required` response;
 - commit by plan ID;
 - verification.
 
-Ship:
+Outcome:
 
-> Intent-Based Restore.
-
----
-
-## Phase 7 — Evals and Optimization
-
-Before broad release:
-
-- create several hundred synthetic scenarios;
-- measure component metrics;
-- tune prompts;
-- tune budgets;
-- tune search escalation;
-- collect regression tests from real failures.
+**Intent-Based Restore** works safely in both frontend modes.
 
 ---
 
-# 57. Definition of "Good" GIB AI
+## Phase 9 — Evals and Hardening
 
-The system is successful when the user does not need to understand snapshots.
+Implement a large synthetic eval corpus and regression suite covering:
 
-A good GIB AI experience should feel like:
+- routing;
+- vague search;
+- search expansion;
+- ambiguity;
+- temporal language;
+- deleted files;
+- rename/move;
+- history explanations;
+- restore safety;
+- conversation continuation;
+- active conversation persistence;
+- concurrent JSON invocations;
+- interactive/JSON parity;
+- malformed model output;
+- model/runtime failures.
 
-> "Tell GIB what you remember."
+Tune:
 
-The system then reconstructs the technical details.
+- prompts;
+- few-shot examples;
+- budgets;
+- escalation rules;
+- ranking thresholds;
+- critic usage;
+- runtime profiles.
 
-For example:
+---
 
-> "Restore the latest photo of my driver's license."
+# 58. End-to-End Conversation Example
 
-The user does not need to know:
+First process:
 
-- filename;
-- extension;
-- folder;
-- backup;
-- revision;
-- snapshot timestamp.
-
-GIB AI may internally perform:
-
-```text
-Intent routing
-    ->
-Temporal interpretation
-    ->
-Search hypothesis generation
-    ->
-Lexical search
-    ->
-Historical scan
-    ->
-Candidate ranking
-    ->
-Semantic candidate judgment
-    ->
-Revision resolution
-    ->
-Restore preview
-    ->
-Safety validation
-    ->
-Restore
-    ->
-Verification
+```bash
+gib ai --mode json --message "find the identity document I had last week"
 ```
 
-But the user experiences one coherent capability.
+Internally:
+
+```text
+load active conversation
+  -> append user message
+  -> create AgentSession
+  -> route Locate
+  -> resolve last week
+  -> search CNH/RG/identity terms
+  -> no result
+  -> scan PDFs in period
+  -> rank candidates
+  -> resolve Downloads/CNH_Digital.pdf
+  -> persist resolved-target reference
+  -> append assistant turn
+  -> persist conversation
+```
+
+Later, in another shell/process:
+
+```bash
+gib ai --mode json --message "what happened to it?"
+```
+
+The Conversation Context Resolver identifies `it` as the previously resolved target.
+
+The workflow becomes:
+
+```text
+ExplainLoss
+  -> load entry history
+  -> determine disappearance interval
+  -> check probable move/rename
+  -> explain evidence
+```
+
+Later the user runs:
+
+```bash
+gib ai
+```
+
+Interactive mode opens the same active conversation and shows the previous messages.
+
+The user enters:
+
+> Restore the latest version.
+
+The same conversation context resolves the target, then the restore workflow creates a preview and performs the deterministic safety flow.
+
+This continuity is a fundamental requirement of the product.
 
 ---
 
-# 58. Final Architectural Summary
+# 59. Safety Invariants
 
-GIB AI should not be implemented as a single autonomous agent with broad tool access.
+These are non-negotiable.
 
-The intended architecture is:
+1. The LLM never executes shell commands.
+2. The LLM never directly mutates repository state.
+3. All filesystem facts come from evidence.
+4. All mutation arguments are validated by Rust.
+5. Restore commits use immutable precomputed plans.
+6. Overwrite policy is deterministic.
+7. Repeated actions are detected outside the model.
+8. Every loop has a budget.
+9. Ambiguity is preferable to an unsafe guess.
+10. The model cannot expand its own permissions.
+11. JSON mode never falls back to an interactive prompt.
+12. Conversation persistence never stores hidden model reasoning.
+13. Interactive and JSON modes must execute the same underlying AI workflow.
+
+---
+
+# 60. Quality Invariants
+
+1. A failed specific search should broaden or change a search dimension.
+2. The same failed search should never execute repeatedly.
+3. The user should not be asked for information GIB can reasonably investigate.
+4. Raw historical data should be summarized before model input.
+5. The model should not perform deterministic timestamp/revision arithmetic.
+6. Final answers expose uncertainty when evidence is incomplete.
+7. Difficult searches consider materially different strategies before exhaustion.
+8. A follow-up turn should reuse durable resolved context where safe.
+9. Process restarts must not lose the selected conversation.
+10. JSON output is stable, versioned, and machine-readable.
+
+---
+
+# 61. Future Content Understanding
+
+A future content subsystem may add:
 
 ```text
-Small local model
-        +
-specialized roles
-        +
+historical file
+  -> extractor
+  -> text/OCR/metadata/image description
+  -> local index
+  -> semantic search tools
+```
+
+Future tools may include:
+
+```text
+search_content
+search_ocr
+search_image_descriptions
+search_embeddings
+inspect_document_text
+```
+
+The existing Investigative Search architecture should treat this as another search dimension rather than requiring a redesign.
+
+---
+
+# 62. Final Architectural Summary
+
+GIB AI should not be a single unrestricted autonomous agent.
+
+The intended system is:
+
+```text
+local model
+    +
+model manager
+    +
+persistent conversation runtime
+    +
+modern interactive CLI / stable JSON adapter
+    +
+specialized model roles
+    +
 typed artifacts
-        +
+    +
 deterministic orchestration
-        +
+    +
 minimal tool exposure
-        +
+    +
 evidence grounding
-        +
+    +
 search escalation
-        +
+    +
 bounded hypothesis exploration
-        +
-validators
-        +
-critics at checkpoints
-        +
+    +
+validators and critics
+    +
 strict mutation safety
-        +
-verification
+    +
+restore verification
 ```
 
-The core strategy is simple:
+The core strategy is:
 
-> **Make each AI decision smaller, narrower, and more verifiable than the full user task.**
+> **Make every AI decision smaller, narrower, and more verifiable than the full user task.**
 
-The model should interpret ambiguity.
+The model interprets ambiguity.
 
-Rust should control truth.
+Rust controls truth and safety.
 
-GIB should control state.
+GIB controls filesystem state.
 
-The harness should control execution.
+The harness controls execution.
 
-This design allows a relatively small local model to provide a significantly more capable user experience without requiring the model itself to reliably perform long, unconstrained autonomous reasoning.
+The conversation layer preserves continuity across processes and across interactive/JSON usage.
 
-The long-term result is not merely "AI commands for GIB".
+The final user experience should be simple:
 
-It is a local historical file intelligence layer capable of answering:
+> Tell GIB what you remember.
 
-- what the user had;
-- where it was;
-- when it existed;
-- how it changed;
-- when it disappeared;
-- which historical version matters;
-- and how to safely bring it back.
+GIB reconstructs what happened, finds the relevant history, and safely helps the user get the right files back.
