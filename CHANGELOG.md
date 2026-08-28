@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.37](https://github.com/Theryston/gib/compare/v0.0.36...v0.0.37) - 2026-08-28
+
+### Added
+
+- remove redundant backup status lines in interactive logs
+- use progress bar for live autostart logs
+- add interactive renderer for live log display
+
 ## [0.0.36](https://github.com/Theryston/gib/compare/v0.0.35...v0.0.36) - 2026-08-27
 
 ### Added
