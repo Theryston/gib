@@ -18,6 +18,8 @@ pub(crate) use installer::{
     ModelInstallStatus, ModelManager, ProgressCallback, output_progress_sink,
 };
 #[allow(unused_imports)]
+pub(crate) use lock::ModelInstallCancellation;
+#[allow(unused_imports)]
 pub(crate) use paths::ModelPaths;
 #[allow(unused_imports)]
 pub(crate) use registry::{

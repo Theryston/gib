@@ -820,6 +820,7 @@ fn generate_tokens(
         .unwrap_or(0);
     let mut pending_text = String::new();
     let mut final_text = String::new();
+    let mut reasoning_filter = HiddenReasoningFilter::default();
     let mut decoder = UTF_8.new_decoder();
     let mut completion_tokens = 0_u32;
     let mut next_position = prompt_tokens.len();
@@ -862,7 +863,7 @@ fn generate_tokens(
                 };
             }
         };
-        pending_text.push_str(&piece);
+        pending_text.push_str(&reasoning_filter.push(&piece));
 
         if let Some(stop_length) = matching_stop_length(&pending_text, &request.stop_sequences) {
             let text_without_stop = pending_text.len() - stop_length;
@@ -954,6 +955,7 @@ fn generate_tokens(
         next_position = next_position.saturating_add(1);
     }
 
+    pending_text.push_str(&reasoning_filter.finish());
     if !flush_all_text(
         &mut pending_text,
         events,
@@ -1023,6 +1025,106 @@ fn matching_stop_length(text: &str, stop_sequences: &[String]) -> Option<usize> 
         .filter(|stop| text.ends_with(stop.as_str()))
         .map(String::len)
         .max()
+}
+
+const HIDDEN_REASONING_OPEN_MARKERS: &[&str] = &[
+    "<think>",
+    "<|think|>",
+    "<|start_think|>",
+    "<|assistant_think|>",
+    "<thought>",
+    "<|thought|>",
+];
+const HIDDEN_REASONING_CLOSE_MARKERS: &[&str] = &[
+    "</think>",
+    "<|/think|>",
+    "<|end_think|>",
+    "</thought>",
+    "<|/thought|>",
+];
+
+/// Removes provider-specific hidden reasoning blocks before they reach the
+/// stream or the persisted conversation. The filter is incremental because a
+/// llama token can split a marker across multiple generated pieces.
+#[derive(Default)]
+struct HiddenReasoningFilter {
+    inside_reasoning: bool,
+    pending: String,
+}
+
+impl HiddenReasoningFilter {
+    fn push(&mut self, text: &str) -> String {
+        self.pending.push_str(text);
+        let mut visible = String::new();
+
+        loop {
+            if self.inside_reasoning {
+                if let Some((index, length)) =
+                    find_marker(&self.pending, HIDDEN_REASONING_CLOSE_MARKERS)
+                {
+                    self.pending.drain(..index + length);
+                    self.inside_reasoning = false;
+                    continue;
+                }
+                let keep = max_marker_length(HIDDEN_REASONING_CLOSE_MARKERS).saturating_sub(1);
+                let keep_from = suffix_start(&self.pending, keep);
+                self.pending = self.pending[keep_from..].to_string();
+                break;
+            }
+
+            if let Some((index, length)) = find_marker(&self.pending, HIDDEN_REASONING_OPEN_MARKERS)
+            {
+                visible.push_str(&self.pending[..index]);
+                self.pending.drain(..index + length);
+                self.inside_reasoning = true;
+                continue;
+            }
+
+            let keep = max_marker_length(HIDDEN_REASONING_OPEN_MARKERS).saturating_sub(1);
+            let emit_length = self.pending.len().saturating_sub(keep);
+            let emit_length = char_boundary_at_or_before(&self.pending, emit_length);
+            visible.push_str(&self.pending[..emit_length]);
+            self.pending.drain(..emit_length);
+            break;
+        }
+
+        visible
+    }
+
+    fn finish(&mut self) -> String {
+        if self.inside_reasoning {
+            self.pending.clear();
+            return String::new();
+        }
+        std::mem::take(&mut self.pending)
+    }
+}
+
+fn find_marker(text: &str, markers: &[&str]) -> Option<(usize, usize)> {
+    markers
+        .iter()
+        .filter_map(|marker| text.find(marker).map(|index| (index, marker.len())))
+        .min_by_key(|(index, _)| *index)
+}
+
+fn max_marker_length(markers: &[&str]) -> usize {
+    markers.iter().map(|marker| marker.len()).max().unwrap_or(1)
+}
+
+fn suffix_start(text: &str, max_bytes: usize) -> usize {
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    start
+}
+
+fn char_boundary_at_or_before(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 fn flush_safe_text(
@@ -1157,6 +1259,29 @@ mod tests {
         let stops = vec!["<|eot|>".to_string(), "<|eot_id|>".to_string()];
         assert_eq!(matching_stop_length("hello<|eot_id|>", &stops), Some(10));
         assert_eq!(matching_stop_length("hello", &stops), None);
+    }
+
+    #[test]
+    fn hidden_reasoning_is_filtered_across_token_boundaries() {
+        let mut filter = HiddenReasoningFilter::default();
+        let mut visible = String::new();
+        for piece in ["Visible ", "<thi", "nk>private", "</thi", "nk>answer"] {
+            visible.push_str(&filter.push(piece));
+        }
+        visible.push_str(&filter.finish());
+
+        assert_eq!(visible, "Visible answer");
+        assert!(!visible.contains("private"));
+    }
+
+    #[test]
+    fn unclosed_hidden_reasoning_is_not_exposed_at_end_of_generation() {
+        let mut filter = HiddenReasoningFilter::default();
+        let mut visible = filter.push("answer<think>secret");
+        visible.push_str(&filter.finish());
+
+        assert_eq!(visible, "answer");
+        assert!(!visible.contains("secret"));
     }
 
     #[test]

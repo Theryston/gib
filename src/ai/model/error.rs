@@ -40,6 +40,7 @@ pub(crate) enum ModelError {
         current: u64,
         expected: u64,
     },
+    DownloadCancelled,
     DownloadInterrupted(String),
     SizeMismatch {
         expected: u64,
@@ -142,6 +143,10 @@ impl fmt::Display for ModelError {
                 formatter,
                 "The partial AI model download is {} bytes but the manifest expects {} bytes",
                 current, expected
+            ),
+            Self::DownloadCancelled => write!(
+                formatter,
+                "AI model download was cancelled; the partial download was preserved"
             ),
             Self::DownloadInterrupted(message) => {
                 write!(formatter, "AI model download was interrupted: {}", message)

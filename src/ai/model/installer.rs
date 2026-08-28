@@ -1,6 +1,6 @@
 use super::config::AiConfigStore;
 use super::error::ModelError;
-use super::lock::FileLock;
+use super::lock::{FileLock, ModelInstallCancellation};
 use super::paths::ModelPaths;
 use super::registry::{MODEL_MANIFEST_SCHEMA_VERSION, ModelManifest, ModelRegistry};
 use super::storage::{hash_file, now_unix_seconds, quarantine, write_atomic};
@@ -43,6 +43,7 @@ pub(crate) enum ModelInstallStatus {
     Installed,
     Resumed,
     Downloaded,
+    Cancelled,
     Failed,
 }
 
@@ -299,10 +300,33 @@ impl ModelManager {
         &self,
         progress: Option<ProgressCallback>,
     ) -> Result<InstalledModel, ModelError> {
+        self.ensure_active_model_with_cancellation(progress, None)
+            .await
+    }
+
+    pub(crate) async fn ensure_active_model_with_cancellation(
+        &self,
+        progress: Option<ProgressCallback>,
+        cancellation: Option<ModelInstallCancellation>,
+    ) -> Result<InstalledModel, ModelError> {
+        if cancellation
+            .as_ref()
+            .is_some_and(ModelInstallCancellation::is_cancelled)
+        {
+            return Err(ModelError::DownloadCancelled);
+        }
         let model_id = self
             .active_model_id()?
             .unwrap_or_else(|| super::registry::DEFAULT_MODEL_ID.to_string());
-        let installed = self.ensure_installed(&model_id, progress).await?;
+        let installed = self
+            .ensure_installed_with_cancellation(&model_id, progress, cancellation.clone())
+            .await?;
+        if cancellation
+            .as_ref()
+            .is_some_and(ModelInstallCancellation::is_cancelled)
+        {
+            return Err(ModelError::DownloadCancelled);
+        }
         if self.active_model_id()?.is_none() {
             AiConfigStore::new(self.paths.clone())
                 .set_active_model(&model_id)
@@ -316,8 +340,19 @@ impl ModelManager {
         model_id: &str,
         progress: Option<ProgressCallback>,
     ) -> Result<InstalledModel, ModelError> {
+        self.ensure_installed_with_cancellation(model_id, progress, None)
+            .await
+    }
+
+    pub(crate) async fn ensure_installed_with_cancellation(
+        &self,
+        model_id: &str,
+        progress: Option<ProgressCallback>,
+        cancellation: Option<ModelInstallCancellation>,
+    ) -> Result<InstalledModel, ModelError> {
         let manifest = self.registry.get(model_id)?.clone();
-        self.install_manifest(&manifest, progress).await
+        self.install_manifest(&manifest, progress, cancellation)
+            .await
     }
 
     pub(crate) async fn install(
@@ -332,11 +367,29 @@ impl ModelManager {
         &self,
         manifest: &ModelManifest,
         progress: Option<ProgressCallback>,
+        cancellation: Option<ModelInstallCancellation>,
     ) -> Result<InstalledModel, ModelError> {
+        if cancellation
+            .as_ref()
+            .is_some_and(ModelInstallCancellation::is_cancelled)
+        {
+            return Err(ModelError::DownloadCancelled);
+        }
         manifest.validate()?;
         let (expected_size, expected_sha256) = manifest.require_integrity()?;
         let lock_path = self.paths.model_lock_path(&manifest.id)?;
-        let lock = FileLock::acquire(&lock_path, self.lock_timeout).await?;
+        let lock = FileLock::acquire_with_cancellation(
+            &lock_path,
+            self.lock_timeout,
+            cancellation.as_ref(),
+        )
+        .await?;
+        if cancellation
+            .as_ref()
+            .is_some_and(ModelInstallCancellation::is_cancelled)
+        {
+            return Err(ModelError::DownloadCancelled);
+        }
 
         let artifact_path = self.paths.artifact_path(manifest)?;
         let metadata_path = self.paths.metadata_path(manifest)?;
@@ -480,11 +533,35 @@ impl ModelManager {
             ),
         );
 
-        let mut response = match self
-            .transport
-            .get(&manifest.download_url, (received > 0).then_some(received))
-            .await
-        {
+        let response_result = if let Some(cancellation) = cancellation.as_ref() {
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    let message =
+                        "The model download was cancelled; the partial download was preserved";
+                    emit_event(
+                        &progress,
+                        ModelInstallEvent::new(
+                            manifest,
+                            ModelInstallPhase::Failed,
+                            received,
+                            Some(expected_size),
+                            received > 0,
+                            message,
+                            Some(ModelInstallStatus::Cancelled),
+                        ),
+                    );
+                    return Err(ModelError::DownloadCancelled);
+                }
+                response = self
+                    .transport
+                    .get(&manifest.download_url, (received > 0).then_some(received)) => response,
+            }
+        } else {
+            self.transport
+                .get(&manifest.download_url, (received > 0).then_some(received))
+                .await
+        };
+        let mut response = match response_result {
             Ok(response) => response,
             Err(error) => {
                 emit_event(
@@ -530,7 +607,40 @@ impl ModelManager {
         let mut file = open_partial(&partial_path, append)?;
         protect_file(&partial_path)?;
 
-        while let Some(chunk) = response.body.next().await {
+        loop {
+            let next_chunk = if let Some(cancellation) = cancellation.as_ref() {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        file.flush().map_err(|error| {
+                            ModelError::io("flush partial model", &partial_path, error)
+                        })?;
+                        file.sync_all().map_err(|error| {
+                            ModelError::io("sync partial model", &partial_path, error)
+                        })?;
+                        let message =
+                            "The model download was cancelled; the partial download was preserved";
+                        emit_event(
+                            &progress,
+                            ModelInstallEvent::new(
+                                manifest,
+                                ModelInstallPhase::Failed,
+                                received,
+                                Some(expected_size),
+                                true,
+                                message,
+                                Some(ModelInstallStatus::Cancelled),
+                            ),
+                        );
+                        return Err(ModelError::DownloadCancelled);
+                    }
+                    chunk = response.body.next() => chunk,
+                }
+            } else {
+                response.body.next().await
+            };
+            let Some(chunk) = next_chunk else {
+                break;
+            };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(message) => {
@@ -1216,6 +1326,7 @@ mod tests {
     use futures::stream;
     use sha2::Digest;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
     struct FakeResponse {
         status: StatusCode,
@@ -1227,6 +1338,11 @@ mod tests {
     struct FakeTransport {
         responses: Mutex<Vec<FakeResponse>>,
         requests: Arc<Mutex<Vec<Option<u64>>>>,
+    }
+
+    struct SlowTransport {
+        body: Arc<Vec<u8>>,
+        first_chunk_sent: Arc<Notify>,
     }
 
     impl FakeTransport {
@@ -1268,6 +1384,43 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl DownloadTransport for SlowTransport {
+        async fn get(
+            &self,
+            _url: &str,
+            _range_start: Option<u64>,
+        ) -> Result<DownloadResponse, ModelError> {
+            let body = Arc::clone(&self.body);
+            let first_chunk_sent = Arc::clone(&self.first_chunk_sent);
+            let body_length = body.len() as u64;
+            let stream = stream::unfold(0_u8, move |state| {
+                let body = Arc::clone(&body);
+                let first_chunk_sent = Arc::clone(&first_chunk_sent);
+                async move {
+                    match state {
+                        0 => {
+                            let split = body.len() / 2;
+                            first_chunk_sent.notify_one();
+                            Some((Ok(Bytes::copy_from_slice(&body[..split])), 1))
+                        }
+                        1 => {
+                            std::future::pending::<()>().await;
+                            None
+                        }
+                        _ => None,
+                    }
+                }
+            });
+            Ok(DownloadResponse {
+                status: StatusCode::OK,
+                content_range: None,
+                content_length: Some(body_length),
+                body: Box::pin(stream),
+            })
+        }
+    }
+
     fn full_response(body: &[u8]) -> FakeResponse {
         FakeResponse {
             status: StatusCode::OK,
@@ -1294,16 +1447,12 @@ mod tests {
     fn model_manager_with_transport(
         manifest: ModelManifest,
         root: PathBuf,
-        transport: Arc<FakeTransport>,
+        transport: Arc<dyn DownloadTransport>,
     ) -> ModelManager {
         let registry =
             ModelRegistry::from_models([manifest]).expect("test manifest should validate");
-        ModelManager::with_transport(
-            registry,
-            ModelPaths::from_root(root),
-            transport as Arc<dyn DownloadTransport>,
-        )
-        .expect("test model manager should be created")
+        ModelManager::with_transport(registry, ModelPaths::from_root(root), transport)
+            .expect("test model manager should be created")
     }
 
     fn temporary_root(label: &str) -> PathBuf {
@@ -1670,6 +1819,60 @@ mod tests {
             .verify_installed(&manifest.id)
             .expect("the resumed model should verify");
         assert_eq!(std::fs::read(installed.artifact_path).unwrap(), body);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_partial_download_and_releases_the_lock() {
+        let body = b"cancellable model download".to_vec();
+        let root = temporary_root("cancelled");
+        let manifest = manifest("https://example.com/model.gguf".to_string(), &body);
+        let first_chunk_sent = Arc::new(Notify::new());
+        let manager = model_manager_with_transport(
+            manifest.clone(),
+            root.clone(),
+            Arc::new(SlowTransport {
+                body: Arc::new(body.clone()),
+                first_chunk_sent: Arc::clone(&first_chunk_sent),
+            }) as Arc<dyn DownloadTransport>,
+        );
+        let cancellation = ModelInstallCancellation::new();
+        let first_chunk_waiter = first_chunk_sent.notified();
+        let install = tokio::spawn({
+            let manager = manager.clone();
+            let cancellation = cancellation.clone();
+            let task_manifest = manifest.clone();
+            async move {
+                manager
+                    .ensure_installed_with_cancellation(&task_manifest.id, None, Some(cancellation))
+                    .await
+            }
+        });
+        first_chunk_waiter.await;
+        cancellation.cancel();
+
+        let error = install
+            .await
+            .expect("installation task should finish")
+            .expect_err("cancelled installation should fail with a resumable error");
+        assert!(matches!(error, ModelError::DownloadCancelled));
+        let partial_path = manager.paths().partial_path(&manifest).unwrap();
+        assert!(std::fs::metadata(&partial_path).unwrap().len() > 0);
+        assert!(
+            manager
+                .paths()
+                .partial_state_path(&manifest)
+                .unwrap()
+                .is_file()
+        );
+        assert!(
+            !manager
+                .paths()
+                .model_lock_path(&manifest.id)
+                .unwrap()
+                .exists()
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }

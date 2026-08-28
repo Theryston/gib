@@ -71,13 +71,23 @@ never asks for another line, a password, or a confirmation.
 
 ## Persistence and retries
 
-The user message is committed before generation. The assistant message is
-committed only after the runtime sends its successful terminal event. Every
-turn carries an opaque `turn_id` in persisted message metadata; it is not sent
-to the model and makes a retry fail with `turn_already_recorded` instead of
-duplicating the user or assistant messages. A revision conflict is retried
-once before generation. Once output has started, the service never reloads and
-merges another process's revision.
+The user message is committed with `status = "pending"` before generation.
+After a successful terminal runtime event, one atomic conversation mutation
+marks that user message complete and appends the complete assistant message.
+Cancellation and failure use the same atomic mutation to mark the user message
+complete and append one bounded assistant message with
+`status = "interrupted"`.
+
+If a process dies after the pending user message is written, a later
+invocation with the same message resumes that persisted turn and does not
+append a second user message. A different message is rejected while that turn
+is pending, so the conversation cannot silently reorder work. An explicitly
+reused opaque `turn_id` is also rejected after a terminal turn with
+`turn_already_recorded`. The ID is operational metadata, is not sent to the
+model, and prevents duplicate persistence for request retries.
+
+A revision conflict is retried once before generation. Once output has
+started, the service never reloads and merges another process's revision.
 
 The direct-chat prompt contains a fixed local-assistant system instruction and
 all persisted user-visible messages mapped through the shared `AiMessage`

@@ -225,6 +225,11 @@ impl ConversationMessage {
         if let Some(turn_id) = &self.turn_id {
             validate_conversation_id_with_limit(turn_id, limits.max_id_bytes)?;
         }
+        if self.status == ConversationMessageStatus::Pending
+            && self.role != ConversationMessageRole::User
+        {
+            return Err(ConversationError::InvalidMessage);
+        }
         Ok(())
     }
 }
@@ -241,6 +246,10 @@ pub(crate) enum ConversationMessageRole {
 pub(crate) enum ConversationMessageStatus {
     Complete,
     Interrupted,
+    /// A user message whose generation has not reached a durable terminal
+    /// state yet. It allows the next process invocation to resume the same
+    /// turn instead of appending the user's message a second time.
+    Pending,
 }
 
 /// Explicit context that may survive turns. It has no field for raw tools,

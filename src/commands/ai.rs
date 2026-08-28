@@ -1,5 +1,5 @@
 use crate::ai::conversation::{ConversationError, ConversationService};
-use crate::ai::model::{ModelError, ModelManager, output_progress_sink};
+use crate::ai::model::{ModelError, ModelInstallCancellation, ModelManager, output_progress_sink};
 use crate::ai::runtime::{AiBackend, AiBackendError, AiBackendFactory};
 use crate::ai::{
     AiCancellation, AiPromptPolicy, AiTurnError, AiTurnEvent, AiTurnEventSink, AiTurnRequest,
@@ -42,6 +42,9 @@ impl AiCommandError {
     fn json_message(&self) -> String {
         match self {
             Self::Input(message) => message.clone(),
+            Self::Model(ModelError::DownloadCancelled) => {
+                "AI model download was cancelled; the partial download was preserved".to_string()
+            }
             Self::Model(_) => "AI model installation or verification failed".to_string(),
             Self::Backend(error) => error.to_string(),
             Self::Conversation(error) => error.to_string(),
@@ -100,7 +103,17 @@ pub async fn ai(matches: &ArgMatches) {
         ));
     }
 
-    let (service, backend, model_id) = match build_turn_service().await {
+    let install_cancellation = ModelInstallCancellation::new();
+    let signal_cancellation = install_cancellation.clone();
+    let install_signal_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_cancellation.cancel();
+        }
+    });
+    let build_result = build_turn_service(install_cancellation).await;
+    install_signal_task.abort();
+
+    let (service, backend, model_id) = match build_result {
         Ok(value) => value,
         Err(error) => report_failure(error),
     };
@@ -133,16 +146,27 @@ fn parse_request(matches: &ArgMatches) -> Result<AiCommandRequest, String> {
     })
 }
 
-async fn build_turn_service() -> Result<(AiTurnService, Arc<dyn AiBackend>, String), AiCommandError>
-{
+async fn build_turn_service(
+    cancellation: ModelInstallCancellation,
+) -> Result<(AiTurnService, Arc<dyn AiBackend>, String), AiCommandError> {
     let conversations = ConversationService::default_store()?;
     let model_manager = ModelManager::default()?;
     let installed = model_manager
-        .ensure_active_model(Some(output_progress_sink()))
+        .ensure_active_model_with_cancellation(
+            Some(output_progress_sink()),
+            Some(cancellation.clone()),
+        )
         .await?;
+    if cancellation.is_cancelled() {
+        return Err(ModelError::DownloadCancelled.into());
+    }
     let model_id = installed.manifest.id.clone();
     let backend = AiBackendFactory::new(model_manager).build()?;
     backend.load_model(&model_id).await?;
+    if cancellation.is_cancelled() {
+        let _ = backend.unload_model(Some(&model_id)).await;
+        return Err(ModelError::DownloadCancelled.into());
+    }
     let service = AiTurnService::new(
         conversations,
         backend.clone(),
@@ -159,14 +183,20 @@ async fn run_single_turn(
     json_mode: bool,
 ) -> Result<(), AiCommandError> {
     let cancellation = AiCancellation::new();
+    let signal_cancellation = cancellation.clone();
+    let signal_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_cancellation.cancel();
+        }
+    });
     let sink = if json_mode {
         Some(json_event_sink())
     } else {
         Some(interactive_event_sink())
     };
-    run_turn_with_sink(service, conversation_id, message, cancellation, sink)
-        .await
-        .map(|_| ())
+    let result = run_turn_with_sink(service, conversation_id, message, cancellation, sink).await;
+    signal_task.abort();
+    result.map(|_| ())
 }
 
 async fn run_turn_with_sink(
@@ -305,6 +335,7 @@ fn model_error_code(error: &ModelError) -> &'static str {
         | ModelError::InvalidContentRange { .. }
         | ModelError::RangeNotSatisfiable { .. }
         | ModelError::DownloadInterrupted(_) => "model_download_error",
+        ModelError::DownloadCancelled => "model_download_cancelled",
         ModelError::SizeMismatch { .. } => "model_size_mismatch",
         ModelError::ChecksumMismatch { .. } => "model_checksum_mismatch",
         ModelError::NotInstalled(_) => "model_not_installed",

@@ -2,11 +2,48 @@ use super::error::ModelError;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::Notify;
 
 const STALE_LOCK_AFTER: Duration = Duration::from_secs(15 * 60);
 static LOCK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Cooperative cancellation used while waiting for or holding the model
+/// installation lock. The command owns the signal handler; the model layer
+/// only observes this state and preserves resumable download data.
+#[derive(Clone, Default)]
+pub(crate) struct ModelInstallCancellation {
+    cancelled: Arc<AtomicBool>,
+    notification: Arc<Notify>,
+}
+
+impl ModelInstallCancellation {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notification.notify_one();
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.notification.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
 
 pub(crate) struct FileLock {
     path: PathBuf,
@@ -15,6 +52,14 @@ pub(crate) struct FileLock {
 
 impl FileLock {
     pub(crate) async fn acquire(path: &Path, timeout: Duration) -> Result<Self, ModelError> {
+        Self::acquire_with_cancellation(path, timeout, None).await
+    }
+
+    pub(crate) async fn acquire_with_cancellation(
+        path: &Path,
+        timeout: Duration,
+        cancellation: Option<&ModelInstallCancellation>,
+    ) -> Result<Self, ModelError> {
         let parent = path
             .parent()
             .ok_or_else(|| ModelError::UnsafePath(path.to_path_buf()))?;
@@ -33,6 +78,9 @@ impl FileLock {
         let started = Instant::now();
 
         loop {
+            if cancellation.is_some_and(ModelInstallCancellation::is_cancelled) {
+                return Err(ModelError::DownloadCancelled);
+            }
             match OpenOptions::new().write(true).create_new(true).open(path) {
                 Ok(mut file) => {
                     if let Err(error) = protect_lock(&file, path) {
@@ -60,7 +108,16 @@ impl FileLock {
                     if started.elapsed() >= timeout {
                         return Err(ModelError::LockTimeout(path.to_path_buf()));
                     }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    if let Some(cancellation) = cancellation {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                            _ = cancellation.cancelled() => {
+                                return Err(ModelError::DownloadCancelled);
+                            }
+                        }
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
                 }
                 Err(error) => return Err(ModelError::io("create lock", path, error)),
             }
@@ -103,11 +160,35 @@ impl Drop for FileLock {
 }
 
 fn is_stale(path: &Path) -> bool {
-    std::fs::metadata(path)
+    let lease_expired = std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age > STALE_LOCK_AFTER)
+        .is_some_and(|age| age > STALE_LOCK_AFTER);
+    lease_expired || owner_process_is_gone(path)
+}
+
+#[cfg(target_os = "linux")]
+fn owner_process_is_gone(path: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Some(pid) = contents
+        .split('-')
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    if pid == std::process::id() {
+        return false;
+    }
+    !Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn owner_process_is_gone(_path: &Path) -> bool {
+    false
 }
 
 fn protect_lock(file: &File, path: &Path) -> Result<(), ModelError> {

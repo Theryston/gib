@@ -33,9 +33,11 @@ Each JSON document contains:
 - a monotonically increasing revision;
 - optional model and prompt identity metadata;
 - user-visible messages with stable IDs, user or assistant roles, UTC
-  timestamps, text content, and completion status. Messages may also carry an
-  opaque turn ID for retry idempotency; this ID is operational metadata and is
-  never included in a model prompt;
+  timestamps, text content, and completion status. Status can be `complete`,
+  `interrupted`, or `pending`; pending is reserved for a user message whose
+  generation was interrupted before a terminal result was durably recorded.
+  Messages may also carry an opaque turn ID for retry idempotency; this ID is
+  operational metadata and is never included in a model prompt;
 - bounded durable_context containing only an explicit summary, user
   preferences, artifact references, evidence references, and facts;
 - an archived flag reserved for lifecycle metadata.
@@ -52,6 +54,10 @@ Append, rename, and context replacement require the caller's expected
 revision. The store acquires a per-conversation lock, reloads the document
 inside that lock, compares the on-disk revision, and returns a structured
 revision conflict instead of silently merging concurrent assistant responses.
+Turn finalization marks the pending user message and appends the assistant
+message inside the same locked mutation. A later invocation can therefore
+resume a pending turn left by a crashed process without duplicating its user
+message.
 
 The store uses a separate configuration lock for config.toml. File
 replacements are written to a same-directory temporary file, flushed with

@@ -65,6 +65,8 @@ pub(crate) enum AiTurnError {
     StreamClosed,
     StreamProtocol,
     TurnAlreadyRecorded { turn_id: String },
+    PendingTurn { turn_id: String },
+    EmptyResponse,
 }
 
 impl AiTurnError {
@@ -77,6 +79,8 @@ impl AiTurnError {
             Self::StreamClosed => "stream_closed",
             Self::StreamProtocol => "stream_protocol_error",
             Self::TurnAlreadyRecorded { .. } => "turn_already_recorded",
+            Self::PendingTurn { .. } => "pending_turn",
+            Self::EmptyResponse => "empty_response",
         }
     }
 
@@ -100,6 +104,13 @@ impl fmt::Display for AiTurnError {
             }
             Self::TurnAlreadyRecorded { turn_id } => {
                 write!(formatter, "AI turn '{turn_id}' has already been recorded")
+            }
+            Self::PendingTurn { turn_id } => write!(
+                formatter,
+                "AI turn '{turn_id}' is still pending; retry the same message to resume it"
+            ),
+            Self::EmptyResponse => {
+                formatter.write_str("the local model returned no visible assistant response")
             }
         }
     }
@@ -292,21 +303,49 @@ impl AiTurnService {
         cancellation: AiCancellation,
         sink: Option<AiTurnEventSink>,
     ) -> Result<AiTurnResponse, AiTurnError> {
+        let mut request = request;
         let conversation = self
             .resolve_conversation(request.conversation_id.clone())
             .await?;
-        if conversation
+        let pending = conversation
             .messages
             .iter()
-            .any(|message| message.turn_id.as_deref() == Some(request.turn_id.as_str()))
-        {
-            return Err(AiTurnError::TurnAlreadyRecorded {
-                turn_id: request.turn_id,
+            .rev()
+            .find(|message| {
+                message.role == ConversationMessageRole::User
+                    && message.status == ConversationMessageStatus::Pending
+            })
+            .map(|message| {
+                (
+                    message.message_id.clone(),
+                    message.content.clone(),
+                    message.turn_id.clone(),
+                )
             });
-        }
-
-        let (conversation, user_message_id) =
-            self.append_user_with_retry(conversation, &request).await?;
+        let (conversation, user_message_id) = if let Some((message_id, content, turn_id)) = pending
+        {
+            if content != request.message {
+                return Err(AiTurnError::PendingTurn {
+                    turn_id: turn_id.unwrap_or_else(|| "unknown".to_string()),
+                });
+            }
+            let Some(turn_id) = turn_id else {
+                return Err(AiTurnError::StreamProtocol);
+            };
+            request.turn_id = turn_id;
+            (conversation, message_id)
+        } else {
+            if conversation
+                .messages
+                .iter()
+                .any(|message| message.turn_id.as_deref() == Some(request.turn_id.as_str()))
+            {
+                return Err(AiTurnError::TurnAlreadyRecorded {
+                    turn_id: request.turn_id,
+                });
+            }
+            self.append_user_with_retry(conversation, &request).await?
+        };
         emit_event(
             sink.as_ref(),
             AiTurnEvent::Started {
@@ -433,16 +472,29 @@ impl AiTurnService {
                         )
                         .await;
                 }
+                if result.text.trim().is_empty() {
+                    return self
+                        .finish_interrupted(
+                            &conversation,
+                            &request,
+                            &user_message_id,
+                            result.text,
+                            usage,
+                            AiTurnError::EmptyResponse,
+                            sink.as_ref(),
+                        )
+                        .await;
+                }
                 usage = result.usage;
                 let updated = match self
                     .conversations
-                    .append_message_with_status_and_turn_id(
+                    .finish_turn(
                         conversation.conversation_id.clone(),
                         conversation.revision,
-                        ConversationMessageRole::Assistant,
+                        user_message_id.clone(),
+                        request.turn_id.clone(),
                         result.text.clone(),
                         ConversationMessageStatus::Complete,
-                        Some(request.turn_id.clone()),
                     )
                     .await
                 {
@@ -555,7 +607,7 @@ impl AiTurnService {
                     conversation.revision,
                     ConversationMessageRole::User,
                     request.message.clone(),
-                    ConversationMessageStatus::Complete,
+                    ConversationMessageStatus::Pending,
                     Some(request.turn_id.clone()),
                 )
                 .await
@@ -578,6 +630,17 @@ impl AiTurnService {
                         .conversations
                         .load(conversation.conversation_id.clone())
                         .await?;
+                    if let Some(pending) = conversation.messages.iter().rev().find(|message| {
+                        message.role == ConversationMessageRole::User
+                            && message.status == ConversationMessageStatus::Pending
+                    }) {
+                        return Err(AiTurnError::PendingTurn {
+                            turn_id: pending
+                                .turn_id
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string()),
+                        });
+                    }
                     if conversation
                         .messages
                         .iter()
@@ -598,7 +661,7 @@ impl AiTurnService {
         &self,
         conversation: &Conversation,
         request: &AiTurnRequest,
-        _user_message_id: &str,
+        user_message_id: &str,
         partial_text: String,
         usage: AiUsage,
         error: AiTurnError,
@@ -607,13 +670,13 @@ impl AiTurnService {
         let content = interrupted_content(&partial_text, &error);
         if let Err(persist_error) = self
             .conversations
-            .append_message_with_status_and_turn_id(
+            .finish_turn(
                 conversation.conversation_id.clone(),
                 conversation.revision,
-                ConversationMessageRole::Assistant,
+                user_message_id.to_string(),
+                request.turn_id.clone(),
                 content,
                 ConversationMessageStatus::Interrupted,
-                Some(request.turn_id.clone()),
             )
             .await
         {
@@ -890,6 +953,10 @@ mod tests {
             .expect("conversation should be active");
         assert_eq!(conversation.messages.len(), 2);
         assert_eq!(
+            conversation.messages[0].status,
+            ConversationMessageStatus::Complete
+        );
+        assert_eq!(
             conversation.messages[1].status,
             ConversationMessageStatus::Interrupted
         );
@@ -957,6 +1024,55 @@ mod tests {
             .expect("conversation should load")
             .expect("conversation should be active");
         assert_eq!(conversation.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_after_an_interrupted_process_reuses_the_pending_user_message() {
+        let (service, conversations, _backend) = make_service("pending-recovery").await;
+        let conversation = conversations
+            .create(Some("Recovery".to_string()))
+            .await
+            .expect("conversation should be created");
+        let pending = conversations
+            .append_message_with_status_and_turn_id(
+                conversation.conversation_id.clone(),
+                conversation.revision,
+                ConversationMessageRole::User,
+                "hello".to_string(),
+                ConversationMessageStatus::Pending,
+                Some("turn-crashed".to_string()),
+            )
+            .await
+            .expect("pending user message should be persisted");
+
+        let response = service
+            .run_turn(
+                AiTurnRequest::with_turn_id(
+                    Some(pending.conversation_id.clone()),
+                    "hello",
+                    "new-process-request",
+                )
+                .expect("retry request should be valid"),
+                AiCancellation::new(),
+                None,
+            )
+            .await
+            .expect("the pending turn should resume");
+
+        assert_eq!(response.turn_id, "turn-crashed");
+        let recovered = conversations
+            .load(pending.conversation_id)
+            .await
+            .expect("recovered conversation should load");
+        assert_eq!(recovered.messages.len(), 2);
+        assert_eq!(
+            recovered.messages[0].status,
+            ConversationMessageStatus::Complete
+        );
+        assert_eq!(
+            recovered.messages[1].status,
+            ConversationMessageStatus::Complete
+        );
     }
 
     #[test]

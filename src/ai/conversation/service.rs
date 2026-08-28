@@ -92,6 +92,53 @@ impl ConversationService {
         .await
     }
 
+    /// Atomically finalize a pending user turn and append its assistant
+    /// result. Keeping both mutations under one conversation lock prevents a
+    /// successful response from being persisted without its user message
+    /// being finalized, or vice versa.
+    pub(crate) async fn finish_turn(
+        &self,
+        conversation_id: String,
+        expected_revision: u64,
+        user_message_id: String,
+        turn_id: String,
+        content: String,
+        status: ConversationMessageStatus,
+    ) -> Result<Conversation, ConversationError> {
+        let message_id = generate_id("msg")?;
+        let timestamp = current_timestamp();
+        let store = self.store.clone();
+        run_blocking(move || {
+            store.mutate_blocking(&conversation_id, expected_revision, |conversation| {
+                let Some(user_message) = conversation.messages.iter_mut().find(|message| {
+                    message.message_id == user_message_id
+                        && message.role == ConversationMessageRole::User
+                        && message.turn_id.as_deref() == Some(turn_id.as_str())
+                }) else {
+                    return Err(ConversationError::InvalidMessage);
+                };
+                if user_message.status == ConversationMessageStatus::Pending {
+                    user_message.status = ConversationMessageStatus::Complete;
+                }
+                if user_message.status != ConversationMessageStatus::Complete {
+                    return Err(ConversationError::InvalidMessage);
+                }
+                conversation
+                    .messages
+                    .push(ConversationMessage::with_status_and_turn_id(
+                        message_id,
+                        ConversationMessageRole::Assistant,
+                        timestamp,
+                        content,
+                        status,
+                        Some(turn_id),
+                    ));
+                Ok(())
+            })
+        })
+        .await
+    }
+
     pub(crate) async fn rename(
         &self,
         conversation_id: String,
