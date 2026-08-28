@@ -1,7 +1,7 @@
 use super::error::ConversationError;
 use super::model::{
-    Conversation, ConversationList, ConversationMessage, ConversationMessageRole, DurableContext,
-    current_timestamp,
+    Conversation, ConversationList, ConversationMessage, ConversationMessageRole,
+    ConversationMessageStatus, DurableContext, current_timestamp,
 };
 use super::store::ConversationStore;
 use crate::ai::model::{AiConfigStore, ModelError, ModelPaths};
@@ -56,14 +56,36 @@ impl ConversationService {
         role: ConversationMessageRole,
         content: String,
     ) -> Result<Conversation, ConversationError> {
+        self.append_message_with_status_and_turn_id(
+            conversation_id,
+            expected_revision,
+            role,
+            content,
+            ConversationMessageStatus::Complete,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn append_message_with_status_and_turn_id(
+        &self,
+        conversation_id: String,
+        expected_revision: u64,
+        role: ConversationMessageRole,
+        content: String,
+        status: ConversationMessageStatus,
+        turn_id: Option<String>,
+    ) -> Result<Conversation, ConversationError> {
         let message_id = generate_id("msg")?;
         let timestamp = current_timestamp();
         let store = self.store.clone();
         run_blocking(move || {
             store.mutate_blocking(&conversation_id, expected_revision, |conversation| {
-                conversation.messages.push(ConversationMessage::new(
-                    message_id, role, timestamp, content,
-                ));
+                conversation
+                    .messages
+                    .push(ConversationMessage::with_status_and_turn_id(
+                        message_id, role, timestamp, content, status, turn_id,
+                    ));
                 Ok(())
             })
         })

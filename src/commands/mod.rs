@@ -1,3 +1,4 @@
+pub(crate) mod ai;
 mod autostart;
 pub(crate) mod backup;
 mod config;
@@ -14,6 +15,7 @@ mod whoami;
 
 pub mod storage;
 
+pub use ai::ai;
 pub use autostart::autostart;
 pub use backup::backup;
 pub use config::config;

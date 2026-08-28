@@ -59,6 +59,25 @@ fn cli() -> Command {
                 .about("Show your identity")
         )
         .subcommand(
+            Command::new("ai")
+                .about("Chat with the local GIB AI assistant")
+                .arg(
+                    Arg::new("message")
+                        .long("message")
+                        .value_name("MESSAGE")
+                        .help("Run one AI turn with this message")
+                        .required(false)
+                        .required_if_eq("mode", "json"),
+                )
+                .arg(
+                    Arg::new("conversation")
+                        .long("conversation")
+                        .value_name("ID")
+                        .help("Use a conversation for this invocation without changing the active conversation")
+                        .required(false),
+                )
+        )
+        .subcommand(
             Command::new("setup")
                 .about("Discover local GIB storages and configure them")
                 .arg(
@@ -678,6 +697,7 @@ async fn main() {
     match matches.subcommand() {
         Some(("config", matches)) => commands::config(matches),
         Some(("whoami", _)) => commands::whoami(),
+        Some(("ai", matches)) => commands::ai(matches).await,
         Some(("setup", matches)) => commands::setup(matches),
         Some(("live", matches)) => commands::live(matches).await,
         Some(("autostart", matches)) => commands::autostart(matches).await,

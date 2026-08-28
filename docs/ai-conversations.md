@@ -33,7 +33,9 @@ Each JSON document contains:
 - a monotonically increasing revision;
 - optional model and prompt identity metadata;
 - user-visible messages with stable IDs, user or assistant roles, UTC
-  timestamps, text content, and completion status;
+  timestamps, text content, and completion status. Messages may also carry an
+  opaque turn ID for retry idempotency; this ID is operational metadata and is
+  never included in a model prompt;
 - bounded durable_context containing only an explicit summary, user
   preferences, artifact references, evidence references, and facts;
 - an archived flag reserved for lifecycle metadata.
@@ -79,4 +81,3 @@ context, and complete document size. Objects are protected with restrictive
 user-only permissions where the platform supports them. Listing returns valid
 summaries and structured warnings for malformed files rather than failing the
 entire directory; direct loading keeps the actionable error.
-

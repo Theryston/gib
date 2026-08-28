@@ -169,6 +169,10 @@ pub(crate) struct ConversationMessage {
     pub(crate) timestamp: String,
     pub(crate) content: String,
     pub(crate) status: ConversationMessageStatus,
+    /// An opaque, non-user-visible turn identifier used to make a turn
+    /// append idempotent across retries. It is never sent to the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) turn_id: Option<String>,
 }
 
 impl ConversationMessage {
@@ -184,6 +188,25 @@ impl ConversationMessage {
             timestamp,
             content,
             status: ConversationMessageStatus::Complete,
+            turn_id: None,
+        }
+    }
+
+    pub(crate) fn with_status_and_turn_id(
+        message_id: String,
+        role: ConversationMessageRole,
+        timestamp: String,
+        content: String,
+        status: ConversationMessageStatus,
+        turn_id: Option<String>,
+    ) -> Self {
+        Self {
+            message_id,
+            role,
+            timestamp,
+            content,
+            status,
+            turn_id,
         }
     }
 
@@ -198,6 +221,9 @@ impl ConversationMessage {
                 limit: limits.max_message_bytes,
                 actual: self.content.len(),
             });
+        }
+        if let Some(turn_id) = &self.turn_id {
+            validate_conversation_id_with_limit(turn_id, limits.max_id_bytes)?;
         }
         Ok(())
     }
