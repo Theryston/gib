@@ -34,7 +34,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use tokio::task::JoinSet;
 
@@ -174,6 +174,7 @@ async fn run_backup_with_scope(
     received_pending_backup: Option<PendingBackupMatch>,
     changed_paths: Option<BTreeSet<String>>,
 ) -> Result<BackupResult, String> {
+    let started_at = Instant::now();
     let BackupOptions {
         key,
         root_path_string,
@@ -192,7 +193,7 @@ async fn run_backup_with_scope(
     let received_pending_backup = Arc::new(Mutex::new(received_pending_backup));
     let config = Config { author };
 
-    let pb = if is_json_mode() {
+    let metadata_pb = if is_json_mode() {
         ProgressBar::hidden()
     } else {
         let pb = ProgressBar::new(100);
@@ -206,7 +207,7 @@ async fn run_backup_with_scope(
         emit_progress_message("Loading metadata from the repository key...");
     }
 
-    pb.set_message("Generating new backup...");
+    metadata_pb.set_message("Generating new backup...");
     if is_json_mode() {
         emit_progress_message("Generating new backup...");
     }
@@ -231,7 +232,7 @@ async fn run_backup_with_scope(
         {
             Ok(result) => result,
             Err(e) => {
-                pb.finish_and_clear();
+                metadata_pb.finish_and_clear();
                 return Err(e);
             }
         };
@@ -246,7 +247,7 @@ async fn run_backup_with_scope(
 
     let total_files = root_files.len();
 
-    pb.finish_and_clear();
+    metadata_pb.finish_and_clear();
 
     if *prev_not_encrypted_but_now_yes.lock().unwrap() {
         let warning = "The backup was not encrypted but you provided a password. Only new chunks will be encrypted; run 'gib encrypt' to encrypt existing chunks.";
@@ -268,7 +269,7 @@ async fn run_backup_with_scope(
         None
     };
 
-    let pb = if is_json_mode() {
+    let file_pb = if is_json_mode() {
         ProgressBar::hidden()
     } else {
         let pb = ProgressBar::new(root_files.len() as u64);
@@ -338,7 +339,7 @@ async fn run_backup_with_scope(
 
     files_stream
         .for_each_concurrent(concurrency, |file_path| {
-            let pb_clone = pb.clone();
+            let pb_clone = file_pb.clone();
             let chunk_indexes_clone = Arc::clone(&chunk_indexes);
             let password_clone = password.clone();
             let key_clone = key.clone();
@@ -396,7 +397,7 @@ async fn run_backup_with_scope(
     pending_backup_monitor_stop.store(true, Ordering::SeqCst);
 
     if !failed_files.is_empty() {
-        pb.finish_and_clear();
+        file_pb.finish_and_clear();
         return Err(format!(
             "Failed to process {} files:\n{}\n\n{}",
             failed_files.len(),
@@ -407,6 +408,24 @@ async fn run_backup_with_scope(
                 .join("\n"),
             &continue_error_message
         ));
+    }
+
+    // The file progress bar represents only the file-processing stage. Clear
+    // it before the repository finalization starts so a completed bar is not
+    // mixed with the status of index and catalog writes.
+    file_pb.finish_and_clear();
+
+    let finalization_pb = if is_json_mode() {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new_spinner();
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+        pb.set_message("Saving repository indexes...");
+        pb
+    };
+    if is_json_mode() {
+        emit_progress_message("Saving repository indexes...");
     }
 
     let final_chunk_indexes = chunk_indexes.lock().unwrap().clone();
@@ -423,7 +442,7 @@ async fn run_backup_with_scope(
     let backup_file_bytes = match rmp_serde::to_vec_named(&*new_backup.lock().unwrap()) {
         Ok(bytes) => bytes,
         Err(error) => {
-            pb.finish_and_clear();
+            finalization_pb.finish_and_clear();
             return Err(format!("Failed to serialize backup: {}", error));
         }
     };
@@ -443,7 +462,7 @@ async fn run_backup_with_scope(
         tokio::join!(write_chunk_index_future, write_backup_file_future);
 
     if let Err(error) = write_chunk_index_result {
-        pb.finish_and_clear();
+        finalization_pb.finish_and_clear();
         return Err(format!(
             "Failed to write chunk indexes: {}\n\n{}",
             error, &continue_error_message
@@ -451,7 +470,7 @@ async fn run_backup_with_scope(
     }
 
     if let Err(error) = write_backup_file_result {
-        pb.finish_and_clear();
+        finalization_pb.finish_and_clear();
         return Err(format!(
             "Failed to write backup file: {}\n\n{}",
             error, &continue_error_message
@@ -460,6 +479,11 @@ async fn run_backup_with_scope(
 
     let written_bytes = *written_bytes.lock().unwrap();
     let deduplicated_bytes = *deduplicated_bytes.lock().unwrap();
+
+    finalization_pb.set_message("Updating backup index...");
+    if is_json_mode() {
+        emit_progress_message("Updating backup index...");
+    }
 
     {
         let backup_guard = new_backup.lock().unwrap();
@@ -473,12 +497,17 @@ async fn run_backup_with_scope(
         )
         .await
         {
-            pb.finish_and_clear();
+            finalization_pb.finish_and_clear();
             return Err(format!(
                 "Failed to save backup summary: {}\n\n{}",
                 &e, &continue_error_message
             ));
         }
+    }
+
+    finalization_pb.set_message("Updating historical catalog...");
+    if is_json_mode() {
+        emit_progress_message("Updating historical catalog...");
     }
 
     let backup_for_catalog = new_backup.lock().unwrap().clone();
@@ -502,24 +531,46 @@ async fn run_backup_with_scope(
         );
     }
 
+    finalization_pb.set_message("Publishing repository HEAD...");
+    if is_json_mode() {
+        emit_progress_message("Publishing repository HEAD...");
+    }
+
     let backup_hash = new_backup.lock().unwrap().hash.clone();
     let expected_head_parent = match primary_parent {
         Some(parent) => Some(parent),
         None => {
-            read_or_initialize_repository_head(Arc::clone(&fs), key.clone(), password.clone())
-                .await?
-                .head
-                .backup
+            match read_or_initialize_repository_head(Arc::clone(&fs), key.clone(), password.clone())
+                .await
+            {
+                Ok(snapshot) => snapshot.head.backup,
+                Err(error) => {
+                    finalization_pb.finish_and_clear();
+                    return Err(error);
+                }
+            }
         }
     };
-    let head_published = advance_repository_head(
+    let head_published = match advance_repository_head(
         Arc::clone(&fs),
         key.clone(),
         password.clone(),
         expected_head_parent.as_deref(),
         &backup_hash,
     )
-    .await?;
+    .await
+    {
+        Ok(published) => published,
+        Err(error) => {
+            finalization_pb.finish_and_clear();
+            return Err(error);
+        }
+    };
+
+    finalization_pb.set_message("Cleaning up temporary backup state...");
+    if is_json_mode() {
+        emit_progress_message("Cleaning up temporary backup state...");
+    }
 
     let _ = fs.delete_file(&pending_backup_path).await;
 
@@ -531,6 +582,8 @@ async fn run_backup_with_scope(
             None => {}
         };
     }
+
+    finalization_pb.finish_and_clear();
 
     if is_json_mode() {
         #[derive(serde::Serialize)]
@@ -548,7 +601,7 @@ async fn run_backup_with_scope(
         }
 
         let backup_guard = new_backup.lock().unwrap();
-        let elapsed_ms = pb.elapsed().as_millis() as u64;
+        let elapsed_ms = started_at.elapsed().as_millis() as u64;
         let payload = BackupOutput {
             backup: backup_guard.hash.clone(),
             backup_short: backup_guard.hash[..8.min(backup_guard.hash.len())].to_string(),
@@ -563,15 +616,13 @@ async fn run_backup_with_scope(
         };
         emit_output(&payload);
     } else {
-        let elapsed = pb.elapsed();
-        pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
-        pb.set_prefix("OK");
-        pb.finish_with_message(format!(
-            "Backed up files ({:.2?}) - {} written, {} deduplicated",
-            elapsed,
+        println!(
+            "{} Backed up files ({:.2?}) - {} written, {} deduplicated",
+            style("OK").green(),
+            started_at.elapsed(),
             ByteSize(written_bytes),
             ByteSize(deduplicated_bytes),
-        ));
+        );
     }
 
     Ok(BackupResult {
@@ -579,7 +630,7 @@ async fn run_backup_with_scope(
         files_total: total_files,
         written_bytes,
         deduplicated_bytes,
-        elapsed_ms: pb.elapsed().as_millis() as u64,
+        elapsed_ms: started_at.elapsed().as_millis() as u64,
         head_published,
     })
 }

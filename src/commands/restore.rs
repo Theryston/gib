@@ -14,6 +14,7 @@ use crate::fs::FS;
 use crate::output::{JsonProgress, emit_output, emit_progress_message, emit_warning, is_json_mode};
 use crate::utils::{decompress_bytes, handle_error};
 use clap::ArgMatches;
+use console::style;
 use dialoguer::Select;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashSet;
@@ -43,7 +44,7 @@ pub async fn restore(matches: &ArgMatches) {
         Err(e) => handle_error(e, None),
     };
 
-    let pb = if is_json_mode() {
+    let load_pb = if is_json_mode() {
         ProgressBar::hidden()
     } else {
         let pb = ProgressBar::new(100);
@@ -66,10 +67,10 @@ pub async fn restore(matches: &ArgMatches) {
     .await
     {
         Ok(backup) => backup,
-        Err(e) => handle_error(e, Some(&pb)),
+        Err(e) => handle_error(e, Some(&load_pb)),
     };
 
-    pb.finish_and_clear();
+    load_pb.finish_and_clear();
 
     let files_to_restore = match only_request {
         OnlyRequest::None => backup
@@ -106,7 +107,7 @@ pub async fn restore(matches: &ArgMatches) {
         None
     };
 
-    let pb = if is_json_mode() {
+    let file_pb = if is_json_mode() {
         ProgressBar::hidden()
     } else {
         let pb = ProgressBar::new(total_files);
@@ -127,7 +128,7 @@ pub async fn restore(matches: &ArgMatches) {
     let progress: RestoreProgressCallback = if let Some(json_progress) = json_progress.clone() {
         Arc::new(move || json_progress.inc_by(1))
     } else {
-        let pb_clone = pb.clone();
+        let pb_clone = file_pb.clone();
         Arc::new(move || pb_clone.inc(1))
     };
     let stats = restore_files(
@@ -152,16 +153,29 @@ pub async fn restore(matches: &ArgMatches) {
                     .collect::<Vec<String>>()
                     .join("\n")
             ),
-            Some(&pb),
+            Some(&file_pb),
         );
     }
 
+    // The file progress bar ends with restore_files. Local cleanup is a
+    // separate operation and must not reuse a completed file bar while it
+    // walks the entire destination tree.
+    file_pb.finish_and_clear();
+
     let deleted_count = if prune_local {
-        pb.set_message("Cleaning up files not in backup...");
+        let cleanup_pb = if is_json_mode() {
+            ProgressBar::hidden()
+        } else {
+            let pb = ProgressBar::new_spinner();
+            pb.enable_steady_tick(Duration::from_millis(100));
+            pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+            pb.set_message("Cleaning up files not in backup...");
+            pb
+        };
         if is_json_mode() {
             emit_progress_message("Cleaning up files not in backup...");
         }
-        match cleanup_extra_files(&target_path, &backup.tree) {
+        let deleted_count = match cleanup_extra_files(&target_path, &backup.tree) {
             Ok(count) => count,
             Err(e) => {
                 emit_warning(
@@ -170,7 +184,9 @@ pub async fn restore(matches: &ArgMatches) {
                 );
                 0
             }
-        }
+        };
+        cleanup_pb.finish_and_clear();
+        deleted_count
     } else {
         0
     };
@@ -201,20 +217,23 @@ pub async fn restore(matches: &ArgMatches) {
         };
         emit_output(&payload);
     } else {
-        let elapsed = pb.elapsed();
-        pb.set_style(ProgressStyle::with_template("{prefix:.green} {msg}").unwrap());
-        pb.set_prefix("OK");
-
         if deleted_count > 0 {
-            pb.finish_with_message(format!(
-                "Restored {} files, skipped {} files, deleted {} files ({:.2?})",
-                restored_count, skipped_count, deleted_count, elapsed
-            ));
+            println!(
+                "{} Restored {} files, skipped {} files, deleted {} files ({:.2?})",
+                style("OK").green(),
+                restored_count,
+                skipped_count,
+                deleted_count,
+                started_at.elapsed()
+            );
         } else {
-            pb.finish_with_message(format!(
-                "Restored {} files, skipped {} files ({:.2?})",
-                restored_count, skipped_count, elapsed
-            ));
+            println!(
+                "{} Restored {} files, skipped {} files ({:.2?})",
+                style("OK").green(),
+                restored_count,
+                skipped_count,
+                started_at.elapsed()
+            );
         }
     }
 }
