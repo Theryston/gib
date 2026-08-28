@@ -1290,7 +1290,7 @@ dependencies = [
 
 [[package]]
 name = "gib"
-version = "0.0.37"
+version = "0.0.38"
 dependencies = [
  "argon2",
  "async-trait",
