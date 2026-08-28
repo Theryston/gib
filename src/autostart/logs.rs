@@ -200,10 +200,10 @@ impl InteractiveLogRenderer {
                 }
             }
             "change_batch" => self.render_change_batch(data),
-            "backup_start" => {
-                let message = string_field(data, "message").unwrap_or("Creating backup");
-                println!("{} {}", style("Backup").bold(), message);
-            }
+            // The change_batch event already announces what will be backed
+            // up. The progress events that follow provide the activity
+            // indicator, so a separate "backup started" line is redundant.
+            "backup_start" => {}
             "backup_complete" => {
                 self.render_backup_complete(data);
             }
@@ -319,18 +319,10 @@ impl InteractiveLogRenderer {
     }
 
     fn render_output(&mut self, data: &Value) {
-        if let Some(backup) = data.get("backup_short").and_then(Value::as_str) {
-            let message = string_field(data, "message").unwrap_or("");
-            if message.is_empty() {
-                println!("{} {}", style("Backup created").green().bold(), backup);
-            } else {
-                println!(
-                    "{} {} ({})",
-                    style("Backup created").green().bold(),
-                    backup,
-                    message
-                );
-            }
+        // Live emits a friendly backup_complete event after this internal
+        // output event. Render only the former to avoid showing the same
+        // backup twice in the interactive log viewer.
+        if data.get("backup_short").is_some() {
             return;
         }
 
