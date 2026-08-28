@@ -833,9 +833,12 @@ gib autostart add \
   --root-path /path/to/work-project \
   --storage mybackups \
   --key work-project \
-  --conflict local \
-  --start-now
+  --conflict local
 ```
+
+The job is enabled and started immediately by default. Use `--no-start` when
+you want to register it without starting the live process now; it will still
+be available for automatic startup after login.
 
 After login, GIB can automatically resume synchronization.
 
@@ -1212,8 +1215,7 @@ gib autostart add \
   --config /path/to/gib.toml \
   --storage cloud \
   --key work-project \
-  --conflict remote \
-  --start-now
+  --conflict remote
 
 gib autostart update work-project --conflict local
 gib autostart status work-project

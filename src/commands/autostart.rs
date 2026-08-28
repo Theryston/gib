@@ -193,7 +193,7 @@ async fn add(matches: &ArgMatches) -> Result<(), String> {
         secrets: SecretReferences { password_ref },
     };
 
-    let start_now = matches.get_flag("start-now");
+    let start_now = !matches.get_flag("no-start");
     if let Err(error) = install_job(&paths, &job, previous_job.as_ref(), start_now) {
         if password.is_some()
             && previous_job
@@ -240,8 +240,9 @@ async fn update(matches: &ArgMatches) -> Result<(), String> {
     .await?;
     persist_effective_repository_values(&mut overrides, &resolved);
 
-    let start_now = previous.enabled || matches.get_flag("start-now");
-    let enabled = start_now;
+    let start_now =
+        !matches.get_flag("no-start") && (previous.enabled || matches.get_flag("start-now"));
+    let enabled = previous.enabled || matches.get_flag("start-now");
     ensure_unique_identity(
         &paths,
         &identity_from_resolved(&resolved),
@@ -801,11 +802,18 @@ fn emit_changed(event: &str, job: &AutostartJob, start_now: bool) {
             }),
         );
     } else {
+        let state = if job.enabled && start_now {
+            "enabled and started"
+        } else if job.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        };
         println!(
             "{} Autostart job '{}' is {}.",
             style("OK").green(),
             job.name,
-            if job.enabled { "enabled" } else { "disabled" }
+            state
         );
     }
 }
