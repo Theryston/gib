@@ -420,23 +420,32 @@ impl FS for S3FS {
         &self,
         path: &str,
     ) -> Result<(Vec<u8>, String), std::io::Error> {
-        let head = self
+        // GetObject already returns the ETag, so avoid the extra HEAD request
+        // that used to precede every versioned read. Catalog shard updates can
+        // read hundreds of objects during a backup finalization.
+        let response = self
             .client
-            .head_object()
+            .get_object()
             .bucket(&self.bucket)
             .key(path)
             .send()
             .await
             .map_err(|error| s3_io_error(&error, true))?;
 
-        let version = head.e_tag().map(ToString::to_string).ok_or_else(|| {
+        let version = response.e_tag().map(ToString::to_string).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "S3 did not return an ETag for the repository reference",
             )
         })?;
-        let data = self.read_file(path).await?;
-        Ok((data, version))
+        let data = response.body.collect().await.map_err(|error| {
+            Error::new(
+                ErrorKind::Other,
+                format!("S3 response body read failed: {error}"),
+            )
+        })?;
+
+        Ok((data.into_bytes().to_vec(), version))
     }
 
     async fn write_file_if_version(

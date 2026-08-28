@@ -1,6 +1,7 @@
 use crate::core::metadata::{Backup, BackupObject};
 use crate::core::metadata::{BackupSummary, ChunkIndex};
 use crate::fs::FS;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -21,6 +22,7 @@ use super::storage::{
 
 const MAX_PENDING_RECONCILIATIONS: usize = 16;
 const MAX_RECENTLY_INDEXED_BACKUPS: usize = 64;
+const MAX_CONCURRENT_CATALOG_SHARD_UPDATES: usize = 16;
 
 /// Applies one finalized backup to the historical catalog.
 ///
@@ -1063,63 +1065,74 @@ async fn update_entry_shards(
             .push(change.clone());
     }
 
-    for (shard, shard_changes) in grouped {
+    stream::iter(grouped.into_iter().map(|(shard, shard_changes)| {
         let path = entry_shard_path(key, &shard);
-        update_object(
-            fs,
-            &path,
-            password,
-            compress,
-            empty_entry_shard(),
-            "catalog entry shard",
-            |shard_data: &mut EntryShard| {
-                for change in &shard_changes {
-                    let id = entry_id(&change.path);
-                    let existing = shard_data.entries.get(&id).cloned();
+        async move {
+            update_object(
+                fs,
+                &path,
+                password,
+                compress,
+                empty_entry_shard(),
+                "catalog entry shard",
+                |shard_data: &mut EntryShard| {
+                    for change in &shard_changes {
+                        let id = entry_id(&change.path);
+                        let existing = shard_data.entries.get(&id).cloned();
 
-                    match &change.after {
-                        Some(object) => {
-                            let was_cataloged = existing.is_some();
-                            let mut entry = existing.unwrap_or_else(|| {
-                                new_entry_history(&change.path, &id, object, backup_hash, timestamp)
-                            });
+                        match &change.after {
+                            Some(object) => {
+                                let was_cataloged = existing.is_some();
+                                let mut entry = existing.unwrap_or_else(|| {
+                                    new_entry_history(
+                                        &change.path,
+                                        &id,
+                                        object,
+                                        backup_hash,
+                                        timestamp,
+                                    )
+                                });
 
-                            if !was_cataloged {
-                                shard_data.entries.insert(id, entry);
-                                continue;
-                            }
+                                if !was_cataloged {
+                                    shard_data.entries.insert(id, entry);
+                                    continue;
+                                }
 
-                            if entry.last_change_backup.as_deref() == Some(backup_hash) {
-                                continue;
-                            }
-
-                            apply_present_change(&mut entry, object, backup_hash, timestamp);
-                            shard_data.entries.insert(id, entry);
-                        }
-                        None => {
-                            if let Some(mut entry) = existing {
                                 if entry.last_change_backup.as_deref() == Some(backup_hash) {
                                     continue;
                                 }
 
-                                apply_deleted_change(
-                                    &mut entry,
-                                    backup_hash,
-                                    timestamp,
-                                    parent_hash,
-                                );
+                                apply_present_change(&mut entry, object, backup_hash, timestamp);
                                 shard_data.entries.insert(id, entry);
+                            }
+                            None => {
+                                if let Some(mut entry) = existing {
+                                    if entry.last_change_backup.as_deref() == Some(backup_hash) {
+                                        continue;
+                                    }
+
+                                    apply_deleted_change(
+                                        &mut entry,
+                                        backup_hash,
+                                        timestamp,
+                                        parent_hash,
+                                    );
+                                    shard_data.entries.insert(id, entry);
+                                }
                             }
                         }
                     }
-                }
-                Ok(())
-            },
-        )
-        .await?;
-    }
-
-    Ok(())
+                    Ok(())
+                },
+            )
+            .await
+            .map(|_| ())
+        }
+    }))
+    .buffer_unordered(MAX_CONCURRENT_CATALOG_SHARD_UPDATES)
+    .try_collect::<Vec<_>>()
+    .await
+    .map(|_| ())
 }
 
 fn new_entry_history(
@@ -1277,87 +1290,94 @@ async fn update_children_shards(
         }
     }
 
-    for (shard, shard_changes) in grouped {
+    stream::iter(grouped.into_iter().map(|(shard, shard_changes)| {
         let path = children_shard_path(key, &shard);
-        update_object(
-            fs,
-            &path,
-            password,
-            compress,
-            empty_children_shard(),
-            "catalog children shard",
-            |shard_data: &mut ChildrenShard| {
-                for change in &shard_changes {
-                    let directories = directory_paths(&change.path);
+        async move {
+            update_object(
+                fs,
+                &path,
+                password,
+                compress,
+                empty_children_shard(),
+                "catalog children shard",
+                |shard_data: &mut ChildrenShard| {
+                    for change in &shard_changes {
+                        let directories = directory_paths(&change.path);
 
-                    for directory in &directories {
-                        let id = directory_id(directory);
-                        if shard_id(&id) != shard {
+                        for directory in &directories {
+                            let id = directory_id(directory);
+                            if shard_id(&id) != shard {
+                                continue;
+                            }
+                            let record = shard_data
+                                .directories
+                                .entry(id.clone())
+                                .or_insert_with(|| DirectoryChildren::new(id, directory.clone()));
+
+                            if change.present {
+                                record.current_entry_ids.insert(change.entry_id.clone());
+                            } else {
+                                record.current_entry_ids.remove(&change.entry_id);
+                            }
+                        }
+
+                        if !change.present {
                             continue;
                         }
-                        let record = shard_data
-                            .directories
-                            .entry(id.clone())
-                            .or_insert_with(|| DirectoryChildren::new(id, directory.clone()));
 
-                        if change.present {
-                            record.current_entry_ids.insert(change.entry_id.clone());
-                        } else {
-                            record.current_entry_ids.remove(&change.entry_id);
+                        for directory in directories.iter().skip(1) {
+                            let parent = parent_directory(directory);
+                            let parent_id = directory_id(&parent);
+                            if shard_id(&parent_id) != shard {
+                                continue;
+                            }
+                            let child = DirectoryChild {
+                                name: file_name(directory),
+                                kind: DirectoryChildKind::Directory,
+                                target_id: directory_id(directory),
+                            };
+                            shard_data
+                                .directories
+                                .entry(parent_id.clone())
+                                .or_insert_with(|| {
+                                    DirectoryChildren::new(parent_id, parent.clone())
+                                })
+                                .children
+                                .entry(child.name.clone())
+                                .and_modify(|current| *current = child.clone())
+                                .or_insert(child);
                         }
-                    }
 
-                    if !change.present {
-                        continue;
-                    }
-
-                    for directory in directories.iter().skip(1) {
-                        let parent = parent_directory(directory);
+                        let parent = parent_directory(&change.path);
                         let parent_id = directory_id(&parent);
                         if shard_id(&parent_id) != shard {
                             continue;
                         }
                         let child = DirectoryChild {
-                            name: file_name(directory),
-                            kind: DirectoryChildKind::Directory,
-                            target_id: directory_id(directory),
+                            name: file_name(&change.path),
+                            kind: DirectoryChildKind::File,
+                            target_id: change.entry_id.clone(),
                         };
                         shard_data
                             .directories
                             .entry(parent_id.clone())
-                            .or_insert_with(|| DirectoryChildren::new(parent_id, parent.clone()))
+                            .or_insert_with(|| DirectoryChildren::new(parent_id, parent))
                             .children
                             .entry(child.name.clone())
                             .and_modify(|current| *current = child.clone())
                             .or_insert(child);
                     }
-
-                    let parent = parent_directory(&change.path);
-                    let parent_id = directory_id(&parent);
-                    if shard_id(&parent_id) != shard {
-                        continue;
-                    }
-                    let child = DirectoryChild {
-                        name: file_name(&change.path),
-                        kind: DirectoryChildKind::File,
-                        target_id: change.entry_id.clone(),
-                    };
-                    shard_data
-                        .directories
-                        .entry(parent_id.clone())
-                        .or_insert_with(|| DirectoryChildren::new(parent_id, parent))
-                        .children
-                        .entry(child.name.clone())
-                        .and_modify(|current| *current = child.clone())
-                        .or_insert(child);
-                }
-                Ok(())
-            },
-        )
-        .await?;
-    }
-
-    Ok(())
+                    Ok(())
+                },
+            )
+            .await
+            .map(|_| ())
+        }
+    }))
+    .buffer_unordered(MAX_CONCURRENT_CATALOG_SHARD_UPDATES)
+    .try_collect::<Vec<_>>()
+    .await
+    .map(|_| ())
 }
 
 async fn update_token_shards(
@@ -1369,7 +1389,11 @@ async fn update_token_shards(
 ) -> Result<(), String> {
     let mut grouped = BTreeMap::<String, Vec<(String, String)>>::new();
     for change in changes {
-        if change.after.is_none() {
+        // Token postings are derived from the path, not file contents. Existing
+        // paths therefore do not need to rewrite their token shards for a
+        // content or metadata-only change. New paths are still indexed here;
+        // deletions are removed when their history is purged.
+        if change.before.is_some() || change.after.is_none() {
             continue;
         }
         let id = entry_id(&change.path);
@@ -1381,34 +1405,39 @@ async fn update_token_shards(
         }
     }
 
-    for (shard, shard_changes) in grouped {
+    stream::iter(grouped.into_iter().map(|(shard, shard_changes)| {
         let path = token_shard_path(key, &shard);
-        update_object(
-            fs,
-            &path,
-            password,
-            compress,
-            empty_token_shard(),
-            "catalog token shard",
-            |shard_data: &mut TokenShard| {
-                for (token, id) in &shard_changes {
-                    shard_data
-                        .postings
-                        .entry(token.clone())
-                        .or_insert_with(|| TokenPosting {
-                            token: token.clone(),
-                            entry_ids: BTreeSet::new(),
-                        })
-                        .entry_ids
-                        .insert(id.clone());
-                }
-                Ok(())
-            },
-        )
-        .await?;
-    }
-
-    Ok(())
+        async move {
+            update_object(
+                fs,
+                &path,
+                password,
+                compress,
+                empty_token_shard(),
+                "catalog token shard",
+                |shard_data: &mut TokenShard| {
+                    for (token, id) in &shard_changes {
+                        shard_data
+                            .postings
+                            .entry(token.clone())
+                            .or_insert_with(|| TokenPosting {
+                                token: token.clone(),
+                                entry_ids: BTreeSet::new(),
+                            })
+                            .entry_ids
+                            .insert(id.clone());
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .map(|_| ())
+        }
+    }))
+    .buffer_unordered(MAX_CONCURRENT_CATALOG_SHARD_UPDATES)
+    .try_collect::<Vec<_>>()
+    .await
+    .map(|_| ())
 }
 
 #[allow(dead_code)]
