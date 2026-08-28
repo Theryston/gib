@@ -6,6 +6,7 @@ use crate::output::{
 };
 use crate::utils::handle_error;
 
+pub(crate) mod ai;
 mod autostart;
 mod commands;
 mod config;
