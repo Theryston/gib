@@ -56,6 +56,7 @@ async fn follow_logs(matches: &ArgMatches) -> Result<(), String> {
     let log = log_path(&paths, &job.id)?;
     let mut follower = LogFollower::new(log.clone());
     let mut renderer = InteractiveLogRenderer::new();
+    let mut reading_existing_log = true;
 
     if is_json_mode() {
         emit_named_event(
@@ -93,13 +94,19 @@ async fn follow_logs(matches: &ArgMatches) -> Result<(), String> {
                     }),
                 );
             } else {
-                renderer.render_line(&line);
+                if reading_existing_log {
+                    renderer.render_initial_line(&line);
+                } else {
+                    renderer.render_line(&line);
+                }
             }
         }
+        reading_existing_log = false;
 
         tokio::select! {
             result = &mut ctrl_c => {
                 result.map_err(|error| format!("Failed to listen for Ctrl+C: {}", error))?;
+                renderer.clear_progress();
                 if is_json_mode() {
                     emit_named_event(
                         "autostart",
