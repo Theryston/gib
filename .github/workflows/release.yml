@@ -131,6 +131,25 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install native llama.cpp build dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake clang libclang-dev
+
+      - name: Install native llama.cpp build dependencies (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install llvm cmake
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
+      - name: Install native llama.cpp build dependencies (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install llvm cmake --no-progress -y
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Install cross-compilation tools (Linux ARM64)
         if: matrix.cross
         run: |

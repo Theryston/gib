@@ -3,6 +3,21 @@ name = "gib"
 version = "0.0.39"
 edition = "2024"
 
+[features]
+# The in-process runtime is always available on the default CPU build. Native
+# accelerator backends remain opt-in so they do not make the release matrix
+# depend on a local GPU SDK.
+default = ["ai-cpu"]
+ai-cpu = []
+ai-openmp = ["llama-cpp-2/openmp", "llama-cpp-sys-2/openmp"]
+ai-cuda = ["llama-cpp-2/cuda", "llama-cpp-sys-2/cuda"]
+ai-cuda-no-vmm = ["ai-cuda", "llama-cpp-2/cuda-no-vmm", "llama-cpp-sys-2/cuda-no-vmm"]
+ai-metal = ["llama-cpp-2/metal", "llama-cpp-sys-2/metal"]
+ai-vulkan = ["llama-cpp-2/vulkan", "llama-cpp-sys-2/vulkan"]
+ai-opencl = ["llama-cpp-2/opencl", "llama-cpp-sys-2/opencl"]
+ai-rocm = ["llama-cpp-2/rocm", "llama-cpp-sys-2/rocm"]
+ai-mkl = ["llama-cpp-2/mkl", "llama-cpp-sys-2/mkl"]
+
 [dependencies]
 argon2 = "0.5.3"
 async-trait = "0.1.83"
@@ -40,6 +55,9 @@ percent-encoding = "2.3.1"
 quick-xml = "0.37.5"
 reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls"] }
 url = "2.5.7"
+encoding_rs = "0.8.35"
+llama-cpp-2 = { version = "=0.1.154", default-features = false }
+llama-cpp-sys-2 = { version = "=0.1.154", default-features = false }
 
 [profile.release]
 opt-level = 3
