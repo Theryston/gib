@@ -1,4 +1,4 @@
-use crate::autostart::logs::LogFollower;
+use crate::autostart::logs::{InteractiveLogRenderer, LogFollower};
 use crate::autostart::model::{
     AUTOSTART_JOB_VERSION, AutostartJob, LiveJobOverrides, SecretReferences, validate_name,
 };
@@ -55,6 +55,8 @@ async fn follow_logs(matches: &ArgMatches) -> Result<(), String> {
         .ok_or_else(|| format!("Autostart job '{}' was not found", name))?;
     let log = log_path(&paths, &job.id)?;
     let mut follower = LogFollower::new(log.clone());
+    let mut renderer = InteractiveLogRenderer::new();
+    let mut reading_existing_log = true;
 
     if is_json_mode() {
         emit_named_event(
@@ -92,13 +94,19 @@ async fn follow_logs(matches: &ArgMatches) -> Result<(), String> {
                     }),
                 );
             } else {
-                println!("{}", line);
+                if reading_existing_log {
+                    renderer.render_initial_line(&line);
+                } else {
+                    renderer.render_line(&line);
+                }
             }
         }
+        reading_existing_log = false;
 
         tokio::select! {
             result = &mut ctrl_c => {
                 result.map_err(|error| format!("Failed to listen for Ctrl+C: {}", error))?;
+                renderer.clear_progress();
                 if is_json_mode() {
                     emit_named_event(
                         "autostart",
@@ -185,7 +193,7 @@ async fn add(matches: &ArgMatches) -> Result<(), String> {
         secrets: SecretReferences { password_ref },
     };
 
-    let start_now = matches.get_flag("start-now");
+    let start_now = !matches.get_flag("no-start");
     if let Err(error) = install_job(&paths, &job, previous_job.as_ref(), start_now) {
         if password.is_some()
             && previous_job
@@ -232,8 +240,9 @@ async fn update(matches: &ArgMatches) -> Result<(), String> {
     .await?;
     persist_effective_repository_values(&mut overrides, &resolved);
 
-    let start_now = previous.enabled || matches.get_flag("start-now");
-    let enabled = start_now;
+    let start_now =
+        !matches.get_flag("no-start") && (previous.enabled || matches.get_flag("start-now"));
+    let enabled = previous.enabled || matches.get_flag("start-now");
     ensure_unique_identity(
         &paths,
         &identity_from_resolved(&resolved),
@@ -793,11 +802,18 @@ fn emit_changed(event: &str, job: &AutostartJob, start_now: bool) {
             }),
         );
     } else {
+        let state = if job.enabled && start_now {
+            "enabled and started"
+        } else if job.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        };
         println!(
             "{} Autostart job '{}' is {}.",
             style("OK").green(),
             job.name,
-            if job.enabled { "enabled" } else { "disabled" }
+            state
         );
     }
 }

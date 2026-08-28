@@ -407,8 +407,19 @@ fn cli() -> Command {
                         .arg(
                             Arg::new("start-now")
                                 .long("start-now")
-                                .help("Start the job immediately after registering it")
+                                .help("Start the job immediately after registering it (default)")
                                 .action(clap::ArgAction::SetTrue)
+                                .conflicts_with("no-start")
+                                .hide(true)
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("no-start")
+                                .long("no-start")
+                                .visible_alias("not-start")
+                                .help("Register and enable the job without starting it now")
+                                .action(clap::ArgAction::SetTrue)
+                                .conflicts_with("start-now")
                                 .required(false),
                         )
                         .arg(
@@ -464,6 +475,16 @@ fn cli() -> Command {
                                 .long("start-now")
                                 .help("Enable and start the job immediately")
                                 .action(clap::ArgAction::SetTrue)
+                                .conflicts_with("no-start")
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("no-start")
+                                .long("no-start")
+                                .visible_alias("not-start")
+                                .help("Keep the job registered without starting it now")
+                                .action(clap::ArgAction::SetTrue)
+                                .conflicts_with("start-now")
                                 .required(false),
                         ),
                 )
