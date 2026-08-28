@@ -245,6 +245,13 @@ fn cli() -> Command {
                         .action(clap::ArgAction::Append),
                 )
                 .arg(
+                    Arg::new("no-ignore-git")
+                        .long("no-ignore-git")
+                        .help("Include .git directories and files in the backup")
+                        .action(clap::ArgAction::SetTrue)
+                        .required(false),
+                )
+                .arg(
                     Arg::new("continue")
                         .long("continue")
                         .value_name("BACKUP")
@@ -324,6 +331,13 @@ fn cli() -> Command {
                         .action(clap::ArgAction::Append),
                 )
                 .arg(
+                    Arg::new("no-ignore-git")
+                        .long("no-ignore-git")
+                        .help("Include .git directories and files in live synchronization")
+                        .action(clap::ArgAction::SetTrue)
+                        .required(false),
+                )
+                .arg(
                     Arg::new("continue")
                         .long("continue")
                         .value_name("BACKUP")
@@ -387,6 +401,13 @@ fn cli() -> Command {
                                 .value_name("IGNORE")
                                 .help("File or folder name to ignore (repeatable)")
                                 .action(clap::ArgAction::Append)
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("no-ignore-git")
+                                .long("no-ignore-git")
+                                .help("Include .git directories and files in the live job")
+                                .action(clap::ArgAction::SetTrue)
                                 .required(false),
                         )
                         .arg(
@@ -460,6 +481,13 @@ fn cli() -> Command {
                                 .long("ignore")
                                 .value_name("IGNORE")
                                 .action(clap::ArgAction::Append)
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("no-ignore-git")
+                                .long("no-ignore-git")
+                                .help("Include .git directories and files in the live job")
+                                .action(clap::ArgAction::SetTrue)
                                 .required(false),
                         )
                         .arg(Arg::new("concurrency").long("concurrency").value_name("CONCURRENCY").required(false))

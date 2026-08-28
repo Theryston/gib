@@ -298,40 +298,10 @@ Backup manifests and chunks remain the authoritative source of data.
 
 ---
 
-### 💻 Developer-Friendly Workspace Synchronization
+### 💻 Git Directories
 
-GIB Live is especially useful for development workspaces.
-
-It recursively detects Git repositories and deliberately does **not** treat
-`.git` as one giant machine-local directory.
-
-Shareable Git data such as:
-
-- commit objects;
-- pack files;
-- refs;
-- packed refs;
-
-can be synchronized between devices.
-
-Machine-local working state such as:
-
-- `HEAD`;
-- the staging index;
-- locks;
-- reflogs;
-- hooks;
-- temporary operation files;
-
-is excluded from Live synchronization.
-
-That means a commit created on one synchronized machine can become available on
-another without treating every local Git implementation detail as shared state.
-
-These rules apply specifically to `gib live`.
-
-For normal backups, you control whether `.git` is included using your normal
-ignore configuration.
+`.git` directories and files are ignored automatically by backups and Live
+synchronization. Use `--no-ignore-git` when you explicitly want to include them.
 
 ---
 
@@ -811,16 +781,6 @@ or:
 gib live --conflict remote
 ```
 
-### Git Repositories
-
-Live recursively detects Git repositories inside the synchronized root.
-
-Shareable repository data is synchronized, while machine-local working state is
-excluded.
-
-This allows Git history to move with the workspace without blindly synchronizing
-every `.git` implementation detail.
-
 ---
 
 # ⚙️ Start Live Automatically
@@ -1156,6 +1116,7 @@ Common options include:
 - `--chunk-size`
 - `--root-path`
 - `--ignore`
+- `--no-ignore-git`
 - `--concurrency`
 - `--parent`
 
@@ -1176,6 +1137,7 @@ including:
 - `--chunk-size`
 - `--root-path`
 - `--ignore`
+- `--no-ignore-git`
 - `--concurrency`
 
 `--message` can add context after the required `[LIVE]` prefix.
@@ -1231,6 +1193,7 @@ gib autostart remove work-project --yes
 - `--compress`
 - `--chunk-size`
 - `--ignore`
+- `--no-ignore-git`
 - `--concurrency`
 
 A job's effective identity is its canonical root, storage and repository key.

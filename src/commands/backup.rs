@@ -6,7 +6,6 @@ use crate::config::{
 use crate::core::catalog::index_backup_after_finalize;
 use crate::core::crypto::read_file_maybe_decrypt;
 use crate::core::crypto::write_file_maybe_encrypt;
-use crate::core::git_sync::GitSyncPolicy;
 use crate::core::indexes::{
     add_backup_summary, advance_repository_head, create_new_backup, list_backup_summaries,
     list_backup_summaries_strict, load_chunk_indexes_with_version,
@@ -50,7 +49,7 @@ pub(crate) struct BackupOptions {
     pub(crate) password: Option<String>,
     pub(crate) chunk_size: u64,
     pub(crate) ignore_patterns: Vec<String>,
-    pub(crate) git_policy: Option<Arc<GitSyncPolicy>>,
+    pub(crate) include_git: bool,
     pub(crate) concurrency: usize,
 }
 
@@ -73,6 +72,7 @@ pub(crate) struct LiveOverrides {
     pub(crate) compress: Option<i32>,
     pub(crate) chunk_size: Option<String>,
     pub(crate) ignore: Option<Vec<String>>,
+    pub(crate) no_ignore_git: bool,
     pub(crate) concurrency: Option<usize>,
     pub(crate) password: Option<String>,
 }
@@ -184,7 +184,7 @@ async fn run_backup_with_scope(
         password,
         chunk_size,
         ignore_patterns,
-        git_policy,
+        include_git,
         concurrency,
     } = options;
     let primary_parent = parent_hashes.first().cloned();
@@ -223,7 +223,7 @@ async fn run_backup_with_scope(
             password.clone(),
             Arc::clone(&prev_not_encrypted_but_now_yes),
             ignore_patterns.clone(),
-            git_policy.clone(),
+            include_git,
             primary_parent.clone(),
             changed_paths.as_ref(),
         )
@@ -775,19 +775,13 @@ async fn backup_file(
     Ok(())
 }
 
-fn list_files(
-    path: &str,
-    ignore_patterns: &[String],
-    git_policy: Option<&GitSyncPolicy>,
-) -> Vec<String> {
+fn list_files(path: &str, ignore_patterns: &[String]) -> Vec<String> {
     let mut files = Vec::new();
     let root = Path::new(path);
 
     let walker = walkdir::WalkDir::new(path)
         .into_iter()
-        .filter_entry(|entry| {
-            !is_ignored_path_with_git_policy(entry.path(), root, ignore_patterns, git_policy)
-        });
+        .filter_entry(|entry| !is_ignored_path(entry.path(), root, ignore_patterns));
 
     for entry in walker.filter_map(|e| e.ok()).filter(|e| e.path().is_file()) {
         files.push(entry.path().display().to_string());
@@ -797,18 +791,6 @@ fn list_files(
 }
 
 pub(crate) fn is_ignored_path(path: &Path, root: &Path, ignore_patterns: &[String]) -> bool {
-    is_ignored_path_with_git_policy(path, root, ignore_patterns, None)
-}
-
-pub(crate) fn is_ignored_path_with_git_policy(
-    path: &Path,
-    root: &Path,
-    ignore_patterns: &[String],
-    git_policy: Option<&GitSyncPolicy>,
-) -> bool {
-    if git_policy.is_some_and(|policy| policy.is_volatile_path(root, path)) {
-        return true;
-    }
     if ignore_patterns.is_empty() {
         return false;
     }
@@ -833,15 +815,30 @@ pub(crate) fn is_ignored_path_with_git_policy(
         .any(|component| ignore_patterns.iter().any(|pattern| pattern == component))
 }
 
-fn is_ignored_relative_path(
-    path: &str,
-    ignore_patterns: &[String],
-    git_policy: Option<&GitSyncPolicy>,
-) -> bool {
-    git_policy.is_some_and(|policy| policy.is_volatile_relative(path))
-        || path
-            .split('/')
-            .any(|component| ignore_patterns.iter().any(|pattern| pattern == component))
+fn is_ignored_relative_path(path: &str, ignore_patterns: &[String]) -> bool {
+    path.split('/')
+        .any(|component| ignore_patterns.iter().any(|pattern| pattern == component))
+}
+
+fn is_git_path(path: &str) -> bool {
+    path.split('/').any(|component| component == ".git")
+}
+
+fn remove_automatically_ignored_git_objects(
+    tree: &mut HashMap<String, BackupObject>,
+    chunk_indexes: &mut HashMap<String, ChunkIndex>,
+) {
+    let stale_paths: Vec<String> = tree
+        .keys()
+        .filter(|path| is_git_path(path))
+        .cloned()
+        .collect();
+
+    for stale_path in stale_paths {
+        if let Some(backup_object) = tree.remove(&stale_path) {
+            decrement_chunk_refcounts_from_map(chunk_indexes, &backup_object);
+        }
+    }
 }
 
 fn relative_path(file_path: &str, root_path: &str) -> String {
@@ -861,7 +858,6 @@ fn remove_missing_backup_objects(
     root_files: &[String],
     root_path: &str,
     ignore_patterns: &[String],
-    git_policy: Option<&GitSyncPolicy>,
 ) {
     let current_paths: HashSet<String> = root_files
         .iter()
@@ -870,8 +866,7 @@ fn remove_missing_backup_objects(
     let stale_paths: Vec<String> = tree
         .keys()
         .filter(|path| {
-            !current_paths.contains(*path)
-                && !is_ignored_relative_path(path, ignore_patterns, git_policy)
+            !current_paths.contains(*path) && !is_ignored_relative_path(path, ignore_patterns)
         })
         .cloned()
         .collect();
@@ -889,7 +884,6 @@ fn remove_changed_backup_objects(
     root_files: &[String],
     root_path: &str,
     ignore_patterns: &[String],
-    git_policy: Option<&GitSyncPolicy>,
     changed_paths: &BTreeSet<String>,
 ) {
     let current_paths: HashSet<String> = root_files
@@ -900,7 +894,7 @@ fn remove_changed_backup_objects(
     let stale_paths: Vec<String> = tree
         .keys()
         .filter(|path| {
-            if is_ignored_relative_path(path, ignore_patterns, git_policy) {
+            if is_ignored_relative_path(path, ignore_patterns) {
                 return false;
             }
 
@@ -932,7 +926,6 @@ fn remove_changed_backup_objects(
 fn list_changed_files(
     root_path: &str,
     ignore_patterns: &[String],
-    git_policy: Option<&GitSyncPolicy>,
     changed_paths: &BTreeSet<String>,
 ) -> Vec<String> {
     let root = Path::new(root_path);
@@ -940,9 +933,7 @@ fn list_changed_files(
 
     for changed_path in changed_paths {
         let path = root.join(changed_path);
-        if path.is_file()
-            && !is_ignored_path_with_git_policy(&path, root, ignore_patterns, git_policy)
-        {
+        if path.is_file() && !is_ignored_path(&path, root, ignore_patterns) {
             files.insert(path.display().to_string());
             continue;
         }
@@ -953,9 +944,7 @@ fn list_changed_files(
 
         let walker = walkdir::WalkDir::new(&path)
             .into_iter()
-            .filter_entry(|entry| {
-                !is_ignored_path_with_git_policy(entry.path(), root, ignore_patterns, git_policy)
-            });
+            .filter_entry(|entry| !is_ignored_path(entry.path(), root, ignore_patterns));
 
         for entry in walker
             .filter_map(|entry| entry.ok())
@@ -977,7 +966,7 @@ async fn load_metadata(
     password: Option<String>,
     prev_not_encrypted_but_now_yes: Arc<Mutex<bool>>,
     ignore_patterns: Vec<String>,
-    git_policy: Option<Arc<GitSyncPolicy>>,
+    include_git: bool,
     parent_hash: Option<String>,
     changed_paths: Option<&BTreeSet<String>>,
 ) -> Result<
@@ -992,7 +981,6 @@ async fn load_metadata(
 > {
     let mut new_backup = create_new_backup(message, config.author);
 
-    let git_policy_for_listing = git_policy.clone();
     let root_files_future = if let Some(changed_paths) = changed_paths {
         let root_path_for_listing = root_path_string.clone();
         let ignore_patterns_for_listing = ignore_patterns.clone();
@@ -1001,20 +989,15 @@ async fn load_metadata(
             list_changed_files(
                 &root_path_for_listing,
                 &ignore_patterns_for_listing,
-                git_policy_for_listing.as_deref(),
                 &changed_paths_for_listing,
             )
         })
     } else {
         let root_path_for_listing = root_path_string.clone();
         let ignore_patterns_for_listing = ignore_patterns.clone();
-        tokio::spawn(async move {
-            list_files(
-                &root_path_for_listing,
-                &ignore_patterns_for_listing,
-                git_policy_for_listing.as_deref(),
-            )
-        })
+        tokio::spawn(
+            async move { list_files(&root_path_for_listing, &ignore_patterns_for_listing) },
+        )
     };
 
     let parent_backup_future = tokio::spawn({
@@ -1055,6 +1038,9 @@ async fn load_metadata(
     {
         increment_chunk_refcounts(&mut chunk_indexes, &parent_backup.tree);
         new_backup.tree = parent_backup.tree;
+        if !include_git {
+            remove_automatically_ignored_git_objects(&mut new_backup.tree, &mut chunk_indexes);
+        }
 
         if let Some(changed_paths) = changed_paths {
             remove_changed_backup_objects(
@@ -1063,7 +1049,6 @@ async fn load_metadata(
                 &root_files,
                 &root_path_string,
                 &ignore_patterns,
-                git_policy.as_deref(),
                 changed_paths,
             );
         } else {
@@ -1073,7 +1058,6 @@ async fn load_metadata(
                 &root_files,
                 &root_path_string,
                 &ignore_patterns,
-                git_policy.as_deref(),
             );
         }
     }
@@ -1148,6 +1132,16 @@ async fn load_pending_backup(
         backup: pending_backup,
         path: pending_path,
     })
+}
+
+fn configure_git_ignore_patterns(patterns: Vec<String>, include_git: bool) -> Vec<String> {
+    let mut patterns = patterns.into_iter().collect::<BTreeSet<_>>();
+    if include_git {
+        patterns.remove(".git");
+    } else {
+        patterns.insert(".git".to_string());
+    }
+    patterns.into_iter().collect()
 }
 
 pub(crate) async fn resolve_backup(
@@ -1320,6 +1314,7 @@ pub(crate) async fn resolve_backup(
         .get_many::<String>("ignore")
         .map(|values| values.map(ToString::to_string).collect::<Vec<_>>())
         .unwrap_or_default();
+    let include_git = matches.get_flag("no-ignore-git");
     let ignore_patterns = if !cli_ignore_patterns.is_empty() {
         if pending_backup.is_some() {
             cli_ignore_patterns
@@ -1334,14 +1329,7 @@ pub(crate) async fn resolve_backup(
     } else {
         merge_ignore_patterns(&local_config.config.backup.ignore, &[])
     };
-    let git_policy = if mode == BackupMode::Live {
-        Some(Arc::new(GitSyncPolicy::discover(
-            Path::new(&root_path_string),
-            &ignore_patterns,
-        )?))
-    } else {
-        None
-    };
+    let ignore_patterns = configure_git_ignore_patterns(ignore_patterns, include_git);
 
     let default_concurrency = num_cpus::get() * 2;
     let configured_concurrency = local_config
@@ -1392,7 +1380,7 @@ pub(crate) async fn resolve_backup(
             password,
             chunk_size,
             ignore_patterns,
-            git_policy,
+            include_git,
             concurrency,
         },
         message,
@@ -1465,10 +1453,11 @@ pub(crate) async fn resolve_live_overrides(
         return Err("The chunk size must be greater than zero".to_string());
     }
 
+    let include_git = overrides.no_ignore_git;
     let ignore_patterns = overrides
         .ignore
         .unwrap_or_else(|| merge_ignore_patterns(&local_config.config.backup.ignore, &[]));
-    let git_policy = Some(Arc::new(GitSyncPolicy::discover(&root, &ignore_patterns)?));
+    let ignore_patterns = configure_git_ignore_patterns(ignore_patterns, include_git);
     let concurrency = overrides
         .concurrency
         .or(local_config.config.backup.concurrency)
@@ -1488,7 +1477,7 @@ pub(crate) async fn resolve_live_overrides(
             password,
             chunk_size,
             ignore_patterns,
-            git_policy,
+            include_git,
             concurrency,
         },
         message,
@@ -1729,6 +1718,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ignores_git_by_default_and_includes_it_when_requested() {
+        assert_eq!(
+            configure_git_ignore_patterns(vec!["node_modules".to_string()], false),
+            vec![".git", "node_modules"]
+        );
+        assert_eq!(
+            configure_git_ignore_patterns(
+                vec![".git".to_string(), "node_modules".to_string()],
+                true
+            ),
+            vec!["node_modules"]
+        );
+    }
+
     fn test_directory() -> PathBuf {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1756,7 +1760,6 @@ mod tests {
             &["/workspace/kept.txt".to_string()],
             "/workspace",
             &[],
-            None,
         );
 
         assert!(tree.contains_key("kept.txt"));
@@ -1780,11 +1783,29 @@ mod tests {
             &[],
             "/workspace",
             &["ignored".to_string()],
-            None,
         );
 
         assert!(tree.contains_key("ignored/file.txt"));
         assert_eq!(chunk_indexes["ignored-chunk"].refcount, 1);
+    }
+
+    #[test]
+    fn removes_git_objects_inherited_from_an_older_snapshot() {
+        let mut tree = HashMap::from([
+            (".git/HEAD".to_string(), backup_object("git-chunk")),
+            ("src/main.rs".to_string(), backup_object("source-chunk")),
+        ]);
+        let mut chunk_indexes = HashMap::from([
+            ("git-chunk".to_string(), ChunkIndex { refcount: 1 }),
+            ("source-chunk".to_string(), ChunkIndex { refcount: 1 }),
+        ]);
+
+        remove_automatically_ignored_git_objects(&mut tree, &mut chunk_indexes);
+
+        assert!(!tree.contains_key(".git/HEAD"));
+        assert!(tree.contains_key("src/main.rs"));
+        assert_eq!(chunk_indexes["git-chunk"].refcount, 0);
+        assert_eq!(chunk_indexes["source-chunk"].refcount, 1);
     }
 
     #[tokio::test]
@@ -1806,7 +1827,7 @@ mod tests {
             password: None,
             chunk_size: 1024,
             ignore_patterns: Vec::new(),
-            git_policy: None,
+            include_git: false,
             concurrency: 1,
         };
 
@@ -1856,7 +1877,7 @@ mod tests {
             password: None,
             chunk_size: 1024,
             ignore_patterns: Vec::new(),
-            git_policy: None,
+            include_git: false,
             concurrency: 1,
         };
 
