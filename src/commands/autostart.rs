@@ -1,4 +1,4 @@
-use crate::autostart::logs::LogFollower;
+use crate::autostart::logs::{InteractiveLogRenderer, LogFollower};
 use crate::autostart::model::{
     AUTOSTART_JOB_VERSION, AutostartJob, LiveJobOverrides, SecretReferences, validate_name,
 };
@@ -55,6 +55,7 @@ async fn follow_logs(matches: &ArgMatches) -> Result<(), String> {
         .ok_or_else(|| format!("Autostart job '{}' was not found", name))?;
     let log = log_path(&paths, &job.id)?;
     let mut follower = LogFollower::new(log.clone());
+    let mut renderer = InteractiveLogRenderer::new();
 
     if is_json_mode() {
         emit_named_event(
@@ -92,7 +93,7 @@ async fn follow_logs(matches: &ArgMatches) -> Result<(), String> {
                     }),
                 );
             } else {
-                println!("{}", line);
+                renderer.render_line(&line);
             }
         }
 

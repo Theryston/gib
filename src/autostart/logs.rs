@@ -1,11 +1,15 @@
+use std::fmt::Display;
 use std::fs::Metadata;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 
+use console::style;
+use serde_json::Value;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 const MAX_LOG_ROTATIONS: usize = 3;
+const MAX_DISPLAY_ITEMS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FileIdentity {
@@ -34,6 +38,399 @@ pub(crate) struct LogFollower {
     offset: u64,
     identity: Option<FileIdentity>,
     pending: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProgressSnapshot {
+    percent: u64,
+    total: u64,
+    message: String,
+}
+
+pub(crate) struct InteractiveLogRenderer {
+    last_progress: Option<ProgressSnapshot>,
+}
+
+impl InteractiveLogRenderer {
+    pub(crate) fn new() -> Self {
+        Self {
+            last_progress: None,
+        }
+    }
+
+    pub(crate) fn render_line(&mut self, line: &str) {
+        let value = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(_) => {
+                println!("{} {}", style("Log entry").yellow().bold(), line);
+                return;
+            }
+        };
+
+        let Some(kind) = value.get("type").and_then(Value::as_str) else {
+            println!("{}", style("Log event without a type").yellow());
+            return;
+        };
+        let data = value.get("data").unwrap_or(&Value::Null);
+
+        match kind {
+            "autostart" => self.render_autostart(data),
+            "config" => self.render_config(data),
+            "live" => self.render_live(data),
+            "progress" => self.render_progress(data),
+            "warning" => render_message("Warning", data, style("Warning").yellow().bold()),
+            "error" => render_message("Error", data, style("Error").red().bold()),
+            "output" => self.render_output(data),
+            _ => self.render_unknown(kind, data),
+        }
+    }
+
+    fn render_autostart(&mut self, data: &Value) {
+        let event = string_field(data, "event").unwrap_or("event");
+        match event {
+            "started" => {
+                self.last_progress = None;
+                let name = string_field(data, "name").unwrap_or("unknown");
+                println!(
+                    "{} Autostart job '{}' started.",
+                    style("OK").green().bold(),
+                    name
+                );
+                if let Some(root) = string_field(data, "root_path") {
+                    println!("  {} {}", style("Root").bold(), root);
+                }
+            }
+            "stopped" => {
+                let name = string_field(data, "name").unwrap_or("unknown");
+                println!(
+                    "{} Autostart job '{}' stopped.",
+                    style("OK").cyan().bold(),
+                    name
+                );
+            }
+            "failed" => {
+                let name = string_field(data, "name").unwrap_or("unknown");
+                let message = string_field(data, "message").unwrap_or("unknown error");
+                println!(
+                    "{} Autostart job '{}' failed: {}",
+                    style("Error").red().bold(),
+                    name,
+                    message
+                );
+            }
+            "configuration_error" => {
+                render_message(
+                    "Autostart configuration error",
+                    data,
+                    style("Error").red().bold(),
+                );
+            }
+            "secret_unavailable" => {
+                render_message(
+                    "Autostart secret unavailable",
+                    data,
+                    style("Error").red().bold(),
+                );
+            }
+            _ => self.render_unknown("autostart", data),
+        }
+    }
+
+    fn render_config(&mut self, data: &Value) {
+        let loaded = data.get("loaded").and_then(Value::as_bool).unwrap_or(false);
+        if loaded {
+            if let Some(path) = string_field(data, "path") {
+                println!("{} {}", style("Loaded local config").cyan().bold(), path);
+            } else {
+                println!("{}", style("Loaded local config").cyan().bold());
+            }
+        } else {
+            println!("{}", style("No local config loaded").dim());
+        }
+    }
+
+    fn render_live(&mut self, data: &Value) {
+        let event = string_field(data, "event").unwrap_or("event");
+        match event {
+            "start" => {
+                self.last_progress = None;
+                println!("{}", style("GIB live started").cyan().bold());
+                if let Some(root) = string_field(data, "root") {
+                    println!("{} {}", style("Root").bold(), root);
+                }
+                if let (Some(storage), Some(key)) =
+                    (string_field(data, "storage"), string_field(data, "key"))
+                {
+                    println!("{} {} / {}", style("Target").bold(), storage, key);
+                }
+                if let Some(count) = data.get("git_repositories").and_then(Value::as_u64)
+                    && count > 0
+                {
+                    println!(
+                        "{} {} nested repositories (Git history enabled; local metadata excluded)",
+                        style("Git sync").bold(),
+                        count
+                    );
+                }
+                if let Some(ignore) = string_array(data, "ignore")
+                    && !ignore.is_empty()
+                {
+                    println!(
+                        "{} {} patterns: {}",
+                        style("Ignoring").bold(),
+                        ignore.len(),
+                        format_limited_items(&ignore)
+                    );
+                }
+                println!(
+                    "{}",
+                    style("Waiting for changes... Press Ctrl+C to stop.").dim()
+                );
+                if let Some(poll_ms) = data.get("poll_ms").and_then(Value::as_u64) {
+                    println!(
+                        "{} {}",
+                        style("Remote sync interval").bold(),
+                        format_duration(poll_ms)
+                    );
+                }
+            }
+            "change_batch" => self.render_change_batch(data),
+            "backup_start" => {
+                self.last_progress = None;
+                let message = string_field(data, "message").unwrap_or("Creating backup");
+                println!("{} {}", style("Backup").bold(), message);
+            }
+            "backup_complete" => {
+                self.last_progress = None;
+                self.render_backup_complete(data);
+            }
+            "synchronized" => {
+                let applied_remote = number_field(data, "applied_remote");
+                let merged_text = number_field(data, "merged_text");
+                if applied_remote > 0 || merged_text > 0 {
+                    println!(
+                        "{} {} remote changes, {} text merges",
+                        style("Synchronized").green().bold(),
+                        applied_remote,
+                        merged_text
+                    );
+                }
+            }
+            "conflict" => self.render_conflicts(data),
+            "error" => render_message("Live error", data, style("Live error").red().bold()),
+            "stop" => {
+                self.last_progress = None;
+                println!("{}", style("GIB live stopped").cyan().bold());
+            }
+            _ => self.render_unknown("live", data),
+        }
+    }
+
+    fn render_change_batch(&mut self, data: &Value) {
+        println!(
+            "{} {} created, {} changed, {} deleted",
+            style("Changes").bold(),
+            group_count(data, "created"),
+            group_count(data, "changed"),
+            group_count(data, "deleted")
+        );
+        for (label, group) in [
+            ("created", data.get("created")),
+            ("changed", data.get("changed")),
+            ("deleted", data.get("deleted")),
+        ] {
+            let Some(group) = group else {
+                continue;
+            };
+            let count = number_field(group, "count");
+            if count == 0 {
+                continue;
+            }
+            let paths = string_array(group, "paths").unwrap_or_default();
+            let remaining = number_field(group, "truncated") as usize;
+            let details = if paths.is_empty() {
+                format_file_count(count)
+            } else if remaining == 0 {
+                paths.join(", ")
+            } else {
+                format!("{} (+{} more)", paths.join(", "), remaining)
+            };
+            println!("  {}: {}", style(label).dim(), details);
+        }
+    }
+
+    fn render_backup_complete(&self, data: &Value) {
+        let backup = string_field(data, "backup_short")
+            .or_else(|| string_field(data, "backup"))
+            .unwrap_or("unknown");
+        let message = string_field(data, "message").unwrap_or("");
+        if message.is_empty() {
+            println!("{} {}", style("Backup created").green().bold(), backup);
+        } else {
+            println!(
+                "{} {} ({})",
+                style("Backup created").green().bold(),
+                backup,
+                message
+            );
+        }
+    }
+
+    fn render_conflicts(&mut self, data: &Value) {
+        self.last_progress = None;
+        let conflicts = data
+            .get("conflicts")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let resolution = string_field(data, "resolution").unwrap_or("manual");
+        println!(
+            "{} {} {} — resolution: {}",
+            style("Conflict").red().bold(),
+            conflicts,
+            if conflicts == 1 { "file" } else { "files" },
+            resolution
+        );
+        if let Some(items) = data.get("conflicts").and_then(Value::as_array) {
+            for item in items.iter().take(MAX_DISPLAY_ITEMS) {
+                let path = string_field(item, "path").unwrap_or("unknown path");
+                let reason = string_field(item, "reason").unwrap_or("unknown reason");
+                println!("  {}: {}", path, reason);
+            }
+            let remaining = items.len().saturating_sub(MAX_DISPLAY_ITEMS);
+            if remaining > 0 {
+                println!("  {} more conflicts", remaining);
+            }
+        }
+    }
+
+    fn render_progress(&mut self, data: &Value) {
+        let snapshot = ProgressSnapshot {
+            percent: number_field(data, "percent"),
+            total: number_field(data, "total"),
+            message: string_field(data, "message").unwrap_or("").to_string(),
+        };
+        if self.last_progress.as_ref() == Some(&snapshot) {
+            return;
+        }
+        self.last_progress = Some(snapshot.clone());
+
+        let status = if snapshot.total == 0 {
+            "working".to_string()
+        } else {
+            format!(
+                "{}% ({}/{})",
+                snapshot.percent,
+                number_field(data, "processed"),
+                snapshot.total
+            )
+        };
+        if snapshot.message.is_empty() {
+            println!("{} {}", style("Progress").dim(), status);
+        } else {
+            println!(
+                "{} {} — {}",
+                style("Progress").dim(),
+                status,
+                snapshot.message
+            );
+        }
+    }
+
+    fn render_output(&mut self, data: &Value) {
+        if let Some(backup) = data.get("backup_short").and_then(Value::as_str) {
+            self.last_progress = None;
+            let message = string_field(data, "message").unwrap_or("");
+            if message.is_empty() {
+                println!("{} {}", style("Backup created").green().bold(), backup);
+            } else {
+                println!(
+                    "{} {} ({})",
+                    style("Backup created").green().bold(),
+                    backup,
+                    message
+                );
+            }
+            return;
+        }
+
+        if let Some(message) = string_field(data, "message") {
+            println!("{} {}", style("Output").dim(), message);
+        } else if let Some(items) = data.as_array() {
+            println!("{} {} entries", style("Output").dim(), items.len());
+        } else {
+            println!("{}", style("Output completed").dim());
+        }
+    }
+
+    fn render_unknown(&self, kind: &str, data: &Value) {
+        let event = string_field(data, "event");
+        let message = string_field(data, "message");
+        match (event, message) {
+            (Some(event), Some(message)) => {
+                println!("{} {}: {}", style(kind).dim(), event, message);
+            }
+            (Some(event), None) => println!("{} {}", style(kind).dim(), event),
+            (None, Some(message)) => println!("{} {}", style(kind).dim(), message),
+            (None, None) => println!("{} event", style(kind).dim()),
+        }
+    }
+}
+
+fn render_message<T: Display>(label: &str, data: &Value, styled_label: T) {
+    let message = string_field(data, "message").unwrap_or(label);
+    println!("{} {}", styled_label, message);
+}
+
+fn string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
+    value.get(field).and_then(Value::as_str)
+}
+
+fn string_array(value: &Value, field: &str) -> Option<Vec<String>> {
+    value.get(field)?.as_array().map(|items| {
+        items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect()
+    })
+}
+
+fn number_field(value: &Value, field: &str) -> u64 {
+    value.get(field).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn group_count(value: &Value, field: &str) -> u64 {
+    value
+        .get(field)
+        .map(|group| number_field(group, "count"))
+        .unwrap_or(0)
+}
+
+fn format_file_count(count: u64) -> String {
+    format!("{} {}", count, if count == 1 { "file" } else { "files" })
+}
+
+fn format_limited_items(items: &[String]) -> String {
+    let selected = items
+        .iter()
+        .take(MAX_DISPLAY_ITEMS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let remaining = items.len().saturating_sub(selected.len());
+
+    if remaining == 0 {
+        selected.join(", ")
+    } else {
+        format!("{} (+{} more)", selected.join(", "), remaining)
+    }
+}
+
+fn format_duration(milliseconds: u64) -> String {
+    if milliseconds % 1_000 == 0 {
+        format!("{}s", milliseconds / 1_000)
+    } else {
+        format!("{}ms", milliseconds)
+    }
 }
 
 impl LogFollower {
