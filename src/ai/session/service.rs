@@ -261,6 +261,21 @@ impl SessionService {
         expected_revision: u64,
         error_code: impl Into<String>,
     ) -> Result<AgentSession, SessionError> {
+        self.fail_with_reason(
+            session_id,
+            expected_revision,
+            error_code,
+            StopReason::InternalError,
+        )
+    }
+
+    pub(crate) fn fail_with_reason(
+        &self,
+        session_id: impl AsRef<str>,
+        expected_revision: u64,
+        error_code: impl Into<String>,
+        reason: StopReason,
+    ) -> Result<AgentSession, SessionError> {
         let error_code = super::attempt::sanitize_safe_error_code(&error_code.into());
         self.mutate(session_id, expected_revision, |session| {
             if session.is_terminal() {
@@ -268,7 +283,7 @@ impl SessionService {
             }
             transition_status(session, AgentSessionStatus::Failed)?;
             interrupt_in_flight(session)?;
-            session.stop_reason = Some(StopReason::InternalError);
+            session.stop_reason = Some(reason);
             session.record_trace(
                 TraceEventKind::SessionFailed,
                 format!("agent session failed ({error_code})"),
@@ -313,36 +328,61 @@ impl SessionService {
         expected_revision: u64,
         cost: BudgetCost,
     ) -> Result<(AgentSession, BudgetSnapshot), SessionError> {
-        let result = self.mutate(session_id.as_ref(), expected_revision, |session| {
-            require_running(session)?;
-            let snapshot = session.budget.checked_consume(cost)?;
-            session.record_trace(
-                TraceEventKind::BudgetConsumed,
-                "session budget consumed",
-                None,
-                Vec::new(),
-                Vec::new(),
-                Some(TraceProgress {
-                    completed: snapshot.consumed.model_calls,
-                    total: snapshot
-                        .consumed
-                        .model_calls
-                        .saturating_add(snapshot.remaining.model_calls),
-                    signal: Some("budget_charge".to_string()),
-                }),
-                false,
-            )?;
-            Ok(())
-        });
+        self.consume_budget_with_recovery(session_id, expected_revision, cost, true)
+    }
+
+    pub(crate) fn consume_budget_preserving_in_flight(
+        &self,
+        session_id: impl AsRef<str>,
+        expected_revision: u64,
+        cost: BudgetCost,
+    ) -> Result<(AgentSession, BudgetSnapshot), SessionError> {
+        self.consume_budget_with_recovery(session_id, expected_revision, cost, false)
+    }
+
+    fn consume_budget_with_recovery(
+        &self,
+        session_id: impl AsRef<str>,
+        expected_revision: u64,
+        cost: BudgetCost,
+        recover_running_attempts: bool,
+    ) -> Result<(AgentSession, BudgetSnapshot), SessionError> {
+        let session_id = session_id.as_ref().to_string();
+        let result = self.mutate_with_recovery(
+            &session_id,
+            expected_revision,
+            recover_running_attempts,
+            |session| {
+                require_running(session)?;
+                let snapshot = session.budget.checked_consume(cost)?;
+                session.record_trace(
+                    TraceEventKind::BudgetConsumed,
+                    "session budget consumed",
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    Some(TraceProgress {
+                        completed: snapshot.consumed.model_calls,
+                        total: snapshot
+                            .consumed
+                            .model_calls
+                            .saturating_add(snapshot.remaining.model_calls),
+                        signal: Some("budget_charge".to_string()),
+                    }),
+                    false,
+                )?;
+                Ok(())
+            },
+        );
         match result {
             Ok(session) => {
                 let snapshot = session.budget.snapshot()?;
                 Ok((session, snapshot))
             }
             Err(error @ SessionError::Budget(_)) => {
-                let current = self.load(session_id.as_ref())?;
+                let current = self.load(&session_id)?;
                 if !current.is_terminal() {
-                    let _ = self.mark_budget_exhausted(session_id.as_ref(), current.revision);
+                    let _ = self.mark_budget_exhausted(&session_id, current.revision);
                 }
                 Err(error)
             }
@@ -356,39 +396,73 @@ impl SessionService {
         expected_revision: u64,
         artifact_id: super::model::ArtifactId,
     ) -> Result<AgentSession, SessionError> {
+        self.append_artifact_reference_with_recovery(
+            session_id,
+            expected_revision,
+            artifact_id,
+            true,
+        )
+    }
+
+    pub(crate) fn append_artifact_reference_preserving_in_flight(
+        &self,
+        session_id: impl AsRef<str>,
+        expected_revision: u64,
+        artifact_id: super::model::ArtifactId,
+    ) -> Result<AgentSession, SessionError> {
+        self.append_artifact_reference_with_recovery(
+            session_id,
+            expected_revision,
+            artifact_id,
+            false,
+        )
+    }
+
+    fn append_artifact_reference_with_recovery(
+        &self,
+        session_id: impl AsRef<str>,
+        expected_revision: u64,
+        artifact_id: super::model::ArtifactId,
+        recover_running_attempts: bool,
+    ) -> Result<AgentSession, SessionError> {
         if self.artifacts.get(&artifact_id)?.is_none() {
             return Err(SessionError::MissingReference {
                 kind: "artifact".to_string(),
                 id: artifact_id.to_string(),
             });
         }
-        self.mutate(session_id, expected_revision, |session| {
-            require_running(session)?;
-            if session.artifact_refs.contains(&artifact_id) {
-                return Err(SessionError::DuplicateReference {
-                    kind: "artifact".to_string(),
-                    id: artifact_id.to_string(),
-                });
-            }
-            if session.artifact_refs.len() >= self.store.limits().max_references {
-                return Err(SessionError::LimitExceeded {
-                    resource: "artifact references".to_string(),
-                    limit: self.store.limits().max_references,
-                    actual: session.artifact_refs.len() + 1,
-                });
-            }
-            session.artifact_refs.push(artifact_id.clone());
-            session.record_trace(
-                TraceEventKind::ArtifactAdded,
-                "artifact reference added",
-                None,
-                vec![artifact_id],
-                Vec::new(),
-                None,
-                false,
-            )?;
-            Ok(())
-        })
+        self.mutate_with_recovery(
+            session_id,
+            expected_revision,
+            recover_running_attempts,
+            |session| {
+                require_running(session)?;
+                if session.artifact_refs.contains(&artifact_id) {
+                    return Err(SessionError::DuplicateReference {
+                        kind: "artifact".to_string(),
+                        id: artifact_id.to_string(),
+                    });
+                }
+                if session.artifact_refs.len() >= self.store.limits().max_references {
+                    return Err(SessionError::LimitExceeded {
+                        resource: "artifact references".to_string(),
+                        limit: self.store.limits().max_references,
+                        actual: session.artifact_refs.len() + 1,
+                    });
+                }
+                session.artifact_refs.push(artifact_id.clone());
+                session.record_trace(
+                    TraceEventKind::ArtifactAdded,
+                    "artifact reference added",
+                    None,
+                    vec![artifact_id],
+                    Vec::new(),
+                    None,
+                    false,
+                )?;
+                Ok(())
+            },
+        )
     }
 
     pub(crate) fn append_evidence_reference(
@@ -397,39 +471,73 @@ impl SessionService {
         expected_revision: u64,
         evidence_id: EvidenceId,
     ) -> Result<AgentSession, SessionError> {
+        self.append_evidence_reference_with_recovery(
+            session_id,
+            expected_revision,
+            evidence_id,
+            true,
+        )
+    }
+
+    pub(crate) fn append_evidence_reference_preserving_in_flight(
+        &self,
+        session_id: impl AsRef<str>,
+        expected_revision: u64,
+        evidence_id: EvidenceId,
+    ) -> Result<AgentSession, SessionError> {
+        self.append_evidence_reference_with_recovery(
+            session_id,
+            expected_revision,
+            evidence_id,
+            false,
+        )
+    }
+
+    fn append_evidence_reference_with_recovery(
+        &self,
+        session_id: impl AsRef<str>,
+        expected_revision: u64,
+        evidence_id: EvidenceId,
+        recover_running_attempts: bool,
+    ) -> Result<AgentSession, SessionError> {
         if self.evidence.get(&evidence_id)?.is_none() {
             return Err(SessionError::MissingReference {
                 kind: "evidence".to_string(),
                 id: evidence_id.to_string(),
             });
         }
-        self.mutate(session_id, expected_revision, |session| {
-            require_running(session)?;
-            if session.evidence_refs.contains(&evidence_id) {
-                return Err(SessionError::DuplicateReference {
-                    kind: "evidence".to_string(),
-                    id: evidence_id.to_string(),
-                });
-            }
-            if session.evidence_refs.len() >= self.store.limits().max_references {
-                return Err(SessionError::LimitExceeded {
-                    resource: "evidence references".to_string(),
-                    limit: self.store.limits().max_references,
-                    actual: session.evidence_refs.len() + 1,
-                });
-            }
-            session.evidence_refs.push(evidence_id.clone());
-            session.record_trace(
-                TraceEventKind::EvidenceAdded,
-                "evidence reference added",
-                None,
-                Vec::new(),
-                vec![evidence_id],
-                None,
-                false,
-            )?;
-            Ok(())
-        })
+        self.mutate_with_recovery(
+            session_id,
+            expected_revision,
+            recover_running_attempts,
+            |session| {
+                require_running(session)?;
+                if session.evidence_refs.contains(&evidence_id) {
+                    return Err(SessionError::DuplicateReference {
+                        kind: "evidence".to_string(),
+                        id: evidence_id.to_string(),
+                    });
+                }
+                if session.evidence_refs.len() >= self.store.limits().max_references {
+                    return Err(SessionError::LimitExceeded {
+                        resource: "evidence references".to_string(),
+                        limit: self.store.limits().max_references,
+                        actual: session.evidence_refs.len() + 1,
+                    });
+                }
+                session.evidence_refs.push(evidence_id.clone());
+                session.record_trace(
+                    TraceEventKind::EvidenceAdded,
+                    "evidence reference added",
+                    None,
+                    Vec::new(),
+                    vec![evidence_id],
+                    None,
+                    false,
+                )?;
+                Ok(())
+            },
+        )
     }
 
     pub(crate) fn begin_attempt(
@@ -518,7 +626,7 @@ impl SessionService {
         evidence_refs: Vec<EvidenceId>,
         safe_error_code: Option<String>,
     ) -> Result<AgentSession, SessionError> {
-        self.mutate(session_id, expected_revision, |session| {
+        self.mutate_preserving_in_flight(session_id, expected_revision, |session| {
             {
                 let Some(attempt) = session
                     .attempts
@@ -567,12 +675,12 @@ impl SessionService {
     ) -> Result<(AgentSession, ArtifactRecord), SessionError> {
         let artifact = self.artifacts.put_json(header, payload)?;
         let bytes = artifact.header.byte_size;
-        let session = self.append_artifact_reference(
+        let session = self.append_artifact_reference_preserving_in_flight(
             session_id.as_ref(),
             expected_revision,
             artifact.header.artifact_id.clone(),
         )?;
-        let (session, _) = self.consume_budget(
+        let (session, _) = self.consume_budget_preserving_in_flight(
             session.session_id.as_str(),
             session.revision,
             BudgetCost::for_artifact(bytes),
@@ -593,12 +701,12 @@ impl SessionService {
         let artifact = self
             .artifacts
             .create(kind, phase, attempt_id, payload, options)?;
-        let session = self.append_artifact_reference(
+        let session = self.append_artifact_reference_preserving_in_flight(
             session_id,
             expected_revision,
             artifact.header.artifact_id.clone(),
         )?;
-        let (session, _) = self.consume_budget(
+        let (session, _) = self.consume_budget_preserving_in_flight(
             session.session_id.as_str(),
             session.revision,
             BudgetCost::for_artifact(artifact.header.byte_size),
@@ -616,12 +724,12 @@ impl SessionService {
         let bytes = serde_json::to_vec(&evidence)
             .map_err(|_| SessionError::serialization("encode evidence charge"))?
             .len() as u64;
-        let session = self.append_evidence_reference(
+        let session = self.append_evidence_reference_preserving_in_flight(
             session_id.as_ref(),
             expected_revision,
             evidence.evidence_id.clone(),
         )?;
-        let (session, _) = self.consume_budget(
+        let (session, _) = self.consume_budget_preserving_in_flight(
             session.session_id.as_str(),
             session.revision,
             BudgetCost::for_evidence(bytes),
@@ -660,9 +768,38 @@ impl SessionService {
     where
         F: FnOnce(&mut AgentSession) -> Result<(), SessionError>,
     {
-        let updated = self
-            .store
-            .mutate_blocking(session_id, expected_revision, mutation)?;
+        self.mutate_with_recovery(session_id, expected_revision, true, mutation)
+    }
+
+    fn mutate_preserving_in_flight<F>(
+        &self,
+        session_id: impl AsRef<str>,
+        expected_revision: u64,
+        mutation: F,
+    ) -> Result<AgentSession, SessionError>
+    where
+        F: FnOnce(&mut AgentSession) -> Result<(), SessionError>,
+    {
+        self.mutate_with_recovery(session_id, expected_revision, false, mutation)
+    }
+
+    fn mutate_with_recovery<F>(
+        &self,
+        session_id: impl AsRef<str>,
+        expected_revision: u64,
+        recover_running_attempts: bool,
+        mutation: F,
+    ) -> Result<AgentSession, SessionError>
+    where
+        F: FnOnce(&mut AgentSession) -> Result<(), SessionError>,
+    {
+        let updated = if recover_running_attempts {
+            self.store
+                .mutate_blocking(session_id, expected_revision, mutation)?
+        } else {
+            self.store
+                .mutate_preserving_in_flight(session_id, expected_revision, mutation)?
+        };
         self.emit_last_event(&updated);
         Ok(updated)
     }

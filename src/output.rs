@@ -220,6 +220,17 @@ pub(crate) fn emit_agent_trace_event(event: &crate::ai::session::TraceEvent) {
     }
 }
 
+/// Render the deterministic orchestrator event without creating a second
+/// frontend-specific event model. JSON receives the complete bounded event;
+/// interactive mode receives the same event's safe human summary.
+pub(crate) fn emit_orchestrator_event(event: &crate::ai::orchestrator::OrchestratorEvent) {
+    if is_json_mode() {
+        emit_named_event("agent_orchestrator", event);
+    } else {
+        eprintln!("{}", event.interactive_summary());
+    }
+}
+
 pub fn emit_help(text: String) {
     let payload = TextData { text };
     emit_event("help", &payload, false);

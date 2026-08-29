@@ -154,6 +154,22 @@ impl SessionStore {
         self.mutate_blocking(session_id, expected_revision, mutation)
     }
 
+    /// Apply a mutation while preserving an attempt that this process has
+    /// deliberately started. Normal mutations recover running attempts at
+    /// the process boundary; finishing that attempt must use this explicit
+    /// path or it would be mistaken for a crash between every two calls.
+    pub(crate) fn mutate_preserving_in_flight<F>(
+        &self,
+        session_id: impl AsRef<str>,
+        expected_revision: u64,
+        mutation: F,
+    ) -> Result<AgentSession, SessionError>
+    where
+        F: FnOnce(&mut AgentSession) -> Result<(), SessionError>,
+    {
+        self.mutate_blocking_internal(session_id, expected_revision, mutation, false)
+    }
+
     pub(crate) fn create_blocking(
         &self,
         session: &AgentSession,
@@ -212,12 +228,28 @@ impl SessionStore {
     where
         F: FnOnce(&mut AgentSession) -> Result<(), SessionError>,
     {
+        self.mutate_blocking_internal(session_id, expected_revision, mutation, true)
+    }
+
+    fn mutate_blocking_internal<F>(
+        &self,
+        session_id: impl AsRef<str>,
+        expected_revision: u64,
+        mutation: F,
+        recover_running_attempts: bool,
+    ) -> Result<AgentSession, SessionError>
+    where
+        F: FnOnce(&mut AgentSession) -> Result<(), SessionError>,
+    {
         let session_id = session_id.as_ref().to_string();
         let path = self.paths.session_path(&session_id)?;
         let lock_path = self.paths.session_lock_path(&session_id)?;
         let _lock = SessionLock::acquire(&lock_path, "agent session", self.lock_timeout)?;
         let mut session = self.read_document(&path, &session_id)?;
-        let recovered = recover_in_flight(&mut session, self.limits)?;
+        let recovered = recover_running_attempts
+            .then(|| recover_in_flight(&mut session, self.limits))
+            .transpose()?
+            .unwrap_or(false);
         if session.revision != expected_revision {
             if recovered {
                 self.persist_document(&path, &session)?;
