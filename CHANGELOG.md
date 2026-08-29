@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.43](https://github.com/Theryston/gib/compare/v0.0.42...v0.0.43) - 2026-08-29
+
+### Added
+
+- show loading spinner on backup start in interactive mode
+- refine progress bar lifecycle in backup and restore commands
+
 ## [0.0.42](https://github.com/Theryston/gib/compare/v0.0.41...v0.0.42) - 2026-08-28
 
 ### Added
