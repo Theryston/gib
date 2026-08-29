@@ -1,5 +1,6 @@
 pub(crate) mod ai;
 pub(crate) mod ai_conversation;
+pub(crate) mod ai_interactive;
 mod autostart;
 pub(crate) mod backup;
 mod config;

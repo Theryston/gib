@@ -111,3 +111,110 @@ https://public.trygib.org/ai/models/Qwen3.5-4B-Q8_0.gguf
 The raw artifact is not considered installed until its sidecar metadata and
 size check also pass. Model installation intentionally does not hash the
 multi-gigabyte artifact during startup.
+
+## Interactive terminal frontend
+
+The interactive form uses a full-screen alternate terminal with an explicit
+conversation viewport, a multiline composer, streaming assistant output, and a
+status footer. It consumes the same `AiTurnService` events as JSON mode; the
+frontend does not create a second persistence or generation path.
+
+```text
+gib ai
+```
+
+Input behavior:
+
+- `Enter` submits a non-empty message.
+- `Ctrl+J` inserts a newline without submitting, so multiline input works in
+  terminals that do not provide a portable `Shift+Enter` sequence.
+- Multiline terminal paste preserves newlines while ignoring carriage returns
+  and other control characters.
+- Arrow keys, `Home`, `End`, `Backspace`, and `Delete` edit the composer.
+- `Up` and `Down` navigate the local input history when the composer is empty;
+  otherwise they move the cursor between multiline rows.
+- `PageUp` and `PageDown` scroll the transcript. New output follows the newest
+  content again after scrolling back to the bottom.
+- `Ctrl+C` cancels an active generation. When idle it clears a non-empty draft;
+  with an empty draft it exits the frontend.
+- `Ctrl+D` deletes the character under the cursor when a draft exists and exits
+  only when the composer is empty and no confirmation is pending.
+- Typing `/` opens a local command palette. The list is filtered as the command
+  prefix grows; `↑`/`↓` changes the highlighted option and `Tab` inserts the
+  selected command. `Enter` runs a complete command, or completes an incomplete
+  command first.
+
+The header identifies the conversation and model. The status footer shows the
+generation/cancellation state, token usage when available, viewport-following
+state, and the available slash-command hint. Long messages, code, paths, and
+very narrow terminals are wrapped to the current viewport width. Visible text
+is sanitized before rendering, and hidden model reasoning is never displayed.
+
+Slash commands are handled locally and do not consume a model turn:
+
+```text
+/help
+/new [title]
+/list
+/select <id>
+/switch <id>
+/rename <id> <title>
+/clear
+/status
+/exit
+```
+
+`/new` and `/select` update the global active conversation through
+`ConversationService`, matching the conversation-management command. The
+`--conversation <ID>` option remains an invocation-scoped override when the
+interactive command is started and does not itself change global state.
+
+The frontend enters raw mode only after model preparation succeeds and restores
+raw mode, the alternate screen, and cursor visibility through a terminal guard
+on normal exit and errors. If standard input/output/error are not TTYs,
+interactive mode refuses to enter raw mode and asks the caller to use a JSON
+message invocation instead. JSON mode never initializes this frontend, emits
+terminal escape sequences, or waits for interactive confirmation.
+
+## Manual verification matrix
+
+Use a built binary and an installed local model for the interactive checks:
+
+```bash
+cargo build
+./target/debug/gib ai
+```
+
+On Linux, macOS, and Windows terminals, verify the following sequence:
+
+1. The alternate screen opens with a header, prompt, status indicator, and
+   slash-command hint.
+2. Send a normal message and confirm that assistant text appears incrementally
+   without duplicated final output.
+3. Press `Ctrl+J` between two lines, then `Enter`, and confirm the complete
+   multiline message is one persisted user message.
+4. Use `PageUp`/`PageDown`, resize the terminal, and confirm the draft and
+   transcript remain intact.
+5. During generation press `Ctrl+C`; confirm cancellation returns to a usable
+   prompt. Press `Ctrl+C` with a draft to clear it, then with an empty draft to
+   exit.
+6. Re-enter with `gib ai` and verify the conversation remains available. Try
+   `/help`, `/status`, `/list`, `/new Manual test`, `/rename <id> Renamed`,
+   `/select <id>`, `/clear`, and `/exit`.
+7. After every exit path, type a shell command and confirm the cursor is
+   visible, the shell is not in raw mode, and the alternate screen was left.
+
+For redirected or dumb terminals, verify that the command exits with a clear
+non-interactive error rather than enabling raw mode:
+
+```bash
+printf '' | ./target/debug/gib ai
+```
+
+Finally, verify that JSON mode never opens the full-screen frontend or emits
+ANSI sequences:
+
+```bash
+./target/debug/gib --mode json ai conversation list
+./target/debug/gib --mode json ai --message "hello"
+```

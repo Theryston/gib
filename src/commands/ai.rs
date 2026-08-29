@@ -13,7 +13,6 @@ use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncBufReadExt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AiCommandRequest {
@@ -146,7 +145,7 @@ pub async fn ai(matches: &ArgMatches) {
     let result = if let Some(message) = request.message {
         run_single_turn(&service, request.conversation_id, message, is_json_mode()).await
     } else {
-        run_interactive_loop(&service, request.conversation_id).await
+        run_interactive_loop(&service, request.conversation_id, model_id.clone()).await
     };
 
     let _ = backend.unload_model(Some(&model_id)).await;
@@ -310,71 +309,25 @@ async fn run_turn_with_sink(
         .map_err(Into::into)
 }
 
+pub(crate) async fn run_turn_for_interactive(
+    service: &AiTurnService,
+    conversation_id: Option<String>,
+    message: String,
+    cancellation: AiCancellation,
+    sink: Option<AiTurnEventSink>,
+) -> Result<crate::ai::AiTurnResponse, AiTurnError> {
+    let request = AiTurnRequest::new(conversation_id, message)?;
+    service.run_turn(request, cancellation, sink).await
+}
+
 async fn run_interactive_loop(
     service: &AiTurnService,
     conversation_id: Option<String>,
+    model_id: String,
 ) -> Result<(), AiCommandError> {
-    println!("GIB AI — type Ctrl+D to exit.");
-    let stdin = tokio::io::stdin();
-    let mut reader = tokio::io::BufReader::new(stdin);
-
-    loop {
-        print!("you> ");
-        io::stdout()
-            .flush()
-            .map_err(|error| AiCommandError::Input(format!("failed to flush terminal: {error}")))?;
-
-        let mut line = String::new();
-        let bytes_read = tokio::select! {
-            result = reader.read_line(&mut line) => result.map_err(|error| {
-                AiCommandError::Input(format!("failed to read terminal input: {error}"))
-            })?,
-            result = tokio::signal::ctrl_c() => {
-                result.map_err(|error| {
-                    AiCommandError::Input(format!("failed to listen for Ctrl+C: {error}"))
-                })?;
-                println!();
-                break;
-            }
-        };
-        if bytes_read == 0 {
-            println!();
-            break;
-        }
-
-        let message = line.trim_end_matches(['\r', '\n']).to_string();
-        if message.trim().is_empty() {
-            continue;
-        }
-
-        let cancellation = AiCancellation::new();
-        let signal_cancellation = cancellation.clone();
-        let signal_task = tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                signal_cancellation.cancel();
-            }
-        });
-        let result = run_turn_with_sink(
-            service,
-            conversation_id.clone(),
-            message,
-            cancellation,
-            Some(interactive_event_sink()),
-        )
-        .await;
-        signal_task.abort();
-
-        if let Err(error) = result {
-            if let AiCommandError::Turn(turn_error) = &error
-                && turn_error.is_cancelled()
-            {
-                eprintln!("Turn cancelled; the interrupted turn was saved.");
-            } else {
-                eprintln!("AI turn failed: {error}");
-            }
-        }
-    }
-    Ok(())
+    super::ai_interactive::run(service, conversation_id, model_id)
+        .await
+        .map_err(AiCommandError::Input)
 }
 
 fn json_event_sink() -> AiTurnEventSink {
