@@ -209,6 +209,17 @@ pub fn emit_named_event<T: Serialize>(kind: &'static str, data: &T) {
     emit_event(kind, data, false);
 }
 
+/// Render one bounded agent-session trace event through the same output
+/// boundary used by the rest of the CLI. Stores and services never print
+/// directly, which keeps interactive and JSON consumers in parity.
+pub(crate) fn emit_agent_trace_event(event: &crate::ai::session::TraceEvent) {
+    if is_json_mode() {
+        emit_named_event("agent_trace", event);
+    } else {
+        eprintln!("{}", event.interactive_summary());
+    }
+}
+
 pub fn emit_help(text: String) {
     let payload = TextData { text };
     emit_event("help", &payload, false);
