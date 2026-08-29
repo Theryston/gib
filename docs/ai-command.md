@@ -45,6 +45,8 @@ The model installer may emit `ai_model_install` events while the verified local
 model is being prepared. These are structured progress records and never
 contain a spinner, ANSI escape sequence, native llama.cpp log, or human-only
 text.
+The command also emits `ai_model_load` events while llama.cpp maps and loads
+the verified GGUF into memory.
 
 The turn service emits lifecycle records as `ai_turn` events. A successful
 turn has one `started` event, zero or more `progress` and `delta` events, and
@@ -99,7 +101,7 @@ or structured-output requirement. Those capabilities belong to later tasks.
 The first command invocation calls the Task 01 model manager. If the active
 model is not installed and verified, it downloads the built-in Qwen3.5 model
 from the GIB bucket, resumes a valid partial download, verifies the registered
-size and SHA-256, and publishes it atomically before llama.cpp loads it. The
+size, and publishes it atomically before llama.cpp loads it. The
 built-in manifest is:
 
 ```text
@@ -107,4 +109,5 @@ https://public.trygib.org/ai/models/Qwen3.5-4B-Q8_0.gguf
 ```
 
 The raw artifact is not considered installed until its sidecar metadata and
-integrity checks also pass.
+size check also pass. Model installation intentionally does not hash the
+multi-gigabyte artifact during startup.

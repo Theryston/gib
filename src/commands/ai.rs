@@ -8,9 +8,11 @@ use crate::ai::{
 use crate::output::{emit_error, emit_named_event, is_json_mode};
 use crate::utils::handle_error;
 use clap::ArgMatches;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,7 +164,40 @@ async fn build_turn_service(
     }
     let model_id = installed.manifest.id.clone();
     let backend = AiBackendFactory::new(model_manager).build()?;
-    backend.load_model(&model_id).await?;
+    let load_progress = start_model_load_progress(&model_id);
+    let load_result = backend.load_model(&model_id).await;
+    match &load_result {
+        Ok(_) => {
+            load_progress.finish_with_message("The AI model is loaded and ready");
+            if is_json_mode() {
+                emit_named_event(
+                    "ai_model_load",
+                    &serde_json::json!({
+                        "model_id": model_id.as_str(),
+                        "phase": "loading",
+                        "status": "complete",
+                        "message": "The AI model is loaded and ready"
+                    }),
+                );
+            }
+        }
+        Err(error) => {
+            let message = format!("Failed to load the AI model: {error}");
+            load_progress.abandon_with_message(message.clone());
+            if is_json_mode() {
+                emit_named_event(
+                    "ai_model_load",
+                    &serde_json::json!({
+                        "model_id": model_id.as_str(),
+                        "phase": "loading",
+                        "status": "failed",
+                        "message": message
+                    }),
+                );
+            }
+        }
+    }
+    load_result?;
     if cancellation.is_cancelled() {
         let _ = backend.unload_model(Some(&model_id)).await;
         return Err(ModelError::DownloadCancelled.into());
@@ -174,6 +209,31 @@ async fn build_turn_service(
         AiPromptPolicy::default(),
     );
     Ok((service, backend, model_id))
+}
+
+fn start_model_load_progress(model_id: &str) -> ProgressBar {
+    let message = format!("Loading AI model '{model_id}' into memory (this may take a while)");
+    if is_json_mode() {
+        emit_named_event(
+            "ai_model_load",
+            &serde_json::json!({
+                "model_id": model_id,
+                "phase": "loading",
+                "status": "started",
+                "message": message
+            }),
+        );
+        return ProgressBar::hidden();
+    }
+
+    let progress = ProgressBar::new_spinner();
+    progress.enable_steady_tick(Duration::from_millis(100));
+    progress.set_style(
+        ProgressStyle::with_template("{spinner:.green} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    progress.set_message(message);
+    progress
 }
 
 async fn run_single_turn(
@@ -337,7 +397,6 @@ fn model_error_code(error: &ModelError) -> &'static str {
         | ModelError::DownloadInterrupted(_) => "model_download_error",
         ModelError::DownloadCancelled => "model_download_cancelled",
         ModelError::SizeMismatch { .. } => "model_size_mismatch",
-        ModelError::ChecksumMismatch { .. } => "model_checksum_mismatch",
         ModelError::NotInstalled(_) => "model_not_installed",
         ModelError::MetadataMismatch(_) => "model_metadata_error",
         ModelError::UnsafePath(_) => "unsafe_model_path",

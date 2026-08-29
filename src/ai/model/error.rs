@@ -46,10 +46,6 @@ pub(crate) enum ModelError {
         expected: u64,
         actual: u64,
     },
-    ChecksumMismatch {
-        expected: String,
-        actual: String,
-    },
     NotInstalled(String),
     MetadataMismatch(String),
     UnsafePath(PathBuf),
@@ -154,11 +150,6 @@ impl fmt::Display for ModelError {
             Self::SizeMismatch { expected, actual } => write!(
                 formatter,
                 "AI model size mismatch: expected {} bytes, received {} bytes",
-                expected, actual
-            ),
-            Self::ChecksumMismatch { expected, actual } => write!(
-                formatter,
-                "AI model SHA-256 mismatch: expected {}, received {}",
                 expected, actual
             ),
             Self::NotInstalled(id) => write!(formatter, "AI model '{}' is not installed", id),

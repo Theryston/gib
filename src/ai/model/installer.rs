@@ -3,7 +3,7 @@ use super::error::ModelError;
 use super::lock::{FileLock, ModelInstallCancellation};
 use super::paths::ModelPaths;
 use super::registry::{MODEL_MANIFEST_SCHEMA_VERSION, ModelManifest, ModelRegistry};
-use super::storage::{hash_file, now_unix_seconds, quarantine, write_atomic};
+use super::storage::{now_unix_seconds, quarantine, write_atomic};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -11,9 +11,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -73,7 +72,10 @@ pub(crate) struct InstallationMetadata {
     pub(crate) artifact_path: String,
     pub(crate) installed_at: u64,
     pub(crate) verified_size: u64,
-    pub(crate) verified_sha256: String,
+    // Kept only to read metadata written by older versions; new installations
+    // do not calculate, populate, or validate a model digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verified_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -83,7 +85,6 @@ pub(crate) struct InstalledModel {
     pub(crate) metadata_path: PathBuf,
     pub(crate) installed_at: u64,
     pub(crate) verified_size: u64,
-    pub(crate) verified_sha256: String,
 }
 
 type DownloadStream = Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>;
@@ -157,28 +158,25 @@ struct PartialDownloadState {
     manifest_version: String,
     download_url: String,
     expected_size: u64,
-    sha256: String,
 }
 
 impl PartialDownloadState {
-    fn from_manifest(manifest: &ModelManifest, expected_size: u64, sha256: &str) -> Self {
+    fn from_manifest(manifest: &ModelManifest, expected_size: u64) -> Self {
         Self {
             schema_version: PARTIAL_STATE_VERSION,
             model_id: manifest.id.clone(),
             manifest_version: manifest.version.clone(),
             download_url: manifest.download_url.clone(),
             expected_size,
-            sha256: sha256.to_ascii_lowercase(),
         }
     }
 
-    fn matches(&self, manifest: &ModelManifest, expected_size: u64, sha256: &str) -> bool {
+    fn matches(&self, manifest: &ModelManifest, expected_size: u64) -> bool {
         self.schema_version == PARTIAL_STATE_VERSION
             && self.model_id == manifest.id
             && self.manifest_version == manifest.version
             && self.download_url == manifest.download_url
             && self.expected_size == expected_size
-            && digests_equal(&self.sha256, sha256)
     }
 }
 
@@ -256,7 +254,7 @@ impl ModelManager {
     pub(crate) fn verify_installed(&self, model_id: &str) -> Result<InstalledModel, ModelError> {
         let manifest = self.registry.get(model_id)?;
         manifest.validate()?;
-        manifest.require_integrity()?;
+        manifest.require_size()?;
         let artifact_path = self.paths.artifact_path(manifest)?;
         let metadata_path = self.paths.metadata_path(manifest)?;
         self.verify_manifest_files(manifest, &artifact_path, &metadata_path)
@@ -266,7 +264,7 @@ impl ModelManager {
         self.paths.ensure_root()?;
         let mut installed = Vec::new();
         for manifest in self.registry.iter() {
-            if manifest.require_integrity().is_err() {
+            if manifest.require_size().is_err() {
                 continue;
             }
             match self.verify_installed(&manifest.id) {
@@ -275,7 +273,6 @@ impl ModelManager {
                     ModelError::NotInstalled(_)
                     | ModelError::MetadataMismatch(_)
                     | ModelError::Serialization { .. }
-                    | ModelError::ChecksumMismatch { .. }
                     | ModelError::SizeMismatch { .. },
                 ) => {}
                 Err(error) => return Err(error),
@@ -376,7 +373,7 @@ impl ModelManager {
             return Err(ModelError::DownloadCancelled);
         }
         manifest.validate()?;
-        let (expected_size, expected_sha256) = manifest.require_integrity()?;
+        let expected_size = manifest.require_size()?;
         let lock_path = self.paths.model_lock_path(&manifest.id)?;
         let lock = FileLock::acquire_with_cancellation(
             &lock_path,
@@ -414,7 +411,7 @@ impl ModelManager {
                 0,
                 Some(expected_size),
                 false,
-                "Checking the local model artifact",
+                "Checking the local model artifact size (this may take a while)",
                 None,
             ),
         );
@@ -438,7 +435,6 @@ impl ModelManager {
                 ModelError::NotInstalled(_)
                 | ModelError::MetadataMismatch(_)
                 | ModelError::Serialization { .. }
-                | ModelError::ChecksumMismatch { .. }
                 | ModelError::SizeMismatch { .. },
             ) => {
                 quarantine_if_present(&artifact_path, "invalid-artifact")?;
@@ -452,7 +448,6 @@ impl ModelManager {
         let _ = self.prepare_partial_state(
             manifest,
             expected_size,
-            expected_sha256,
             &partial_path,
             &partial_state_path,
         )?;
@@ -464,7 +459,6 @@ impl ModelManager {
                 let _ = self.prepare_partial_state(
                     manifest,
                     expected_size,
-                    expected_sha256,
                     &partial_path,
                     &partial_state_path,
                 )?;
@@ -473,49 +467,39 @@ impl ModelManager {
             }
 
             if partial_size == expected_size {
-                let (actual_size, actual_sha256) = hash_file(&partial_path)?;
-                if actual_size == expected_size && digests_equal(&actual_sha256, expected_sha256) {
-                    emit_event(
-                        &progress,
-                        ModelInstallEvent::new(
-                            manifest,
-                            ModelInstallPhase::Verifying,
-                            actual_size,
-                            Some(expected_size),
-                            true,
-                            "The completed partial artifact passed verification",
-                            None,
-                        ),
-                    );
-                    return self.publish_verified(
-                        manifest,
-                        &partial_path,
-                        &partial_state_path,
-                        &artifact_path,
-                        &metadata_path,
-                        actual_size,
-                        &actual_sha256,
-                        progress,
-                        true,
-                    );
+                let actual_size = file_size_if_present(&partial_path)?;
+                if actual_size != expected_size {
+                    partial_size = actual_size;
+                    continue;
                 }
-                quarantine_if_present(&partial_path, "checksum-mismatch")?;
-                quarantine_if_present(&partial_state_path, "checksum-mismatch-state")?;
-                let _ = self.prepare_partial_state(
+                emit_event(
+                    &progress,
+                    ModelInstallEvent::new(
+                        manifest,
+                        ModelInstallPhase::Verifying,
+                        actual_size,
+                        Some(expected_size),
+                        true,
+                        "The completed partial artifact has the expected size",
+                        None,
+                    ),
+                );
+                return self.publish_verified(
                     manifest,
-                    expected_size,
-                    expected_sha256,
                     &partial_path,
                     &partial_state_path,
-                )?;
-                partial_size = 0;
-                continue;
+                    &artifact_path,
+                    &metadata_path,
+                    actual_size,
+                    progress,
+                    true,
+                );
             }
 
             break;
         }
 
-        let (mut hasher, mut received) = seed_hasher(&partial_path)?;
+        let mut received = file_size_if_present(&partial_path)?;
         emit_event(
             &progress,
             ModelInstallEvent::new(
@@ -602,7 +586,6 @@ impl ModelManager {
         let append = response_mode == ResponseMode::Append;
         if !append {
             received = 0;
-            hasher = Sha256::new();
         }
         let mut file = open_partial(&partial_path, append)?;
         protect_file(&partial_path)?;
@@ -687,7 +670,6 @@ impl ModelManager {
 
             file.write_all(&chunk)
                 .map_err(|error| ModelError::io("write partial model", &partial_path, error))?;
-            hasher.update(&chunk);
             received += chunk_len;
             emit_event(
                 &progress,
@@ -708,13 +690,14 @@ impl ModelManager {
         file.sync_all()
             .map_err(|error| ModelError::io("sync partial model", &partial_path, error))?;
 
-        if received != expected_size {
+        let actual_size = file_size_if_present(&partial_path)?;
+        if actual_size != expected_size {
             emit_event(
                 &progress,
                 ModelInstallEvent::new(
                     manifest,
                     ModelInstallPhase::Failed,
-                    received,
+                    actual_size,
                     Some(expected_size),
                     true,
                     "The download ended before the manifest size was reached",
@@ -723,52 +706,31 @@ impl ModelManager {
             );
             return Err(ModelError::SizeMismatch {
                 expected: expected_size,
-                actual: received,
+                actual: actual_size,
             });
         }
 
-        let actual_sha256 = format!("{:x}", hasher.finalize());
         emit_event(
             &progress,
             ModelInstallEvent::new(
                 manifest,
                 ModelInstallPhase::Verifying,
-                received,
+                actual_size,
                 Some(expected_size),
                 true,
-                "Verifying the model SHA-256",
+                "Verifying the downloaded model size",
                 None,
             ),
         );
-        if !digests_equal(&actual_sha256, expected_sha256) {
-            emit_event(
-                &progress,
-                ModelInstallEvent::new(
-                    manifest,
-                    ModelInstallPhase::Failed,
-                    received,
-                    Some(expected_size),
-                    true,
-                    "The model SHA-256 did not match the manifest",
-                    Some(ModelInstallStatus::Failed),
-                ),
-            );
-            return Err(ModelError::ChecksumMismatch {
-                expected: expected_sha256.to_ascii_lowercase(),
-                actual: actual_sha256,
-            });
-        }
-
         self.publish_verified(
             manifest,
             &partial_path,
             &partial_state_path,
             &artifact_path,
             &metadata_path,
-            received,
-            &actual_sha256,
+            actual_size,
             progress,
-            append && received > 0,
+            append && actual_size > 0,
         )
     }
 
@@ -776,13 +738,12 @@ impl ModelManager {
         &self,
         manifest: &ModelManifest,
         expected_size: u64,
-        expected_sha256: &str,
         partial_path: &Path,
         state_path: &Path,
     ) -> Result<PartialDownloadState, ModelError> {
         let state = match fs::read(state_path) {
             Ok(bytes) => match serde_json::from_slice::<PartialDownloadState>(&bytes) {
-                Ok(state) if state.matches(manifest, expected_size, expected_sha256) => Some(state),
+                Ok(state) if state.matches(manifest, expected_size) => Some(state),
                 Ok(_) | Err(_) => {
                     quarantine_if_present(partial_path, "stale-partial")?;
                     quarantine_if_present(state_path, "stale-partial-state")?;
@@ -798,9 +759,8 @@ impl ModelManager {
             Err(error) => return Err(ModelError::io("read partial state", state_path, error)),
         };
 
-        let state = state.unwrap_or_else(|| {
-            PartialDownloadState::from_manifest(manifest, expected_size, expected_sha256)
-        });
+        let state =
+            state.unwrap_or_else(|| PartialDownloadState::from_manifest(manifest, expected_size));
         if !path_is_present(state_path)? {
             let encoded = serde_json::to_vec_pretty(&state)
                 .map_err(|error| ModelError::serialization("partial download state", error))?;
@@ -848,25 +808,17 @@ impl ModelManager {
                 "the sidecar artifact path does not match the registered model path".to_string(),
             ));
         }
-        let (expected_size, expected_sha256) = manifest.require_integrity()?;
-        if metadata.verified_size != expected_size
-            || !digests_equal(&metadata.verified_sha256, expected_sha256)
-        {
+        let expected_size = manifest.require_size()?;
+        if metadata.verified_size != expected_size {
             return Err(ModelError::MetadataMismatch(
-                "the sidecar verification values do not match the manifest".to_string(),
+                "the sidecar verified size does not match the manifest".to_string(),
             ));
         }
-        let (actual_size, actual_sha256) = hash_file(artifact_path)?;
+        let actual_size = file_size_if_present(artifact_path)?;
         if actual_size != expected_size {
             return Err(ModelError::SizeMismatch {
                 expected: expected_size,
                 actual: actual_size,
-            });
-        }
-        if !digests_equal(&actual_sha256, expected_sha256) {
-            return Err(ModelError::ChecksumMismatch {
-                expected: expected_sha256.to_ascii_lowercase(),
-                actual: actual_sha256,
             });
         }
         Ok(InstalledModel {
@@ -875,7 +827,6 @@ impl ModelManager {
             metadata_path: metadata_path.to_path_buf(),
             installed_at: metadata.installed_at,
             verified_size: actual_size,
-            verified_sha256: actual_sha256,
         })
     }
 
@@ -887,7 +838,6 @@ impl ModelManager {
         artifact_path: &Path,
         metadata_path: &Path,
         verified_size: u64,
-        verified_sha256: &str,
         progress: Option<ProgressCallback>,
         resumed: bool,
     ) -> Result<InstalledModel, ModelError> {
@@ -899,7 +849,7 @@ impl ModelManager {
                 verified_size,
                 Some(verified_size),
                 resumed,
-                "Publishing the verified model atomically",
+                "Publishing the model atomically",
                 None,
             ),
         );
@@ -915,7 +865,7 @@ impl ModelManager {
             artifact_path: self.paths.relative_to_models(artifact_path)?,
             installed_at: now_unix_seconds(),
             verified_size,
-            verified_sha256: verified_sha256.to_ascii_lowercase(),
+            verified_sha256: None,
         };
         let encoded = serde_json::to_vec_pretty(&metadata)
             .map_err(|error| ModelError::serialization("installed model metadata", error))?;
@@ -933,7 +883,6 @@ impl ModelManager {
             metadata_path: metadata_path.to_path_buf(),
             installed_at: metadata.installed_at,
             verified_size,
-            verified_sha256: verified_sha256.to_ascii_lowercase(),
         };
         emit_event(
             &progress,
@@ -943,7 +892,7 @@ impl ModelManager {
                 verified_size,
                 Some(verified_size),
                 resumed,
-                "The model was installed and verified",
+                "The model was installed and its expected size was verified",
                 Some(if resumed {
                     ModelInstallStatus::Resumed
                 } else {
@@ -1008,49 +957,92 @@ pub(crate) fn output_progress_sink() -> ProgressCallback {
             }
         })
     } else {
-        let progress_bar = Arc::new(Mutex::new(None::<ProgressBar>));
+        let progress = Arc::new(Mutex::new(InteractiveModelProgress::default()));
         Arc::new(move |event| {
-            if event.phase == ModelInstallPhase::Downloading {
-                let mut guard = progress_bar
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if guard.is_none() {
-                    let bar = event
-                        .total_bytes
-                        .map(ProgressBar::new)
-                        .unwrap_or_else(ProgressBar::new_spinner);
-                    let style = ProgressStyle::with_template(
-                        "{spinner:.green} {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} {percent}%",
-                    )
-                    .unwrap_or_else(|_| ProgressStyle::default_bar());
-                    bar.set_style(style);
-                    *guard = Some(bar);
-                }
-                if let Some(bar) = guard.as_ref() {
-                    bar.set_position(event.bytes_received);
-                    bar.set_message(event.message.clone());
-                }
-            } else if matches!(
-                event.phase,
-                ModelInstallPhase::Complete | ModelInstallPhase::Failed
-            ) {
-                let mut guard = progress_bar
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some(bar) = guard.take() {
-                    if event.phase == ModelInstallPhase::Complete {
-                        bar.finish_with_message(event.message);
-                    } else {
-                        bar.abandon_with_message(event.message);
+            let mut progress = progress
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match event.phase {
+                ModelInstallPhase::Downloading => {
+                    if progress.progress_bar.is_none() || !progress.downloading {
+                        if let Some(bar) = progress.progress_bar.take() {
+                            bar.finish_and_clear();
+                        }
+                        progress.progress_bar = Some(new_download_progress(event.total_bytes));
+                        progress.downloading = true;
                     }
-                } else {
-                    eprintln!("{}", event.message);
+                    if let Some(bar) = progress.progress_bar.as_ref() {
+                        bar.set_position(event.bytes_received);
+                        bar.set_message(event.message.clone());
+                    }
                 }
-            } else {
-                eprintln!("{}", event.message);
+                ModelInstallPhase::Resolving
+                | ModelInstallPhase::Checking
+                | ModelInstallPhase::Verifying
+                | ModelInstallPhase::Installing => {
+                    if progress.progress_bar.is_none() || progress.downloading {
+                        if let Some(bar) = progress.progress_bar.take() {
+                            bar.finish_and_clear();
+                        }
+                        progress.progress_bar = Some(new_spinner_progress());
+                        progress.downloading = false;
+                    }
+                    if let Some(bar) = progress.progress_bar.as_ref() {
+                        bar.set_message(event.message.clone());
+                    }
+                }
+                ModelInstallPhase::Complete | ModelInstallPhase::Failed => {
+                    progress.downloading = false;
+                    if let Some(bar) = progress.progress_bar.take() {
+                        if event.phase == ModelInstallPhase::Complete {
+                            bar.finish_with_message(event.message);
+                        } else {
+                            bar.abandon_with_message(event.message);
+                        }
+                    } else {
+                        eprintln!("{}", event.message);
+                    }
+                }
             }
         })
     }
+}
+
+#[derive(Default)]
+struct InteractiveModelProgress {
+    progress_bar: Option<ProgressBar>,
+    downloading: bool,
+}
+
+fn new_spinner_progress() -> ProgressBar {
+    let progress = ProgressBar::new_spinner();
+    progress.enable_steady_tick(Duration::from_millis(100));
+    progress.set_style(
+        ProgressStyle::with_template("{spinner:.green} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    progress
+}
+
+fn new_download_progress(total_bytes: Option<u64>) -> ProgressBar {
+    let progress = total_bytes
+        .map(ProgressBar::new)
+        .unwrap_or_else(ProgressBar::new_spinner);
+    progress.enable_steady_tick(Duration::from_millis(100));
+    if total_bytes.is_some() {
+        progress.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} {percent}%",
+            )
+            .unwrap_or_else(|_| ProgressStyle::default_bar()),
+        );
+    } else {
+        progress.set_style(
+            ProgressStyle::with_template("{spinner:.green} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+    }
+    progress
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1139,39 +1131,6 @@ fn parse_content_range(value: &str) -> Option<ContentRange> {
     })
 }
 
-fn digests_equal(left: &str, right: &str) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut difference = 0u8;
-    for (left, right) in left.bytes().zip(right.bytes()) {
-        difference |= left.to_ascii_lowercase() ^ right.to_ascii_lowercase();
-    }
-    difference == 0
-}
-
-fn seed_hasher(path: &Path) -> Result<(Sha256, u64), ModelError> {
-    if !path_is_present(path)? {
-        return Ok((Sha256::new(), 0));
-    }
-    let mut file =
-        File::open(path).map_err(|error| ModelError::io("open partial model", path, error))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    let mut size = 0u64;
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| ModelError::io("read partial model", path, error))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        size = size.saturating_add(read as u64);
-    }
-    Ok((hasher, size))
-}
-
 fn open_partial(path: &Path, append: bool) -> Result<File, ModelError> {
     let mut options = OpenOptions::new();
     options.write(true).create(true);
@@ -1242,10 +1201,6 @@ fn quarantine_if_present(path: &Path, reason: &str) -> Result<(), ModelError> {
 }
 
 fn same_manifest(left: &ModelManifest, right: &ModelManifest) -> bool {
-    let mut left = left.clone();
-    let mut right = right.clone();
-    left.sha256 = left.sha256.map(|value| value.to_ascii_lowercase());
-    right.sha256 = right.sha256.map(|value| value.to_ascii_lowercase());
     left.schema_version == right.schema_version
         && left.id == right.id
         && left.display_name == right.display_name
@@ -1262,11 +1217,6 @@ fn same_manifest(left: &ModelManifest, right: &ModelManifest) -> bool {
         && left.expected_size == right.expected_size
         && left.min_ram_bytes == right.min_ram_bytes
         && left.runtime_features == right.runtime_features
-        && match (left.sha256.as_deref(), right.sha256.as_deref()) {
-            (None, None) => true,
-            (Some(left), Some(right)) => digests_equal(left, right),
-            _ => false,
-        }
 }
 
 fn protect_file(path: &Path) -> Result<(), ModelError> {
@@ -1324,7 +1274,6 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures::stream;
-    use sha2::Digest;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
@@ -1481,7 +1430,7 @@ mod tests {
             source: "Local test server".to_string(),
             license: "Test license".to_string(),
             license_url: None,
-            sha256: Some(format!("{:x}", Sha256::digest(body))),
+            sha256: None,
             expected_size: Some(body.len() as u64),
             min_ram_bytes: None,
             runtime_features: vec!["text-generation".to_string()],
@@ -1516,10 +1465,10 @@ mod tests {
             .expect("partial path should resolve");
         std::fs::write(&partial_path, prefix).expect("partial model should be written");
         protect_file(&partial_path).expect("partial model should be protected");
-        let (expected_size, expected_sha256) = manifest
-            .require_integrity()
-            .expect("test manifest should have integrity");
-        let state = PartialDownloadState::from_manifest(manifest, expected_size, expected_sha256);
+        let expected_size = manifest
+            .require_size()
+            .expect("test manifest should have an expected size");
+        let state = PartialDownloadState::from_manifest(manifest, expected_size);
         let state_path = manager
             .paths()
             .partial_state_path(manifest)
@@ -1529,7 +1478,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_uses_the_gib_url_and_published_integrity() {
+    fn built_in_registry_uses_the_gib_url_and_published_size() {
         let registry = ModelRegistry::default();
         let manifest = registry
             .get(DEFAULT_MODEL_ID)
@@ -1541,13 +1490,7 @@ mod tests {
             Some("https://www.apache.org/licenses/LICENSE-2.0")
         );
         assert_eq!(manifest.source, "GIB public model bucket");
-        assert_eq!(
-            manifest.require_integrity().unwrap(),
-            (
-                4_482_402_656,
-                "c3fc7bcaf6f75b8f7ceeead9a769f5a7a9f86a8180af1cfb2b72958dcad8e028"
-            )
-        );
+        assert_eq!(manifest.require_size().unwrap(), 4_482_402_656);
         assert!(matches!(
             registry.get("missing-model"),
             Err(ModelError::UnknownModel(id)) if id == "missing-model"
@@ -1555,21 +1498,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_incomplete_or_invalid_manifest_integrity() {
+    fn requires_a_size_and_ignores_optional_digest_metadata() {
         let body = b"fixture";
         let mut manifest = manifest("https://example.com/model.gguf".to_string(), body);
         manifest.expected_size = None;
         assert!(matches!(
             manifest.validate(),
-            Err(ModelError::InvalidManifest(message)) if message.contains("either both")
+            Err(ModelError::InvalidManifest(message)) if message.contains("expected_size")
         ));
 
         manifest.expected_size = Some(body.len() as u64);
         manifest.sha256 = Some("not-a-sha".to_string());
-        assert!(matches!(
-            manifest.validate(),
-            Err(ModelError::InvalidManifest(message)) if message.contains("64 hexadecimal")
-        ));
+        assert!(manifest.validate().is_ok());
     }
 
     #[test]
@@ -1610,10 +1550,7 @@ mod tests {
         assert_eq!(metadata.manifest, manifest);
         assert_eq!(metadata.artifact_path, "test-model/v1/test-model.gguf");
         assert_eq!(metadata.verified_size, body.len() as u64);
-        assert!(digests_equal(
-            &metadata.verified_sha256,
-            manifest.sha256.as_deref().unwrap()
-        ));
+        assert!(metadata.verified_sha256.is_none());
         assert_eq!(
             manager
                 .verify_installed(&manifest.id)
@@ -1878,20 +1815,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_wrong_checksum_without_publishing_a_final_artifact() {
-        let body = b"checksum mismatch".to_vec();
-        let root = temporary_root("checksum");
+    async fn accepts_matching_size_without_calculating_or_checking_a_checksum() {
+        let body = b"same size, different bytes".to_vec();
+        let root = temporary_root("size-only");
         let mut manifest = manifest("https://example.com/model.gguf".to_string(), &body);
         manifest.sha256 = Some("0".repeat(64));
         let (manager, _) = manager(manifest.clone(), root.clone(), vec![full_response(&body)]);
 
-        let error = manager
+        let installed = manager
             .ensure_installed(&manifest.id, None)
             .await
-            .unwrap_err();
-        assert!(matches!(error, ModelError::ChecksumMismatch { .. }));
-        assert!(!manager.paths().artifact_path(&manifest).unwrap().exists());
-        assert!(manager.paths().partial_path(&manifest).unwrap().is_file());
+            .expect("a matching-size model should install without hashing");
+        assert_eq!(std::fs::read(&installed.artifact_path).unwrap(), body);
+        assert!(manager.verify_installed(&manifest.id).is_ok());
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2080,7 +2016,6 @@ mod tests {
             manifest_version: manifest.version.clone(),
             download_url: "https://different.example/model.gguf".to_string(),
             expected_size: body.len() as u64,
-            sha256: manifest.sha256.clone().unwrap(),
         };
         write_atomic(
             &state_path,

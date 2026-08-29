@@ -1,7 +1,6 @@
 use super::error::ModelError;
-use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,26 +43,6 @@ pub(crate) fn write_atomic(
     result
 }
 
-pub(crate) fn hash_file(path: &Path) -> Result<(u64, String), ModelError> {
-    let mut file = File::open(path).map_err(|error| ModelError::io("open file", path, error))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    let mut size = 0u64;
-
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| ModelError::io("read file", path, error))?;
-        if read == 0 {
-            break;
-        }
-        size = size.saturating_add(read as u64);
-        hasher.update(&buffer[..read]);
-    }
-
-    Ok((size, format!("{:x}", hasher.finalize())))
-}
-
 pub(crate) fn now_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -94,10 +73,6 @@ pub(crate) fn quarantine(path: &Path, reason: &str) -> Result<Option<PathBuf>, M
     fs::rename(path, &destination)
         .map_err(|error| ModelError::io("quarantine file", path, error))?;
     Ok(Some(destination))
-}
-
-pub(crate) fn validate_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn temporary_path(path: &Path) -> PathBuf {

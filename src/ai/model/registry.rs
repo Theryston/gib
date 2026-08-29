@@ -1,6 +1,5 @@
 use super::error::ModelError;
 use super::paths::validate_path_component;
-use super::storage::validate_sha256;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use url::Url;
@@ -27,6 +26,8 @@ pub(crate) struct ModelManifest {
     pub(crate) source: String,
     pub(crate) license: String,
     pub(crate) license_url: Option<String>,
+    // Retained for manifest compatibility and provenance; installation uses
+    // the expected byte size as its artifact check.
     pub(crate) sha256: Option<String>,
     pub(crate) expected_size: Option<u64>,
     pub(crate) min_ram_bytes: Option<u64>,
@@ -105,11 +106,9 @@ impl ModelManifest {
             }
         }
 
-        if let Some(sha256) = &self.sha256
-            && !validate_sha256(sha256)
-        {
+        if self.expected_size.is_none() {
             return Err(ModelError::InvalidManifest(
-                "sha256 must contain exactly 64 hexadecimal characters".to_string(),
+                "expected_size is required for model installation".to_string(),
             ));
         }
         if self.expected_size == Some(0) {
@@ -117,31 +116,19 @@ impl ModelManifest {
                 "expected_size must be greater than zero".to_string(),
             ));
         }
-        if self.sha256.is_some() != self.expected_size.is_some() {
-            return Err(ModelError::InvalidManifest(
-                "sha256 and expected_size must either both be present or both be absent"
-                    .to_string(),
-            ));
-        }
         Ok(())
     }
 
-    pub(crate) fn require_integrity(&self) -> Result<(u64, &str), ModelError> {
-        match (self.expected_size, self.sha256.as_deref()) {
-            (Some(size), Some(sha256)) => Ok((size, sha256)),
-            (size, sha256) => {
-                let mut missing = Vec::new();
-                if size.is_none() {
-                    missing.push("expected size");
-                }
-                if sha256.is_none() {
-                    missing.push("SHA-256");
-                }
-                Err(ModelError::ManifestIntegrityMissing {
-                    model_id: self.id.clone(),
-                    missing,
-                })
-            }
+    pub(crate) fn require_size(&self) -> Result<u64, ModelError> {
+        match self.expected_size {
+            Some(size) if size > 0 => Ok(size),
+            Some(_) => Err(ModelError::InvalidManifest(
+                "expected_size must be greater than zero".to_string(),
+            )),
+            None => Err(ModelError::ManifestIntegrityMissing {
+                model_id: self.id.clone(),
+                missing: vec!["expected size"],
+            }),
         }
     }
 }

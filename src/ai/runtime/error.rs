@@ -74,7 +74,6 @@ impl AiBackendError {
             },
             ModelError::NotInstalled(_)
             | ModelError::MetadataMismatch(_)
-            | ModelError::ChecksumMismatch { .. }
             | ModelError::SizeMismatch { .. } => Self::ModelNotInstalled {
                 model_id: model_id.to_string(),
             },
