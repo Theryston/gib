@@ -309,6 +309,16 @@ impl RuntimeConfig {
             gpu
         )
     }
+
+    pub(crate) fn short_notice(&self) -> Option<String> {
+        self.downgrade_reason.as_ref().map(|_| {
+            if self.profile == RuntimeProfile::LowMemory {
+                "LowMemory mode: performance may be degraded".to_string()
+            } else {
+                format!("Runtime adjusted: {} mode", self.profile.cli_name())
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -987,6 +997,10 @@ mod tests {
                 .downgrade_reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("performance may be degraded"))
+        );
+        assert_eq!(
+            config.short_notice().as_deref(),
+            Some("LowMemory mode: performance may be degraded")
         );
     }
 

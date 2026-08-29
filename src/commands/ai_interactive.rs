@@ -380,8 +380,8 @@ impl AiInteractiveApp {
 
     fn set_runtime_config(&mut self, runtime_config: &RuntimeConfig) {
         self.runtime_summary = runtime_config.summary();
-        if let Some(reason) = &runtime_config.downgrade_reason {
-            self.status_message = Some(format!("Runtime adjustment: {reason}"));
+        if let Some(notice) = runtime_config.short_notice() {
+            self.status_message = Some(notice);
         }
     }
 

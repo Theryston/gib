@@ -254,14 +254,8 @@ async fn build_turn_service(
         hardware,
     )?;
     let runtime_message = runtime_config
-        .downgrade_reason
-        .as_deref()
-        .map(|reason| {
-            format!(
-                "AI runtime resolved ({}): {reason}",
-                runtime_config.summary()
-            )
-        })
+        .short_notice()
+        .map(|notice| format!("AI runtime: {notice}"))
         .unwrap_or_else(|| format!("AI runtime resolved ({})", runtime_config.summary()));
     runtime_progress.finish_with_message(runtime_message);
     if is_json_mode() {
