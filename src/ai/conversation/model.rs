@@ -138,6 +138,7 @@ impl Conversation {
             updated_at: self.updated_at.clone(),
             revision: self.revision,
             message_count: self.messages.len(),
+            last_role: self.messages.last().map(|message| message.role),
             archived: self.archived,
         }
     }
@@ -316,6 +317,8 @@ pub(crate) struct ConversationSummary {
     pub(crate) updated_at: String,
     pub(crate) revision: u64,
     pub(crate) message_count: usize,
+    #[serde(default)]
+    pub(crate) last_role: Option<ConversationMessageRole>,
     pub(crate) archived: bool,
 }
 

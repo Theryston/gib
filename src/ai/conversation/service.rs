@@ -36,6 +36,18 @@ impl ConversationService {
         run_blocking(move || store.create_blocking(&conversation)).await
     }
 
+    /// Create a conversation and select it as the global active conversation.
+    /// This is intentionally separate from `create`: direct chat may create a
+    /// first conversation as part of resolving an absent active state, while
+    /// the explicit `conversation new` command always selects what it creates.
+    pub(crate) async fn create_and_select(
+        &self,
+        title: Option<String>,
+    ) -> Result<Conversation, ConversationError> {
+        let conversation = self.create(title).await?;
+        self.select_active(conversation.conversation_id).await
+    }
+
     pub(crate) async fn list(&self) -> Result<ConversationList, ConversationError> {
         let store = self.store.clone();
         run_blocking(move || store.list_blocking()).await
@@ -426,6 +438,25 @@ mod tests {
             .expect("active conversation should load")
             .expect("an active conversation should exist");
         assert_eq!(active.conversation_id, first.conversation_id);
+        fs::remove_dir_all(root).expect("temporary state should be removed");
+    }
+
+    #[tokio::test]
+    async fn explicit_creation_selects_only_the_new_conversation() {
+        let (service, root) = service("create-select");
+        let first = service
+            .create_and_select(Some("First".to_string()))
+            .await
+            .expect("first conversation should be created and selected");
+        let second = service
+            .create_and_select(Some("Second".to_string()))
+            .await
+            .expect("second conversation should be created and selected");
+        assert_ne!(first.conversation_id, second.conversation_id);
+        assert_eq!(
+            service.active_conversation_id().await.unwrap(),
+            Some(second.conversation_id)
+        );
         fs::remove_dir_all(root).expect("temporary state should be removed");
     }
 

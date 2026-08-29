@@ -94,6 +94,25 @@ impl From<AiTurnError> for AiCommandError {
 /// Run the initial direct-chat command. Repository-local configuration is
 /// intentionally not loaded: AI state is global under ~/.gib/ai.
 pub async fn ai(matches: &ArgMatches) {
+    match matches.subcommand() {
+        Some(("conversation", conversation_matches)) => {
+            if matches.get_one::<String>("message").is_some()
+                || matches.get_one::<String>("conversation").is_some()
+            {
+                report_failure(AiCommandError::Input(
+                    "--message and --conversation are chat options and cannot be used with 'gib ai conversation'"
+                        .to_string(),
+                ));
+            }
+            super::ai_conversation::run(conversation_matches).await;
+            return;
+        }
+        Some((operation, _)) => report_failure(AiCommandError::Input(format!(
+            "Unknown AI operation '{operation}'. Run 'gib ai --help' for more information."
+        ))),
+        None => {}
+    }
+
     let request = match parse_request(matches) {
         Ok(request) => request,
         Err(error) => report_failure(AiCommandError::Input(error)),
@@ -103,6 +122,10 @@ pub async fn ai(matches: &ArgMatches) {
         report_failure(AiCommandError::Input(
             "Interactive gib ai requires a terminal; provide --mode json --message <MESSAGE> for non-interactive use".to_string(),
         ));
+    }
+
+    if let Err(error) = validate_conversation_override(request.conversation_id.clone()).await {
+        report_failure(error);
     }
 
     let install_cancellation = ModelInstallCancellation::new();
@@ -130,6 +153,20 @@ pub async fn ai(matches: &ArgMatches) {
     if let Err(error) = result {
         report_failure(error);
     }
+}
+
+/// Validate an invocation-scoped conversation before model installation. An
+/// unknown explicit ID must fail without downloading/loading a model or
+/// writing a user message.
+async fn validate_conversation_override(
+    conversation_id: Option<String>,
+) -> Result<(), AiCommandError> {
+    let Some(conversation_id) = conversation_id else {
+        return Ok(());
+    };
+    let conversations = ConversationService::default_store()?;
+    conversations.load(conversation_id).await?;
+    Ok(())
 }
 
 fn parse_request(matches: &ArgMatches) -> Result<AiCommandRequest, String> {

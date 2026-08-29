@@ -123,9 +123,10 @@ impl ConversationStore {
         }
 
         conversations.sort_by(|left, right| {
-            left.conversation_id
-                .cmp(&right.conversation_id)
-                .then_with(|| left.updated_at.cmp(&right.updated_at))
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.conversation_id.cmp(&right.conversation_id))
         });
         warnings.sort_by(|left, right| {
             left.conversation_id
@@ -571,6 +572,46 @@ mod tests {
         assert_eq!(
             store.load_blocking("conv-broken").unwrap_err().code(),
             "malformed_conversation"
+        );
+    }
+
+    #[test]
+    fn listing_is_newest_first_with_stable_id_tiebreaking() {
+        let store = store("ordering");
+        let mut older = conversation("conv-older");
+        older.updated_at = "2026-08-28T12:01:00Z".to_string();
+        store
+            .create_blocking(&older)
+            .expect("older conversation should be created");
+
+        let mut same_time_b = conversation("conv-b");
+        same_time_b.updated_at = "2026-08-28T12:02:00Z".to_string();
+        same_time_b.messages.push(ConversationMessage::new(
+            "msg-last-role".to_string(),
+            ConversationMessageRole::Assistant,
+            "2026-08-28T12:01:30Z".to_string(),
+            "assistant result".to_string(),
+        ));
+        store
+            .create_blocking(&same_time_b)
+            .expect("first tied conversation should be created");
+
+        let mut same_time_a = conversation("conv-a");
+        same_time_a.updated_at = "2026-08-28T12:02:00Z".to_string();
+        store
+            .create_blocking(&same_time_a)
+            .expect("second tied conversation should be created");
+
+        let listing = store.list_blocking().expect("listing should succeed");
+        let ids: Vec<_> = listing
+            .conversations
+            .iter()
+            .map(|summary| summary.conversation_id.as_str())
+            .collect();
+        assert_eq!(ids, ["conv-a", "conv-b", "conv-older"]);
+        assert_eq!(
+            listing.conversations[1].last_role,
+            Some(ConversationMessageRole::Assistant)
         );
     }
 

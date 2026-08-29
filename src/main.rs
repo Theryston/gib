@@ -66,8 +66,7 @@ fn cli() -> Command {
                         .long("message")
                         .value_name("MESSAGE")
                         .help("Run one AI turn with this message")
-                        .required(false)
-                        .required_if_eq("mode", "json"),
+                        .required(false),
                 )
                 .arg(
                     Arg::new("conversation")
@@ -75,6 +74,98 @@ fn cli() -> Command {
                         .value_name("ID")
                         .help("Use a conversation for this invocation without changing the active conversation")
                         .required(false),
+                )
+                .subcommand(
+                    Command::new("conversation")
+                        .about("Manage persistent AI conversations")
+                        .subcommand_required(true)
+                        .arg_required_else_help(true)
+                        .subcommand(
+                            Command::new("new")
+                                .about("Create and select a new conversation")
+                                .arg(
+                                    Arg::new("title")
+                                        .value_name("TITLE")
+                                        .help("Optional conversation title")
+                                        .required(false),
+                                ),
+                        )
+                        .subcommand(
+                            Command::new("list")
+                                .about("List persistent AI conversations"),
+                        )
+                        .subcommand(
+                            Command::new("select")
+                                .about("Select the global active conversation")
+                                .arg(
+                                    Arg::new("id")
+                                        .value_name("ID")
+                                        .help("Conversation ID")
+                                        .required(true),
+                                ),
+                        )
+                        .subcommand(
+                            Command::new("show")
+                                .about("Show conversation metadata and messages")
+                                .arg(
+                                    Arg::new("id")
+                                        .value_name("ID")
+                                        .help("Conversation ID")
+                                        .required(true),
+                                )
+                                .arg(
+                                    Arg::new("limit")
+                                        .long("limit")
+                                        .value_name("COUNT")
+                                        .help("Maximum number of messages to return (default: 128)")
+                                        .value_parser(clap::value_parser!(usize))
+                                        .default_value("128")
+                                        .required(false),
+                                )
+                                .arg(
+                                    Arg::new("max-bytes")
+                                        .long("max-bytes")
+                                        .value_name("BYTES")
+                                        .help("Maximum serialized message payload size (default: 131072)")
+                                        .value_parser(clap::value_parser!(usize))
+                                        .default_value("131072")
+                                        .required(false),
+                                ),
+                        )
+                        .subcommand(
+                            Command::new("rename")
+                                .about("Rename a conversation")
+                                .arg(
+                                    Arg::new("id")
+                                        .value_name("ID")
+                                        .help("Conversation ID")
+                                        .required(true),
+                                )
+                                .arg(
+                                    Arg::new("title")
+                                        .value_name("TITLE")
+                                        .help("New non-empty conversation title")
+                                        .required(true),
+                                ),
+                        )
+                        .subcommand(
+                            Command::new("delete")
+                                .about("Delete a conversation")
+                                .arg(
+                                    Arg::new("id")
+                                        .value_name("ID")
+                                        .help("Conversation ID")
+                                        .required(true),
+                                )
+                                .arg(
+                                    Arg::new("yes")
+                                        .short('y')
+                                        .long("yes")
+                                        .help("Skip the interactive confirmation")
+                                        .action(clap::ArgAction::SetTrue)
+                                        .required(false),
+                                ),
+                        ),
                 )
         )
         .subcommand(

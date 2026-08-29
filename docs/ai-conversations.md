@@ -87,3 +87,101 @@ context, and complete document size. Objects are protected with restrictive
 user-only permissions where the platform supports them. Listing returns valid
 summaries and structured warnings for malformed files rather than failing the
 entire directory; direct loading keeps the actionable error.
+
+## Management commands
+
+GIB keeps AI conversations in the user-level `~/.gib/ai` state directory. The
+conversation commands do not require a repository, a project `gib.toml`, an
+installed model, or llama.cpp to be available.
+
+## Commands
+
+```text
+gib ai conversation new [TITLE]
+gib ai conversation list
+gib ai conversation select <ID>
+gib ai conversation show <ID>
+gib ai conversation rename <ID> <TITLE>
+gib ai conversation delete <ID> [--yes]
+```
+
+`new` creates a stable opaque ID and selects the new conversation as the
+global active conversation. When no title is supplied, GIB uses `New
+conversation`. Titles are trimmed, must be non-empty, and are bounded by the
+conversation storage limits.
+
+`list` is ordered by most recently updated conversation first, with the stable
+ID as the deterministic tie-breaker. It reports the ID, title, timestamps,
+message count, last message role, and active marker. A malformed or newer
+conversation document is isolated as a warning instead of hiding valid
+conversations.
+
+`select` changes only the global `active_conversation_id` in the AI config.
+`rename` changes only conversation metadata. Both operations require the
+conversation to exist and leave message content untouched.
+
+`show` returns messages in their persisted chronological order. To keep a
+large conversation from flooding a terminal or script, the default response
+contains at most 128 messages and 128 KiB of serialized message data. The
+limits can be lowered or raised up to 4,096 messages and 1 MiB:
+
+```text
+gib ai conversation show <ID> --limit 40 --max-bytes 65536
+```
+
+The response reports `truncated: true` when either bound stops the output.
+Message DTOs contain only user-visible fields: message ID, role, timestamp,
+content, and terminal status. Operational turn IDs, hidden reasoning, raw
+prompts, tool payloads, lock paths, and absolute storage paths are not exposed.
+
+## Active-conversation policy
+
+`delete` uses a two-mode confirmation policy:
+
+- interactive mode asks for confirmation unless `--yes` is supplied;
+- JSON mode never reads stdin. Without `--yes`, it returns a structured
+  `confirmation_required: true` response and does not change state.
+
+Deleting the active conversation removes its document and clears
+`active_conversation_id`. GIB does not silently choose another conversation.
+The next direct chat follows the Task 05 fresh-install policy and creates a
+new default conversation if no active conversation exists. `new` always
+selects the conversation because selection is the explicit purpose of that
+command.
+
+## Invocation-scoped chat selection
+
+The chat command accepts an explicit conversation without changing global
+state:
+
+```text
+gib ai --conversation <ID>
+gib ai --mode json --conversation <ID> --message "continue there"
+```
+
+An explicit ID is validated before model installation and before any message
+write. In JSON mode, turn events and the final response include the resolved
+conversation ID.
+
+## JSONL response contract
+
+Management commands emit one shared output-layer event on stdout:
+
+```json
+{
+  "type": "ai_conversation",
+  "data": {
+    "schema_version": 1,
+    "operation": "list",
+    "conversations": [],
+    "active_conversation_id": null
+  }
+}
+```
+
+Each conversation-management DTO has a stable `schema_version`, and warnings
+are included in the response data. Errors are emitted through the standard
+JSON error envelope on stderr with stable codes such as
+`conversation_not_found`, `invalid_conversation_id`, `invalid_title`,
+`active_selection_conflict`, `malformed_conversation`, `newer_schema`,
+`locked`, and `persistence_failure`.
