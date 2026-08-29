@@ -2,6 +2,7 @@ use super::error::ModelError;
 use super::lock::FileLock;
 use super::paths::{ModelPaths, ensure_regular_or_missing, validate_path_component};
 use super::storage::write_atomic;
+use crate::ai::profiles::RuntimePreferences;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -24,6 +25,8 @@ pub(crate) struct AiConfig {
     pub(crate) active_conversation_id: Option<String>,
     #[serde(default)]
     pub(crate) model: ModelConfig,
+    #[serde(default)]
+    pub(crate) runtime: RuntimePreferences,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,6 +41,7 @@ impl AiConfig {
             version: AI_CONFIG_VERSION,
             active_conversation_id: None,
             model: ModelConfig::default(),
+            runtime: RuntimePreferences::default(),
         }
     }
 
@@ -54,6 +58,9 @@ impl AiConfig {
         if let Some(active) = &self.active_conversation_id {
             validate_path_component(active)?;
         }
+        self.runtime
+            .validate()
+            .map_err(|error| ModelError::InvalidRuntime(error.to_string()))?;
         Ok(())
     }
 }
@@ -108,6 +115,10 @@ impl AiConfigStore {
         Ok(self.load()?.active_conversation_id)
     }
 
+    pub(crate) fn runtime_preferences(&self) -> Result<RuntimePreferences, ModelError> {
+        Ok(self.load()?.runtime)
+    }
+
     pub(crate) async fn set_active_model(&self, model_id: &str) -> Result<(), ModelError> {
         validate_path_component(model_id)?;
         self.paths.ensure_root()?;
@@ -133,6 +144,24 @@ impl AiConfigStore {
         let _lock = FileLock::acquire(&lock_path, self.lock_timeout).await?;
         let mut config = self.load()?;
         config.active_conversation_id = conversation_id.map(ToString::to_string);
+        config.version = AI_CONFIG_VERSION;
+        let encoded = toml::to_string_pretty(&config)
+            .map_err(|error| ModelError::serialization("AI TOML config", error))?;
+        write_atomic(self.paths.config_path(), encoded.as_bytes(), Some(0o600))
+    }
+
+    pub(crate) async fn set_runtime_preferences(
+        &self,
+        runtime: RuntimePreferences,
+    ) -> Result<(), ModelError> {
+        runtime
+            .validate()
+            .map_err(|error| ModelError::InvalidRuntime(error.to_string()))?;
+        self.paths.ensure_root()?;
+        let lock_path = self.paths.root().join(".config.lock");
+        let _lock = FileLock::acquire(&lock_path, self.lock_timeout).await?;
+        let mut config = self.load()?;
+        config.runtime = runtime;
         config.version = AI_CONFIG_VERSION;
         let encoded = toml::to_string_pretty(&config)
             .map_err(|error| ModelError::serialization("AI TOML config", error))?;
@@ -175,6 +204,7 @@ mod tests {
             .expect("legacy config should load");
         assert_eq!(config.version, AI_CONFIG_VERSION);
         assert_eq!(config.active_conversation_id, None);
+        assert_eq!(config.runtime, RuntimePreferences::default());
         let encoded = toml::to_string_pretty(&config).expect("config should serialize");
         assert!(encoded.contains("schema_version = 1"));
         assert!(!encoded.contains("\nversion = 1"));
@@ -212,6 +242,39 @@ mod tests {
             .await
             .expect("active conversation should be cleared");
         assert_eq!(store.active_conversation_id().unwrap(), None);
+        std::fs::remove_dir_all(root).expect("temporary state should be removed");
+    }
+
+    #[tokio::test]
+    async fn runtime_preferences_round_trip_and_updates_preserve_other_config() {
+        let root = temporary_root("runtime-preferences");
+        let paths = ModelPaths::from_root(root.clone());
+        let store = AiConfigStore::new(paths.clone());
+        store
+            .set_active_model("qwen3.5-4b-q8-0")
+            .await
+            .expect("active model should be written");
+        let preferences = RuntimePreferences {
+            profile: crate::ai::profiles::RuntimeProfile::HighQuality,
+            overrides: crate::ai::profiles::RuntimeOverrides {
+                threads: Some(4),
+                context_size: Some(8192),
+                max_output_tokens: Some(512),
+                ..crate::ai::profiles::RuntimeOverrides::default()
+            },
+        };
+        store
+            .set_runtime_preferences(preferences.clone())
+            .await
+            .expect("runtime preferences should be written");
+        assert_eq!(store.runtime_preferences().unwrap(), preferences);
+        let config = store.load().expect("config should load");
+        assert_eq!(config.model.active.as_deref(), Some("qwen3.5-4b-q8-0"));
+
+        let encoded =
+            std::fs::read_to_string(paths.config_path()).expect("config should be readable");
+        assert!(encoded.contains("profile = \"high_quality\""));
+        assert!(encoded.contains("context_size = 8192"));
         std::fs::remove_dir_all(root).expect("temporary state should be removed");
     }
 }

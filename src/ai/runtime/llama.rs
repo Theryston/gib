@@ -14,7 +14,9 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
-use llama_cpp_2::{LogOptions, send_logs_to_tracing};
+use llama_cpp_2::{
+    LlamaBackendDeviceType, LogOptions, list_llama_ggml_backend_devices, send_logs_to_tracing,
+};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
@@ -58,6 +60,35 @@ fn global_llama_backend() -> Result<&'static LlamaBackend, AiBackendError> {
     }
 }
 
+fn native_capabilities(backend: &LlamaBackend) -> AiRuntimeCapabilities {
+    let mut gpu_memory_total_bytes = 0_u64;
+    let mut gpu_memory_free_bytes = 0_u64;
+    let mut saw_gpu_device = false;
+    let mut accelerator_backends = Vec::new();
+    for device in list_llama_ggml_backend_devices() {
+        if matches!(device.device_type, LlamaBackendDeviceType::Cpu) {
+            continue;
+        }
+        saw_gpu_device = true;
+        gpu_memory_total_bytes = gpu_memory_total_bytes.saturating_add(device.memory_total as u64);
+        gpu_memory_free_bytes = gpu_memory_free_bytes.saturating_add(device.memory_free as u64);
+        if !device.backend.is_empty() && !accelerator_backends.contains(&device.backend) {
+            accelerator_backends.push(device.backend);
+        }
+    }
+    accelerator_backends.sort();
+
+    AiRuntimeCapabilities {
+        cpu: true,
+        gpu_offload: backend.supports_gpu_offload(),
+        mmap: backend.supports_mmap(),
+        mlock: backend.supports_mlock(),
+        gpu_memory_total_bytes: saw_gpu_device.then_some(gpu_memory_total_bytes),
+        gpu_memory_free_bytes: saw_gpu_device.then_some(gpu_memory_free_bytes),
+        accelerator_backends,
+    }
+}
+
 /// Factory for the in-process backend. It is deliberately independent from
 /// the command and conversation layers so those layers can later receive a
 /// fake backend or another runtime implementation.
@@ -78,6 +109,14 @@ impl AiBackendFactory {
     pub(crate) fn with_options(mut self, options: AiRuntimeOptions) -> Self {
         self.options = options;
         self
+    }
+
+    /// Query the initialized native backend before selecting a profile. This
+    /// keeps capability detection at the llama.cpp boundary instead of
+    /// inferring usable acceleration from the operating system alone.
+    pub(crate) fn capabilities(&self) -> Result<AiRuntimeCapabilities, AiBackendError> {
+        let backend = global_llama_backend()?;
+        Ok(native_capabilities(backend))
     }
 
     pub(crate) fn build(self) -> Result<Arc<dyn AiBackend>, AiBackendError> {
@@ -154,13 +193,11 @@ impl AiRuntime {
     }
 
     pub(crate) fn capabilities(&self) -> Result<AiRuntimeCapabilities, AiBackendError> {
-        let backend = global_llama_backend()?;
-        Ok(AiRuntimeCapabilities {
-            cpu: true,
-            gpu_offload: backend.supports_gpu_offload(),
-            mmap: backend.supports_mmap(),
-            mlock: backend.supports_mlock(),
-        })
+        AiBackendFactory {
+            model_manager: self.inner.model_manager.clone(),
+            options: self.inner.options.clone(),
+        }
+        .capabilities()
     }
 
     pub(crate) fn options(&self) -> &AiRuntimeOptions {

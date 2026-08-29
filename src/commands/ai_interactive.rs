@@ -2,6 +2,7 @@ use super::ai::run_turn_for_interactive;
 use crate::ai::conversation::{
     Conversation, ConversationMessageRole, ConversationMessageStatus, ConversationService,
 };
+use crate::ai::profiles::RuntimeConfig;
 use crate::ai::runtime::AiUsage;
 use crate::ai::{AiCancellation, AiTurnError, AiTurnEvent, AiTurnEventSink, AiTurnResponse};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -326,6 +327,7 @@ pub(crate) struct AiInteractiveApp {
     conversation_id: Option<String>,
     conversation_title: String,
     model_id: String,
+    runtime_summary: String,
     runtime_state: RuntimeState,
     transcript: Vec<TranscriptBlock>,
     viewport_scroll: usize,
@@ -353,6 +355,7 @@ impl AiInteractiveApp {
             conversation_id,
             conversation_title: "No active conversation".to_string(),
             model_id,
+            runtime_summary: String::new(),
             runtime_state: RuntimeState::Ready,
             transcript: Vec::new(),
             viewport_scroll: 0,
@@ -372,6 +375,13 @@ impl AiInteractiveApp {
             confirmation_result: None,
             pending_user_block: None,
             slash_selection: 0,
+        }
+    }
+
+    fn set_runtime_config(&mut self, runtime_config: &RuntimeConfig) {
+        self.runtime_summary = runtime_config.summary();
+        if let Some(reason) = &runtime_config.downgrade_reason {
+            self.status_message = Some(format!("Runtime adjustment: {reason}"));
         }
     }
 
@@ -860,15 +870,24 @@ impl AiInteractiveApp {
             RuntimeState::Cancelling => "cancelling",
             RuntimeState::Error => "error",
         };
+        let runtime = if self.runtime_summary.is_empty() {
+            format!("runtime: {state}")
+        } else {
+            format!("runtime: {state} | {}", self.runtime_summary)
+        };
         let lines = if width < 48 {
-            vec![
+            let mut lines = vec![
                 format!("GIB AI | {state} | model {}", short_id(&self.model_id)),
                 format!("conversation {id} | {title}"),
-            ]
+            ];
+            if !self.runtime_summary.is_empty() {
+                lines.push(self.runtime_summary.clone());
+            }
+            lines
         } else {
             vec![
                 format!("GIB AI  |  {title} ({id})"),
-                format!("model: {}  |  runtime: {state}", self.model_id),
+                format!("model: {}  |  {runtime}", self.model_id),
             ]
         };
         lines
@@ -1190,6 +1209,7 @@ pub(crate) async fn run(
     service: &crate::ai::AiTurnService,
     conversation_id: Option<String>,
     model_id: String,
+    runtime_config: RuntimeConfig,
 ) -> Result<(), String> {
     let conversations = ConversationService::default_store().map_err(|error| error.to_string())?;
     let initial = match conversation_id.as_deref() {
@@ -1209,6 +1229,7 @@ pub(crate) async fn run(
     let (width, height) =
         terminal::size().unwrap_or((DEFAULT_TERMINAL_WIDTH, DEFAULT_TERMINAL_HEIGHT));
     let mut app = AiInteractiveApp::new(model_id, conversation_id, width, height);
+    app.set_runtime_config(&runtime_config);
     if let Some(conversation) = &initial {
         app.load_conversation(conversation);
     }
@@ -1225,6 +1246,7 @@ pub(crate) async fn run(
         ai_receiver,
         ai_sender,
         &mut generation,
+        runtime_config.keep_model_warm,
     )
     .await;
 
@@ -1252,6 +1274,7 @@ async fn run_event_loop(
     mut ai_receiver: UnboundedReceiver<AiMessage>,
     ai_sender: UnboundedSender<AiMessage>,
     generation: &mut Option<GenerationTask>,
+    keep_model_warm: bool,
 ) -> Result<(), String> {
     let mut stdout = io::stdout();
     let mut ticker = time::interval(RENDER_TICK);
@@ -1275,6 +1298,7 @@ async fn run_event_loop(
                             app,
                             &ai_sender,
                             generation,
+                            keep_model_warm,
                         ).await?;
                     }
                     Some(TerminalMessage::Error(error)) => return Err(error),
@@ -1283,7 +1307,14 @@ async fn run_event_loop(
             }
             ai_message = ai_receiver.recv() => {
                 if let Some(message) = ai_message {
-                    handle_ai_message(message, conversations, app, generation).await;
+                    handle_ai_message(
+                        message,
+                        service,
+                        conversations,
+                        app,
+                        generation,
+                        keep_model_warm,
+                    ).await;
                 } else if generation.is_some() {
                     return Err("AI event source closed unexpectedly".to_string());
                 }
@@ -1301,6 +1332,7 @@ async fn handle_terminal_event(
     app: &mut AiInteractiveApp,
     ai_sender: &UnboundedSender<AiMessage>,
     generation: &mut Option<GenerationTask>,
+    keep_model_warm: bool,
 ) -> Result<(), String> {
     match event {
         Event::Resize(width, height) => app.on_resize(width, height),
@@ -1367,11 +1399,16 @@ async fn handle_terminal_event(
                                 Err(error) => app.set_local_error(error),
                             }
                         } else if app.submit_message(message.clone()) {
+                            if !keep_model_warm {
+                                app.status_message =
+                                    Some("Loading the model for this turn...".to_string());
+                            }
                             *generation = Some(start_generation(
                                 service,
                                 app.conversation_id.clone(),
                                 message,
                                 ai_sender.clone(),
+                                !keep_model_warm,
                             ));
                         }
                     }
@@ -1430,6 +1467,7 @@ fn start_generation(
     conversation_id: Option<String>,
     message: String,
     sender: UnboundedSender<AiMessage>,
+    load_model_before_turn: bool,
 ) -> GenerationTask {
     let cancellation = AiCancellation::new();
     let task_cancellation = cancellation.clone();
@@ -1441,6 +1479,10 @@ fn start_generation(
         }
     });
     let handle = tokio::spawn(async move {
+        if load_model_before_turn && let Err(error) = service.load_model().await {
+            let _ = sender.send(AiMessage::Completed(Err(AiTurnError::Backend(error))));
+            return;
+        }
         let result = run_turn_for_interactive(
             &service,
             conversation_id,
@@ -1459,9 +1501,11 @@ fn start_generation(
 
 async fn handle_ai_message(
     message: AiMessage,
+    service: &crate::ai::AiTurnService,
     conversations: &ConversationService,
     app: &mut AiInteractiveApp,
     generation: &mut Option<GenerationTask>,
+    keep_model_warm: bool,
 ) {
     match message {
         AiMessage::Turn(event) => app.apply_turn_event(&event),
@@ -1488,6 +1532,18 @@ async fn handle_ai_message(
                         // "sending" state in that case.
                         app.fail_before_started_turn(&error);
                     }
+                }
+            }
+            if !keep_model_warm {
+                if let Err(error) = service.unload_model().await {
+                    app.set_local_error(format!(
+                        "The LowMemory profile could not release the model after the turn: {error}"
+                    ));
+                } else if app.runtime_state == RuntimeState::Ready {
+                    app.status_message = Some(
+                        "Ready (LowMemory profile released the model; it will reload on the next turn)."
+                            .to_string(),
+                    );
                 }
             }
         }

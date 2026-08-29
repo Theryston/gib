@@ -1,6 +1,12 @@
 use crate::ai::conversation::{ConversationError, ConversationService};
-use crate::ai::model::{ModelError, ModelInstallCancellation, ModelManager, output_progress_sink};
-use crate::ai::runtime::{AiBackend, AiBackendError, AiBackendFactory};
+use crate::ai::hardware::{HardwareSnapshot, NativeRuntimeCapabilities};
+use crate::ai::model::{
+    AiConfigStore, ModelError, ModelInstallCancellation, ModelManager, output_progress_sink,
+};
+use crate::ai::profiles::{
+    RuntimeConfig, RuntimeOverrides, RuntimeProfile, RuntimeProfileError, resolve_runtime_config,
+};
+use crate::ai::runtime::{AiBackend, AiBackendError, AiBackendFactory, AiRuntimeOptions};
 use crate::ai::{
     AiCancellation, AiPromptPolicy, AiTurnError, AiTurnEvent, AiTurnEventSink, AiTurnRequest,
     AiTurnService,
@@ -18,6 +24,8 @@ use std::time::Duration;
 struct AiCommandRequest {
     message: Option<String>,
     conversation_id: Option<String>,
+    profile: Option<RuntimeProfile>,
+    runtime_overrides: RuntimeOverrides,
 }
 
 #[derive(Debug)]
@@ -25,6 +33,7 @@ enum AiCommandError {
     Input(String),
     Model(ModelError),
     Backend(AiBackendError),
+    Runtime(RuntimeProfileError),
     Conversation(ConversationError),
     Turn(AiTurnError),
 }
@@ -35,6 +44,7 @@ impl AiCommandError {
             Self::Input(_) => "invalid_request",
             Self::Model(error) => model_error_code(error),
             Self::Backend(error) => error.code(),
+            Self::Runtime(error) => error.code(),
             Self::Conversation(error) => error.code(),
             Self::Turn(error) => error.code(),
         }
@@ -48,6 +58,7 @@ impl AiCommandError {
             }
             Self::Model(_) => "AI model installation or verification failed".to_string(),
             Self::Backend(error) => error.to_string(),
+            Self::Runtime(error) => error.to_string(),
             Self::Conversation(error) => error.to_string(),
             Self::Turn(error) => error.to_string(),
         }
@@ -60,6 +71,7 @@ impl fmt::Display for AiCommandError {
             Self::Input(message) => formatter.write_str(message),
             Self::Model(error) => write!(formatter, "{error}"),
             Self::Backend(error) => write!(formatter, "{error}"),
+            Self::Runtime(error) => write!(formatter, "{error}"),
             Self::Conversation(error) => write!(formatter, "{error}"),
             Self::Turn(error) => write!(formatter, "{error}"),
         }
@@ -75,6 +87,12 @@ impl From<ModelError> for AiCommandError {
 impl From<AiBackendError> for AiCommandError {
     fn from(error: AiBackendError) -> Self {
         Self::Backend(error)
+    }
+}
+
+impl From<RuntimeProfileError> for AiCommandError {
+    fn from(error: RuntimeProfileError) -> Self {
+        Self::Runtime(error)
     }
 }
 
@@ -97,9 +115,10 @@ pub async fn ai(matches: &ArgMatches) {
         Some(("conversation", conversation_matches)) => {
             if matches.get_one::<String>("message").is_some()
                 || matches.get_one::<String>("conversation").is_some()
+                || runtime_options_present(matches)
             {
                 report_failure(AiCommandError::Input(
-                    "--message and --conversation are chat options and cannot be used with 'gib ai conversation'"
+                    "chat and runtime options cannot be used with 'gib ai conversation'"
                         .to_string(),
                 ));
             }
@@ -134,10 +153,10 @@ pub async fn ai(matches: &ArgMatches) {
             signal_cancellation.cancel();
         }
     });
-    let build_result = build_turn_service(install_cancellation).await;
+    let build_result = build_turn_service(install_cancellation, request.clone()).await;
     install_signal_task.abort();
 
-    let (service, backend, model_id) = match build_result {
+    let (service, backend, model_id, runtime_config) = match build_result {
         Ok(value) => value,
         Err(error) => report_failure(error),
     };
@@ -145,7 +164,13 @@ pub async fn ai(matches: &ArgMatches) {
     let result = if let Some(message) = request.message {
         run_single_turn(&service, request.conversation_id, message, is_json_mode()).await
     } else {
-        run_interactive_loop(&service, request.conversation_id, model_id.clone()).await
+        run_interactive_loop(
+            &service,
+            request.conversation_id,
+            model_id.clone(),
+            runtime_config,
+        )
+        .await
     };
 
     let _ = backend.unload_model(Some(&model_id)).await;
@@ -171,6 +196,11 @@ async fn validate_conversation_override(
 fn parse_request(matches: &ArgMatches) -> Result<AiCommandRequest, String> {
     let message = matches.get_one::<String>("message").cloned();
     let conversation_id = matches.get_one::<String>("conversation").cloned();
+    let profile = matches
+        .get_one::<String>("profile")
+        .map(|value| value.parse::<RuntimeProfile>())
+        .transpose()?;
+    let runtime_overrides = parse_runtime_overrides(matches)?;
     if matches
         .get_one::<String>("mode")
         .is_some_and(|mode| mode == "json")
@@ -181,12 +211,15 @@ fn parse_request(matches: &ArgMatches) -> Result<AiCommandRequest, String> {
     Ok(AiCommandRequest {
         message,
         conversation_id,
+        profile,
+        runtime_overrides,
     })
 }
 
 async fn build_turn_service(
     cancellation: ModelInstallCancellation,
-) -> Result<(AiTurnService, Arc<dyn AiBackend>, String), AiCommandError> {
+    request: AiCommandRequest,
+) -> Result<(AiTurnService, Arc<dyn AiBackend>, String, RuntimeConfig), AiCommandError> {
     let conversations = ConversationService::default_store()?;
     let model_manager = ModelManager::default()?;
     let installed = model_manager
@@ -199,7 +232,51 @@ async fn build_turn_service(
         return Err(ModelError::DownloadCancelled.into());
     }
     let model_id = installed.manifest.id.clone();
-    let backend = AiBackendFactory::new(model_manager).build()?;
+    let runtime_progress = start_runtime_profile_progress(&model_id);
+    let factory = AiBackendFactory::new(model_manager.clone());
+    let native_capabilities = factory.capabilities()?;
+    let hardware = HardwareSnapshot::detect(NativeRuntimeCapabilities {
+        cpu: native_capabilities.cpu,
+        gpu_offload: native_capabilities.gpu_offload,
+        mmap: native_capabilities.mmap,
+        mlock: native_capabilities.mlock,
+        gpu_memory_total_bytes: native_capabilities.gpu_memory_total_bytes,
+        gpu_memory_free_bytes: native_capabilities.gpu_memory_free_bytes,
+        accelerator_backends: native_capabilities.accelerator_backends.clone(),
+    });
+    let preferences = AiConfigStore::new(model_manager.paths().clone()).runtime_preferences()?;
+    let runtime_config = resolve_runtime_config(
+        &model_id,
+        &installed.manifest,
+        &preferences,
+        request.profile,
+        &request.runtime_overrides,
+        hardware,
+    )?;
+    let runtime_message = runtime_config
+        .downgrade_reason
+        .as_deref()
+        .map(|reason| {
+            format!(
+                "AI runtime resolved ({}): {reason}",
+                runtime_config.summary()
+            )
+        })
+        .unwrap_or_else(|| format!("AI runtime resolved ({})", runtime_config.summary()));
+    runtime_progress.finish_with_message(runtime_message);
+    if is_json_mode() {
+        emit_named_event(
+            "ai_runtime",
+            &serde_json::json!({
+                "status": "resolved",
+                "model_id": model_id.as_str(),
+                "runtime": runtime_config.clone(),
+            }),
+        );
+    }
+    let backend = factory
+        .with_options(AiRuntimeOptions::from_runtime_config(&runtime_config))
+        .build()?;
     let load_progress = start_model_load_progress(&model_id);
     let load_result = backend.load_model(&model_id).await;
     match &load_result {
@@ -238,13 +315,43 @@ async fn build_turn_service(
         let _ = backend.unload_model(Some(&model_id)).await;
         return Err(ModelError::DownloadCancelled.into());
     }
+    let prompt_policy = AiPromptPolicy {
+        context_limit: runtime_config.context_size,
+        max_output_tokens: runtime_config.max_output_tokens,
+        ..AiPromptPolicy::default()
+    };
     let service = AiTurnService::new(
         conversations,
         backend.clone(),
         model_id.clone(),
-        AiPromptPolicy::default(),
+        prompt_policy,
     );
-    Ok((service, backend, model_id))
+    Ok((service, backend, model_id, runtime_config))
+}
+
+fn start_runtime_profile_progress(model_id: &str) -> ProgressBar {
+    let message =
+        format!("Detecting hardware and selecting an AI runtime profile for '{model_id}'");
+    if is_json_mode() {
+        emit_named_event(
+            "ai_runtime",
+            &serde_json::json!({
+                "status": "detecting",
+                "model_id": model_id,
+                "message": message,
+            }),
+        );
+        return ProgressBar::hidden();
+    }
+
+    let progress = ProgressBar::new_spinner();
+    progress.enable_steady_tick(Duration::from_millis(100));
+    progress.set_style(
+        ProgressStyle::with_template("{spinner:.green} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    progress.set_message(message);
+    progress
 }
 
 fn start_model_load_progress(model_id: &str) -> ProgressBar {
@@ -324,10 +431,51 @@ async fn run_interactive_loop(
     service: &AiTurnService,
     conversation_id: Option<String>,
     model_id: String,
+    runtime_config: RuntimeConfig,
 ) -> Result<(), AiCommandError> {
-    super::ai_interactive::run(service, conversation_id, model_id)
+    super::ai_interactive::run(service, conversation_id, model_id, runtime_config)
         .await
         .map_err(AiCommandError::Input)
+}
+
+fn parse_runtime_overrides(matches: &ArgMatches) -> Result<RuntimeOverrides, String> {
+    let gpu_offload = matches
+        .get_one::<String>("gpu-offload")
+        .and_then(|mode| match mode.as_str() {
+            "auto" => None,
+            "on" => Some(Ok(true)),
+            "off" => Some(Ok(false)),
+            _ => Some(Err("--gpu-offload must be auto, on, or off".to_string())),
+        })
+        .transpose()?;
+    Ok(RuntimeOverrides {
+        threads: matches.get_one::<u32>("threads").copied(),
+        context_size: matches.get_one::<u32>("context-size").copied(),
+        batch_size: matches.get_one::<u32>("batch-size").copied(),
+        gpu_layers: matches.get_one::<u32>("gpu-layers").copied(),
+        gpu_offload,
+        max_output_tokens: matches.get_one::<u32>("max-output-tokens").copied(),
+        agent_budget: matches.get_one::<u32>("agent-budget").copied(),
+        search_budget: matches.get_one::<u32>("search-budget").copied(),
+        memory_budget_percent: matches.get_one::<u8>("memory-budget-percent").copied(),
+    })
+}
+
+fn runtime_options_present(matches: &ArgMatches) -> bool {
+    [
+        "profile",
+        "threads",
+        "context-size",
+        "batch-size",
+        "gpu-layers",
+        "gpu-offload",
+        "max-output-tokens",
+        "agent-budget",
+        "search-budget",
+        "memory-budget-percent",
+    ]
+    .iter()
+    .any(|name| matches.contains_id(name) && matches.get_raw(name).is_some())
 }
 
 fn json_event_sink() -> AiTurnEventSink {
@@ -391,6 +539,7 @@ fn model_error_code(error: &ModelError) -> &'static str {
         ModelError::MetadataMismatch(_) => "model_metadata_error",
         ModelError::UnsafePath(_) => "unsafe_model_path",
         ModelError::ActiveModel(_) => "invalid_active_model",
+        ModelError::InvalidRuntime(_) => "invalid_runtime_config",
     }
 }
 
@@ -444,5 +593,46 @@ mod tests {
             .expect("clap should pass the global mode to the command");
         let matches = matches.subcommand().expect("AI command should exist").1;
         assert!(parse_request(matches).is_err());
+    }
+
+    #[test]
+    fn parses_runtime_profile_and_invocation_overrides() {
+        let matches = command_matches(&[
+            "ai",
+            "--profile",
+            "high-quality",
+            "--threads",
+            "4",
+            "--context-size",
+            "8192",
+            "--batch-size",
+            "512",
+            "--gpu-layers",
+            "12",
+            "--gpu-offload",
+            "on",
+            "--max-output-tokens",
+            "512",
+            "--agent-budget",
+            "100",
+            "--search-budget",
+            "200",
+            "--memory-budget-percent",
+            "75",
+            "--message",
+            "hello",
+        ]);
+        let matches = matches.subcommand().expect("AI command should exist").1;
+        let request = parse_request(matches).expect("runtime options should parse");
+        assert_eq!(request.profile, Some(RuntimeProfile::HighQuality));
+        assert_eq!(request.runtime_overrides.threads, Some(4));
+        assert_eq!(request.runtime_overrides.context_size, Some(8192));
+        assert_eq!(request.runtime_overrides.batch_size, Some(512));
+        assert_eq!(request.runtime_overrides.gpu_layers, Some(12));
+        assert_eq!(request.runtime_overrides.gpu_offload, Some(true));
+        assert_eq!(request.runtime_overrides.max_output_tokens, Some(512));
+        assert_eq!(request.runtime_overrides.agent_budget, Some(100));
+        assert_eq!(request.runtime_overrides.search_budget, Some(200));
+        assert_eq!(request.runtime_overrides.memory_budget_percent, Some(75));
     }
 }

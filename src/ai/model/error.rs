@@ -50,6 +50,7 @@ pub(crate) enum ModelError {
     MetadataMismatch(String),
     UnsafePath(PathBuf),
     ActiveModel(String),
+    InvalidRuntime(String),
 }
 
 impl ModelError {
@@ -166,6 +167,9 @@ impl fmt::Display for ModelError {
                 path.display()
             ),
             Self::ActiveModel(message) => write!(formatter, "Invalid active AI model: {}", message),
+            Self::InvalidRuntime(message) => {
+                write!(formatter, "Invalid AI runtime configuration: {}", message)
+            }
         }
     }
 }

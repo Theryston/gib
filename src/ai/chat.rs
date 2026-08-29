@@ -297,6 +297,18 @@ impl AiTurnService {
         }
     }
 
+    /// Ensure the configured model is loaded before a turn. LowMemory
+    /// profiles use this hook to reload a model after releasing it between
+    /// turns; warm profiles can call it as a cheap already-loaded check.
+    pub(crate) async fn load_model(&self) -> Result<(), AiBackendError> {
+        self.backend.load_model(&self.model_id).await.map(|_| ())
+    }
+
+    /// Release the configured model without changing conversation state.
+    pub(crate) async fn unload_model(&self) -> Result<(), AiBackendError> {
+        self.backend.unload_model(Some(&self.model_id)).await
+    }
+
     pub(crate) async fn run_turn(
         &self,
         request: AiTurnRequest,

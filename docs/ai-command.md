@@ -114,6 +114,11 @@ multi-gigabyte artifact during startup.
 
 ## Interactive terminal frontend
 
+Hardware detection and runtime profile selection are documented in
+[`ai-runtime-profiles.md`](ai-runtime-profiles.md). The selected profile and
+resolved context/thread/batch/GPU settings are shown in the interactive header
+and in the `ai_runtime` JSON status event.
+
 The interactive form uses a full-screen alternate terminal with an explicit
 conversation viewport, a multiline composer, streaming assistant output, and a
 status footer. It consumes the same `AiTurnService` events as JSON mode; the
@@ -218,3 +223,24 @@ ANSI sequences:
 ./target/debug/gib --mode json ai conversation list
 ./target/debug/gib --mode json ai --message "hello"
 ```
+
+To verify Task 08 runtime selection without changing the persistent profile,
+run a one-shot override and inspect the `ai_runtime` records before the model
+load record:
+
+```bash
+./target/debug/gib --mode json ai \
+  --profile low-memory \
+  --threads 2 \
+  --context-size 2048 \
+  --max-output-tokens 128 \
+  --message "report your runtime status"
+```
+
+The resolved record should contain the hardware snapshot, memory estimate,
+selected settings, and any downgrade reason. For a persistent preference,
+update the `[runtime]` section in `~/.gib/ai/config.toml` as documented in
+[`ai-runtime-profiles.md`](ai-runtime-profiles.md), then start `gib ai` and
+confirm the profile/settings appear in the header. On a LowMemory run, wait
+for the first response, send a second message, and confirm the footer reports
+that the model was released and then reloaded for the second turn.

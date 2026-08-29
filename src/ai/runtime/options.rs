@@ -1,4 +1,5 @@
 use super::error::AiBackendError;
+use crate::ai::profiles::RuntimeConfig;
 
 const DEFAULT_CONTEXT_SIZE: u32 = 4096;
 const DEFAULT_BATCH_SIZE: u32 = 512;
@@ -40,6 +41,17 @@ impl Default for AiRuntimeOptions {
 }
 
 impl AiRuntimeOptions {
+    pub(crate) fn from_runtime_config(config: &RuntimeConfig) -> Self {
+        Self::default()
+            .with_context_size(config.context_size)
+            .with_batch_size(config.batch_size)
+            .with_micro_batch_size(config.micro_batch_size)
+            .with_threads(config.threads)
+            .with_batch_threads(config.batch_threads)
+            .with_gpu_layers(config.gpu_layers)
+            .with_offload_kqv(config.offload_kqv)
+    }
+
     pub(crate) fn with_context_size(mut self, value: u32) -> Self {
         self.context_size = value;
         self
@@ -135,10 +147,13 @@ impl AiRuntimeOptions {
 }
 
 /// Capabilities visible to higher layers without exposing native types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AiRuntimeCapabilities {
     pub(crate) cpu: bool,
     pub(crate) gpu_offload: bool,
     pub(crate) mmap: bool,
     pub(crate) mlock: bool,
+    pub(crate) gpu_memory_total_bytes: Option<u64>,
+    pub(crate) gpu_memory_free_bytes: Option<u64>,
+    pub(crate) accelerator_backends: Vec<String>,
 }

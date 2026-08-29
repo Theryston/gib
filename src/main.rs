@@ -75,6 +75,86 @@ fn cli() -> Command {
                         .help("Use a conversation for this invocation without changing the active conversation")
                         .required(false),
                 )
+                .arg(
+                    Arg::new("profile")
+                        .long("profile")
+                        .value_name("PROFILE")
+                        .help("AI runtime profile: low-memory, balanced, or high-quality")
+                        .value_parser(["low-memory", "low_memory", "balanced", "high-quality", "high_quality"])
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("threads")
+                        .long("threads")
+                        .value_name("COUNT")
+                        .help("Override the AI runtime thread count for this invocation")
+                        .value_parser(clap::value_parser!(u32))
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("context-size")
+                        .long("context-size")
+                        .value_name("TOKENS")
+                        .help("Override the prompt context size for this invocation")
+                        .value_parser(clap::value_parser!(u32))
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("batch-size")
+                        .long("batch-size")
+                        .value_name("TOKENS")
+                        .help("Override the llama.cpp batch size for this invocation")
+                        .value_parser(clap::value_parser!(u32))
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("gpu-layers")
+                        .long("gpu-layers")
+                        .value_name("COUNT")
+                        .help("Override the number of model layers to offload")
+                        .value_parser(clap::value_parser!(u32))
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("gpu-offload")
+                        .long("gpu-offload")
+                        .value_name("MODE")
+                        .help("GPU offload policy: auto, on, or off")
+                        .value_parser(["auto", "on", "off"])
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("max-output-tokens")
+                        .long("max-output-tokens")
+                        .value_name("TOKENS")
+                        .help("Override the maximum generated tokens for this invocation")
+                        .value_parser(clap::value_parser!(u32))
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("agent-budget")
+                        .long("agent-budget")
+                        .value_name("UNITS")
+                        .help("Set an optional future agent budget for this invocation")
+                        .value_parser(clap::value_parser!(u32))
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("search-budget")
+                        .long("search-budget")
+                        .value_name("UNITS")
+                        .help("Set an optional future search budget for this invocation")
+                        .value_parser(clap::value_parser!(u32))
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("memory-budget-percent")
+                        .long("memory-budget-percent")
+                        .value_name("PERCENT")
+                        .help("Override the safe estimated-memory fraction (1-100)")
+                        .value_parser(clap::value_parser!(u8))
+                        .required(false),
+                )
                 .subcommand(
                     Command::new("conversation")
                         .about("Manage persistent AI conversations")
