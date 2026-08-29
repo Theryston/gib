@@ -41,16 +41,22 @@ pub(crate) struct LogFollower {
     pending: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProgressDisplayKind {
+    Loading,
+    Files { total: u64 },
+}
+
 pub(crate) struct InteractiveLogRenderer {
     progress: Option<ProgressBar>,
-    progress_total: Option<u64>,
+    progress_kind: Option<ProgressDisplayKind>,
 }
 
 impl InteractiveLogRenderer {
     pub(crate) fn new() -> Self {
         Self {
             progress: None,
-            progress_total: None,
+            progress_kind: None,
         }
     }
 
@@ -86,7 +92,7 @@ impl InteractiveLogRenderer {
     }
 
     pub(crate) fn render_initial_line(&mut self, line: &str) {
-        if is_progress_line(line) {
+        if is_progress_line(line) || is_backup_start_line(line) {
             return;
         }
         self.render_line(line);
@@ -192,9 +198,10 @@ impl InteractiveLogRenderer {
             }
             "change_batch" => self.render_change_batch(data),
             // The change_batch event already announces what will be backed
-            // up. The progress events that follow provide the activity
-            // indicator, so a separate "backup started" line is redundant.
-            "backup_start" => {}
+            // up. Keep the backup-start event as a loading indicator so the
+            // viewer is active even while the first progress event is being
+            // produced, without adding another permanent status line.
+            "backup_start" => self.start_loading("Preparing backup..."),
             "backup_complete" => {
                 self.render_backup_complete(data);
             }
@@ -275,36 +282,39 @@ impl InteractiveLogRenderer {
     fn render_progress(&mut self, data: &Value) {
         let total = number_field(data, "total");
         let processed = number_field(data, "processed");
-        let message = string_field(data, "message").unwrap_or("");
+        let message = string_field(data, "message")
+            .filter(|message| !message.is_empty())
+            .unwrap_or("Working...");
+        let display_kind = if total == 0 {
+            ProgressDisplayKind::Loading
+        } else {
+            ProgressDisplayKind::Files { total }
+        };
 
-        if self.progress_total != Some(total) {
+        if self.progress_kind != Some(display_kind) {
             self.clear_progress();
-            let progress = if total == 0 {
-                let progress = ProgressBar::new_spinner();
-                progress.enable_steady_tick(std::time::Duration::from_millis(100));
-                progress.set_style(
-                    ProgressStyle::with_template("{spinner:.green} {msg}")
-                        .expect("valid spinner progress template"),
-                );
-                progress
-            } else {
-                let progress = ProgressBar::new(total);
-                progress.set_style(
-                    ProgressStyle::with_template(
-                        "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
-                    )
-                    .expect("valid progress bar template"),
-                );
-                progress
-            };
-            self.progress = Some(progress);
-            self.progress_total = Some(total);
+            self.progress = Some(match display_kind {
+                ProgressDisplayKind::Loading => loading_progress_bar(),
+                ProgressDisplayKind::Files { total } => file_progress_bar(total),
+            });
+            self.progress_kind = Some(display_kind);
         }
 
         if let Some(progress) = &self.progress {
             if total > 0 {
                 progress.set_position(processed.min(total));
             }
+            progress.set_message(message.to_string());
+        }
+    }
+
+    fn start_loading(&mut self, message: &str) {
+        if self.progress_kind != Some(ProgressDisplayKind::Loading) {
+            self.clear_progress();
+            self.progress = Some(loading_progress_bar());
+            self.progress_kind = Some(ProgressDisplayKind::Loading);
+        }
+        if let Some(progress) = &self.progress {
             progress.set_message(message.to_string());
         }
     }
@@ -330,7 +340,7 @@ impl InteractiveLogRenderer {
         if let Some(progress) = self.progress.take() {
             progress.finish_and_clear();
         }
-        self.progress_total = None;
+        self.progress_kind = None;
     }
 
     fn render_unknown(&self, kind: &str, data: &Value) {
@@ -368,6 +378,38 @@ fn is_progress_line(line: &str) -> bool {
                 .map(|kind| kind == "progress")
         })
         .unwrap_or(false)
+}
+
+fn is_backup_start_line(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .is_some_and(|value| {
+            value.get("type").and_then(Value::as_str) == Some("live")
+                && value
+                    .get("data")
+                    .and_then(|data| data.get("event"))
+                    .and_then(Value::as_str)
+                    == Some("backup_start")
+        })
+}
+
+fn loading_progress_bar() -> ProgressBar {
+    let progress = ProgressBar::new_spinner();
+    progress.enable_steady_tick(std::time::Duration::from_millis(100));
+    progress.set_style(
+        ProgressStyle::with_template("{spinner:.green} {msg}")
+            .expect("valid spinner progress template"),
+    );
+    progress
+}
+
+fn file_progress_bar(total: u64) -> ProgressBar {
+    let progress = ProgressBar::new(total);
+    progress.set_style(
+        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .expect("valid progress bar template"),
+    );
+    progress
 }
 
 fn string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
@@ -704,6 +746,49 @@ mod tests {
 
         assert_eq!(extract_complete_lines(&mut buffer), vec!["first"]);
         assert_eq!(buffer, b"second");
+    }
+
+    #[test]
+    fn switches_from_file_progress_to_loading_spinner() {
+        let mut renderer = InteractiveLogRenderer::new();
+
+        renderer.render_line(
+            r#"{"type":"progress","data":{"total":3,"processed":3,"message":"Backing up files..."}}"#,
+        );
+        assert_eq!(
+            renderer.progress_kind,
+            Some(ProgressDisplayKind::Files { total: 3 })
+        );
+
+        renderer.render_line(
+            r#"{"type":"progress","data":{"total":0,"processed":0,"message":"Saving repository indexes..."}}"#,
+        );
+        assert_eq!(renderer.progress_kind, Some(ProgressDisplayKind::Loading));
+
+        renderer.clear_progress();
+    }
+
+    #[test]
+    fn historical_backup_start_does_not_start_a_loading_indicator() {
+        let mut renderer = InteractiveLogRenderer::new();
+
+        renderer.render_initial_line(
+            r#"{"type":"live","data":{"event":"backup_start","message":"[LIVE] changed: 1 file"}}"#,
+        );
+
+        assert_eq!(renderer.progress_kind, None);
+    }
+
+    #[test]
+    fn live_backup_start_starts_a_loading_indicator() {
+        let mut renderer = InteractiveLogRenderer::new();
+
+        renderer.render_line(
+            r#"{"type":"live","data":{"event":"backup_start","message":"[LIVE] changed: 1 file"}}"#,
+        );
+
+        assert_eq!(renderer.progress_kind, Some(ProgressDisplayKind::Loading));
+        renderer.clear_progress();
     }
 
     #[tokio::test]
