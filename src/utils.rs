@@ -1,155 +1,67 @@
-use crate::commands::storage::add::{
-    LOCAL_STORAGE_TYPE, S3_STORAGE_TYPE, Storage, WEBDAV_STORAGE_TYPE,
-};
-use crate::fs::{FS, LocalFS, S3FS, S3FSConfig, WebDavFS, WebDavFSConfig};
+//! Small, side-effect-free encoding helpers shared by the library.
+
 use argon2::Argon2;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit},
 };
-use console::style;
-use dirs::home_dir;
-use indicatif::ProgressBar;
 use rand_core::{OsRng, TryRngCore};
-use std::sync::Arc;
 
-use crate::output::{emit_error, is_json_mode};
 const MAGIC: &[u8; 4] = b"GIB1";
 
-pub fn compress_bytes(data: &[u8], level: i32) -> Vec<u8> {
-    zstd::encode_all(data, level).unwrap()
+pub(crate) fn compress_bytes(data: &[u8], level: i32) -> Vec<u8> {
+    zstd::encode_all(data, level).unwrap_or_else(|_| data.to_vec())
 }
 
-pub fn decompress_bytes(data: &[u8]) -> Vec<u8> {
-    zstd::decode_all(data).unwrap()
+pub(crate) fn decompress_bytes(data: &[u8]) -> Vec<u8> {
+    zstd::decode_all(data).unwrap_or_else(|_| data.to_vec())
 }
 
 fn derive_key(password: &[u8], salt: &[u8]) -> Result<[u8; 32], String> {
-    let mut key = [0u8; 32];
-
-    let argon2 = Argon2::default();
-    argon2
+    let mut key = [0_u8; 32];
+    Argon2::default()
         .hash_password_into(password, salt, &mut key)
         .map_err(|_| "Argon2 failed".to_string())?;
-
     Ok(key)
 }
 
-pub fn encrypt_bytes(data: &[u8], password: &[u8]) -> Result<Vec<u8>, String> {
-    let mut salt = [0u8; 16];
+pub(crate) fn encrypt_bytes(data: &[u8], password: &[u8]) -> Result<Vec<u8>, String> {
     let mut rng = OsRng;
-
-    rng.try_fill_bytes(&mut salt).unwrap();
-
+    let mut salt = [0_u8; 16];
+    rng.try_fill_bytes(&mut salt)
+        .map_err(|error| format!("Failed to generate encryption salt: {error}"))?;
     let key_bytes = derive_key(password, &salt)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-
-    let mut nonce_bytes = [0u8; 12];
-    rng.try_fill_bytes(&mut nonce_bytes).unwrap();
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
+    let mut nonce_bytes = [0_u8; 12];
+    rng.try_fill_bytes(&mut nonce_bytes)
+        .map_err(|error| format!("Failed to generate encryption nonce: {error}"))?;
     let ciphertext = cipher
-        .encrypt(nonce, data)
+        .encrypt(Nonce::from_slice(&nonce_bytes), data)
         .map_err(|_| "Encryption failed".to_string())?;
 
-    let mut out =
+    let mut output =
         Vec::with_capacity(MAGIC.len() + salt.len() + nonce_bytes.len() + ciphertext.len());
-
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&salt);
-    out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&ciphertext);
-
-    Ok(out)
+    output.extend_from_slice(MAGIC);
+    output.extend_from_slice(&salt);
+    output.extend_from_slice(&nonce_bytes);
+    output.extend_from_slice(&ciphertext);
+    Ok(output)
 }
 
-pub fn decrypt_bytes(blob: &[u8], password: &[u8]) -> Result<Vec<u8>, String> {
-    if blob.len() < 4 + 16 + 12 {
+pub(crate) fn decrypt_bytes(blob: &[u8], password: &[u8]) -> Result<Vec<u8>, String> {
+    if blob.len() < MAGIC.len() + 16 + 12 {
         return Err("Blob too small".to_string());
     }
-
-    if &blob[..4] != MAGIC {
+    if &blob[..MAGIC.len()] != MAGIC {
         return Err("Not encrypted".to_string());
     }
-
-    let salt = &blob[4..20];
-    let nonce = &blob[20..32];
-    let ciphertext = &blob[32..];
-
-    let key_bytes = derive_key(password, salt)?;
+    let key_bytes = derive_key(password, &blob[4..20])?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-
     cipher
-        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .decrypt(Nonce::from_slice(&blob[20..32]), &blob[32..])
         .map_err(|_| "Invalid password or corrupted data".to_string())
 }
 
-pub fn is_encrypted(data: &[u8]) -> bool {
-    data.len() >= 4 && &data[..4] == MAGIC
-}
-
-pub fn get_pwd_string() -> String {
-    std::env::current_dir()
-        .unwrap()
-        .to_string_lossy()
-        .to_string()
-}
-
-pub fn get_storage(name: &str) -> Storage {
-    let home_dir = home_dir().unwrap();
-    let storage_path = home_dir
-        .join(".gib")
-        .join("storages")
-        .join(format!("{}.msgpack", name));
-    let contents = std::fs::read(&storage_path).unwrap_or_else(|e| {
-        handle_error(format!("Failed to read storage '{}': {}", name, e), None)
-    });
-
-    rmp_serde::from_slice(&contents).unwrap_or_else(|e| {
-        handle_error(format!("Failed to parse storage '{}': {}", name, e), None)
-    })
-}
-
-pub fn handle_error(error: String, pb: Option<&ProgressBar>) -> ! {
-    if let Some(pb) = pb {
-        pb.finish_and_clear();
-    }
-    if is_json_mode() {
-        emit_error(&error, "error");
-    } else {
-        eprintln!("{}", style(error).red());
-        std::process::exit(1);
-    }
-}
-
-pub fn get_fs(storage: &Storage, pb: Option<&ProgressBar>) -> Arc<dyn FS> {
-    let fs: Arc<dyn FS> = match storage.storage_type {
-        LOCAL_STORAGE_TYPE => Arc::new(LocalFS::new(storage.path.as_ref().unwrap().clone())),
-        S3_STORAGE_TYPE => Arc::new(S3FS::new(S3FSConfig {
-            region: storage.region.clone(),
-            bucket: storage.bucket.clone(),
-            access_key: storage.access_key.clone(),
-            secret_key: storage.secret_key.clone(),
-            endpoint: storage.endpoint.clone(),
-        })),
-        WEBDAV_STORAGE_TYPE => {
-            let config = WebDavFSConfig {
-                url: storage
-                    .url
-                    .clone()
-                    .unwrap_or_else(|| handle_error("WebDAV storage has no URL".to_string(), pb)),
-                username: storage.username.clone().unwrap_or_else(|| {
-                    handle_error("WebDAV storage has no username".to_string(), pb)
-                }),
-                password: storage.password.clone().unwrap_or_else(|| {
-                    handle_error("WebDAV storage has no password".to_string(), pb)
-                }),
-            };
-            let webdav = WebDavFS::new(config).unwrap_or_else(|error| handle_error(error, pb));
-            Arc::new(webdav)
-        }
-        _ => handle_error("Invalid storage type".to_string(), pb),
-    };
-
-    fs
+pub(crate) fn is_encrypted(data: &[u8]) -> bool {
+    data.len() >= MAGIC.len() && &data[..MAGIC.len()] == MAGIC
 }

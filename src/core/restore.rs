@@ -1,7 +1,7 @@
 use crate::core::crypto::read_file_maybe_decrypt;
 use crate::core::metadata::BackupObject;
 use crate::core::permissions::set_file_permissions;
-use crate::fs::FS;
+use crate::storage::FS;
 use futures::stream::{self, StreamExt};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
@@ -10,7 +10,12 @@ use std::sync::Arc;
 
 const MAX_CONCURRENT_FILES: usize = 100;
 
-pub(crate) type RestoreProgressCallback = Arc<dyn Fn() + Send + Sync>;
+#[derive(Clone, Debug)]
+pub(crate) struct RestoreProgress {
+    pub(crate) path: String,
+    pub(crate) processed: u64,
+    pub(crate) total: u64,
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct RestoreStats {
@@ -30,22 +35,32 @@ enum RestoreFileOutcome {
     Skipped,
 }
 
-pub(crate) async fn restore_files(
+pub(crate) async fn restore_files_reported(
     fs: Arc<dyn FS>,
     key: String,
     password: Option<String>,
     target_path: String,
     files: Vec<(String, BackupObject)>,
-    progress: Option<RestoreProgressCallback>,
+    progress: Option<Arc<dyn Fn(RestoreProgress) + Send + Sync>>,
+) -> RestoreStats {
+    restore_files_internal(fs, key, password, target_path, files, progress).await
+}
+
+async fn restore_files_internal(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+    target_path: String,
+    files: Vec<(String, BackupObject)>,
+    detailed_progress: Option<Arc<dyn Fn(RestoreProgress) + Send + Sync>>,
 ) -> RestoreStats {
     let mut stats = RestoreStats::default();
+    let total = files.len() as u64;
     let mut results = stream::iter(files.into_iter().map(|(relative_path, backup_object)| {
         let fs = Arc::clone(&fs);
         let key = key.clone();
         let password = password.clone();
         let target_path = target_path.clone();
-        let progress = progress.clone();
-
         async move {
             let result = restore_one_file(
                 fs,
@@ -56,15 +71,19 @@ pub(crate) async fn restore_files(
                 backup_object,
             )
             .await;
-            if let Some(progress) = progress {
-                progress();
-            }
             (relative_path, result)
         }
     }))
-    .buffer_unordered(MAX_CONCURRENT_FILES);
+    .buffered(MAX_CONCURRENT_FILES);
 
     while let Some((relative_path, result)) = results.next().await {
+        if let Some(progress) = &detailed_progress {
+            progress(RestoreProgress {
+                path: relative_path.clone(),
+                processed: stats.restored + stats.skipped + stats.failed.len() as u64 + 1,
+                total,
+            });
+        }
         match result {
             Ok(RestoreFileOutcome::Restored) => stats.restored += 1,
             Ok(RestoreFileOutcome::Skipped) => stats.skipped += 1,
@@ -155,7 +174,7 @@ fn calculate_file_hash(path: &Path) -> Result<String, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::{FS, LocalFS};
+    use crate::storage::{FS, LocalFS};
     use std::path::PathBuf;
 
     fn test_directory(label: &str) -> PathBuf {
@@ -213,7 +232,7 @@ mod tests {
                 },
             ),
         ];
-        let stats = restore_files(
+        let stats = restore_files_reported(
             Arc::clone(&fs),
             key.to_string(),
             None,
@@ -233,7 +252,7 @@ mod tests {
             second_data
         );
 
-        let second_stats = restore_files(
+        let second_stats = restore_files_reported(
             fs,
             key.to_string(),
             None,

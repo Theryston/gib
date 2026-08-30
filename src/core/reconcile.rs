@@ -3,13 +3,14 @@ use crate::core::git::is_git_path;
 use crate::core::live_state::LiveFileCache;
 use crate::core::metadata::{Backup, BackupObject};
 use crate::core::permissions::{get_file_permissions_with_path, set_file_permissions};
-use crate::fs::FS;
+use crate::storage::FS;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::Metadata;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
@@ -26,7 +27,6 @@ pub(crate) struct LocalFile {
 #[derive(Clone, Debug)]
 pub(crate) struct ReconcileConflict {
     pub(crate) path: String,
-    pub(crate) reason: String,
     pub(crate) remote: Option<BackupObject>,
 }
 
@@ -193,7 +193,6 @@ pub(crate) async fn reconcile_worktree(
         result.local_changes.insert(path.clone());
         result.conflicts.push(ReconcileConflict {
             path,
-            reason: conflict_reason(local_file, base_file, remote_file),
             remote: remote_file.cloned(),
         });
     }
@@ -314,110 +313,6 @@ pub(crate) fn worktree_matches_backup_with_cache(
     }))
 }
 
-pub(crate) fn worktree_matches_backup_paths_with_cache(
-    root: &Path,
-    ignore_patterns: &[String],
-    backup: &Backup,
-    changed_paths: &BTreeSet<String>,
-    cache: &mut BTreeMap<String, LiveFileCache>,
-) -> Result<bool, String> {
-    let scopes = changed_paths
-        .iter()
-        .map(|path| {
-            let target = root.join(path);
-            (path.trim_matches('/').to_string(), !target.is_file())
-        })
-        .collect::<Vec<_>>();
-    let local = scan_worktree_scopes(root, ignore_patterns, &scopes, cache)?;
-    let expected: HashMap<String, &BackupObject> = backup
-        .tree
-        .iter()
-        .filter(|(path, _)| {
-            !is_ignored_relative(path, ignore_patterns)
-                && scopes
-                    .iter()
-                    .any(|(scope, recursive)| path_in_scope(path, scope, *recursive))
-        })
-        .map(|(path, object)| (path.clone(), object))
-        .collect();
-
-    if local.len() != expected.len() {
-        return Ok(false);
-    }
-
-    Ok(local.iter().all(|(path, local_file)| {
-        expected
-            .get(path)
-            .is_some_and(|remote| local_matches_backup(Some(local_file), Some(remote)))
-    }))
-}
-
-fn scan_worktree_scopes(
-    root: &Path,
-    ignore_patterns: &[String],
-    scopes: &[(String, bool)],
-    cache: &mut BTreeMap<String, LiveFileCache>,
-) -> Result<HashMap<String, LocalFile>, String> {
-    let mut files = HashMap::new();
-
-    for (scope, recursive) in scopes {
-        let target = root.join(scope);
-        if target.is_file() {
-            if is_ignored_path(&target, root, ignore_patterns) {
-                continue;
-            }
-            insert_local_file(&mut files, root, &target, cache)?;
-            continue;
-        }
-
-        if !*recursive || !target.is_dir() {
-            continue;
-        }
-
-        let walker = WalkDir::new(&target)
-            .into_iter()
-            .filter_entry(|entry| !is_ignored_path(entry.path(), root, ignore_patterns));
-        for entry in walker {
-            let entry = entry.map_err(|error| {
-                format!("Failed to scan live root '{}': {}", root.display(), error)
-            })?;
-            if entry.file_type().is_file() {
-                insert_local_file(&mut files, root, entry.path(), cache)?;
-            }
-        }
-    }
-
-    Ok(files)
-}
-
-fn insert_local_file(
-    files: &mut HashMap<String, LocalFile>,
-    root: &Path,
-    path: &Path,
-    cache: &mut BTreeMap<String, LiveFileCache>,
-) -> Result<(), String> {
-    let relative = path
-        .strip_prefix(root)
-        .map_err(|error| format!("Failed to derive a relative path: {}", error))?
-        .to_string_lossy()
-        .replace('\\', "/");
-    let metadata = path
-        .metadata()
-        .map_err(|error| format!("Failed to inspect '{}': {}", relative, error))?;
-    let permissions = get_file_permissions_with_path(&metadata, path.to_string_lossy().as_ref());
-    let hash = cached_or_hash_file(path, &relative, &metadata, permissions, cache)?;
-
-    files.insert(
-        relative,
-        LocalFile {
-            hash,
-            size: metadata.len(),
-            permissions,
-        },
-    );
-    Ok(())
-}
-
 fn cached_or_hash_file(
     path: &Path,
     relative: &str,
@@ -448,17 +343,6 @@ fn cached_or_hash_file(
         },
     );
     Ok(hash)
-}
-
-pub(crate) fn invalidate_worktree_cache_paths(
-    cache: &mut BTreeMap<String, LiveFileCache>,
-    changed_paths: &BTreeSet<String>,
-) {
-    let scopes = changed_paths
-        .iter()
-        .map(|path| path.trim_matches('/').to_string())
-        .collect::<Vec<_>>();
-    cache.retain(|path, _| !scopes.iter().any(|scope| path_in_scope(path, scope, true)));
 }
 
 pub(crate) fn update_worktree_cache_from_backup(
@@ -611,20 +495,6 @@ fn backup_matches_backup(left: Option<&BackupObject>, right: Option<&BackupObjec
         }
         _ => false,
     }
-}
-
-fn conflict_reason(
-    local: Option<&LocalFile>,
-    base: Option<&BackupObject>,
-    remote: Option<&BackupObject>,
-) -> String {
-    match (local.is_some(), base.is_some(), remote.is_some()) {
-        (true, true, false) => "the file was changed locally while it was deleted remotely",
-        (false, true, true) => "the file was deleted locally while it was changed remotely",
-        (true, false, true) => "the file was created independently on both machines",
-        _ => "both machines changed the same file",
-    }
-    .to_string()
 }
 
 async fn read_backup_object_bytes(
@@ -876,6 +746,8 @@ fn safe_target_path(root: &Path, relative_path: &str) -> Result<PathBuf, String>
     Ok(root.join(relative))
 }
 
+static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn temporary_path(target: &Path) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -885,7 +757,12 @@ fn temporary_path(target: &Path) -> PathBuf {
         .file_name()
         .map(|name| name.to_string_lossy())
         .unwrap_or_else(|| std::borrow::Cow::Borrowed("file"));
-    target.with_file_name(format!(".{}.gib-{}-{}", name, std::process::id(), stamp))
+    target.with_file_name(format!(
+        ".{}.gib-{}-{}",
+        name,
+        stamp,
+        TEMPORARY_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 fn write_bytes_atomically(
@@ -1042,7 +919,7 @@ mod tests {
         std::fs::create_dir_all(git_head.parent().unwrap()).unwrap();
         std::fs::write(&git_head, b"ref: refs/heads/main\n").unwrap();
 
-        let fs: Arc<dyn FS> = Arc::new(crate::fs::LocalFS::new(&storage));
+        let fs: Arc<dyn FS> = Arc::new(crate::storage::LocalFS::new(&storage));
         apply_remote_change(&root, "projects/app/.git/HEAD", None, fs, "project", None)
             .await
             .unwrap();

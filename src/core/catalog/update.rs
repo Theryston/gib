@@ -1,6 +1,6 @@
 use crate::core::metadata::{Backup, BackupObject};
 use crate::core::metadata::{BackupSummary, ChunkIndex};
-use crate::fs::FS;
+use crate::storage::FS;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -1462,7 +1462,7 @@ mod tests {
     };
     use crate::core::catalog::storage::catalog_path;
     use crate::core::metadata::{BackupObject, BackupSummary, ChunkIndex};
-    use crate::fs::{FS, LocalFS};
+    use crate::storage::{FS, LocalFS};
     use crate::utils::compress_bytes;
     use async_trait::async_trait;
     use std::sync::Arc;

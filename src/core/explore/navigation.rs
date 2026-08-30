@@ -1,10 +1,10 @@
-use super::state::{ExplorerEntry, ExplorerKind, ExplorerScope, ExplorerStatus, SelectedFile};
+use super::state::{ExplorerEntry, ExplorerKind, ExplorerScope, ExplorerStatus};
 use crate::core::catalog::{
     CatalogEntrySummary, CurrentSnapshot, EntryHistory, collect_entries_by_tokens_with_snapshot,
-    directory_exists, get_entry_history_with_snapshot, list_directory_children_with_snapshot,
-    lookup_path, normalize_file_path, normalize_relative_path, path_tokens,
+    get_entry_history_with_snapshot, list_directory_children_with_snapshot,
+    normalize_relative_path, path_tokens,
 };
-use crate::fs::FS;
+use crate::storage::FS;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -66,12 +66,6 @@ impl ExplorerNavigator {
                 entries: directory.entries.clone(),
                 next_cursor: directory.next_cursor.clone(),
             })
-    }
-
-    pub(crate) fn next_cursor(&self, path: &str, scope: ExplorerScope) -> Option<String> {
-        self.directories
-            .get(&(path.to_string(), scope))
-            .and_then(|directory| directory.next_cursor.clone())
     }
 
     pub(crate) async fn load_directory_page(
@@ -250,37 +244,6 @@ impl ExplorerNavigator {
         Ok(false)
     }
 
-    pub(crate) async fn ensure_directory(
-        &mut self,
-        path: &str,
-        scope: ExplorerScope,
-    ) -> Result<DirectoryPage, String> {
-        self.load_directory_page(path, scope, None).await
-    }
-
-    pub(crate) async fn directory_exists(&self, path: &str) -> Result<bool, String> {
-        directory_exists(
-            Arc::clone(&self.fs),
-            self.key.clone(),
-            self.password.clone(),
-            path,
-        )
-        .await
-    }
-
-    pub(crate) async fn load_next_directory_page(
-        &mut self,
-        path: &str,
-        scope: ExplorerScope,
-    ) -> Result<Option<DirectoryPage>, String> {
-        let Some(cursor) = self.next_cursor(path, scope) else {
-            return Ok(None);
-        };
-        self.load_directory_page(path, scope, Some(&cursor))
-            .await
-            .map(Some)
-    }
-
     pub(crate) async fn entry_details(
         &mut self,
         entry: &ExplorerEntry,
@@ -307,31 +270,6 @@ impl ExplorerNavigator {
         let enriched = ExplorerEntry::from_history(&history);
         self.entry_details.insert(entry.entry_id.clone(), history);
         Ok(Some(enriched))
-    }
-
-    pub(crate) async fn history(&mut self, path: &str) -> Result<Option<EntryHistory>, String> {
-        let path = normalize_file_path(path)?;
-        if let Some((_, history)) = self
-            .entry_details
-            .iter()
-            .find(|(_, history)| lookup_path(&history.path) == lookup_path(&path))
-        {
-            return Ok(Some(history.clone()));
-        }
-
-        let history = get_entry_history_with_snapshot(
-            Arc::clone(&self.fs),
-            self.key.clone(),
-            self.password.clone(),
-            &path,
-            self.current_snapshot.as_ref(),
-        )
-        .await?;
-        if let Some(history) = &history {
-            self.entry_details
-                .insert(history.entry_id.clone(), history.clone());
-        }
-        Ok(history)
     }
 
     pub(crate) async fn search(
@@ -365,105 +303,6 @@ impl ExplorerNavigator {
                 .then_with(|| left.path.cmp(&right.path))
                 .then_with(|| left.entry_id.cmp(&right.entry_id))
         });
-        Ok(entries)
-    }
-
-    pub(crate) async fn descendant_files(
-        &mut self,
-        path: &str,
-        scope: ExplorerScope,
-    ) -> Result<Vec<SelectedFile>, String> {
-        let entries = self.descendant_entries(path, scope).await?;
-        Ok(entries
-            .iter()
-            .filter_map(ExplorerEntry::selected_file)
-            .collect())
-    }
-
-    pub(crate) async fn reveal_path(
-        &mut self,
-        root_path: &str,
-        target_path: &str,
-        scope: ExplorerScope,
-        expanded: &mut std::collections::BTreeSet<String>,
-    ) -> Result<bool, String> {
-        let root_path = normalize_relative_path(root_path)?;
-        let target_path = normalize_relative_path(target_path)?;
-        if target_path == root_path {
-            return Ok(true);
-        }
-
-        let relative_target = if root_path.is_empty() {
-            target_path.clone()
-        } else if let Some(relative) = target_path.strip_prefix(&format!("{}/", root_path)) {
-            relative.to_string()
-        } else {
-            return Ok(false);
-        };
-
-        let mut current_path = root_path;
-        for component in relative_target.split('/') {
-            if component.is_empty() {
-                continue;
-            }
-
-            let found = loop {
-                let page = self.ensure_directory(&current_path, scope).await?;
-                let found = page
-                    .entries
-                    .iter()
-                    .find(|entry| lookup_path(&entry.name) == lookup_path(component))
-                    .cloned();
-                if found.is_some() || page.next_cursor.is_none() {
-                    break found;
-                }
-                self.load_next_directory_page(&current_path, scope).await?;
-            };
-
-            let Some(entry) = found else {
-                return Ok(false);
-            };
-            expanded.insert(current_path.clone());
-            current_path = entry.path;
-        }
-
-        Ok(true)
-    }
-
-    async fn descendant_entries(
-        &mut self,
-        path: &str,
-        scope: ExplorerScope,
-    ) -> Result<Vec<ExplorerEntry>, String> {
-        let mut entries = Vec::new();
-        let mut pending_directories = vec![path.to_string()];
-        while let Some(directory_path) = pending_directories.pop() {
-            let mut cursor = None;
-            loop {
-                let page = self
-                    .load_directory_page(&directory_path, scope, cursor.as_deref())
-                    .await?;
-                let page_entries = page.entries;
-                let next_cursor = page.next_cursor;
-
-                for entry in page_entries {
-                    if entry.is_file() {
-                        if let Some(entry) = self.entry_details(&entry).await?
-                            && entry.restorable
-                        {
-                            entries.push(entry);
-                        }
-                    } else {
-                        pending_directories.push(entry.path);
-                    }
-                }
-
-                match next_cursor {
-                    Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
-                    _ => break,
-                }
-            }
-        }
         Ok(entries)
     }
 }
@@ -503,9 +342,8 @@ mod tests {
     use crate::core::catalog::index_backup_after_finalize;
     use crate::core::crypto::encode_file_bytes;
     use crate::core::metadata::{Backup, BackupObject};
-    use crate::fs::LocalFS;
+    use crate::storage::LocalFS;
     use crate::utils::compress_bytes;
-    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     #[test]
@@ -617,7 +455,7 @@ mod tests {
 
         let mut navigator = ExplorerNavigator::new(Arc::clone(&fs), key.to_string(), None);
         let all_history = navigator
-            .ensure_directory("", ExplorerScope::AllHistory)
+            .load_directory_page("", ExplorerScope::AllHistory, None)
             .await
             .unwrap();
         let old_directory = all_history
@@ -628,7 +466,6 @@ mod tests {
         assert_eq!(old_directory.kind, ExplorerKind::Directory);
         assert_eq!(old_directory.status, ExplorerStatus::Deleted);
         assert!(old_directory.restorable);
-        assert!(navigator.directory_exists("old").await.unwrap());
 
         let current_directory = all_history
             .entries
@@ -639,7 +476,7 @@ mod tests {
         assert!(current_directory.restorable);
 
         let current = navigator
-            .ensure_directory("", ExplorerScope::Current)
+            .load_directory_page("", ExplorerScope::Current, None)
             .await
             .unwrap();
         assert!(current.entries.iter().all(|entry| entry.path != "old"));
@@ -652,7 +489,7 @@ mod tests {
         );
 
         let old_file = navigator
-            .ensure_directory("old", ExplorerScope::AllHistory)
+            .load_directory_page("old", ExplorerScope::AllHistory, None)
             .await
             .unwrap()
             .entries
@@ -661,7 +498,6 @@ mod tests {
             .unwrap();
         assert_eq!(old_file.status, ExplorerStatus::Deleted);
         assert_eq!(old_file.last_backup.as_deref(), Some("backup-one"));
-        assert!(old_file.selected_file().is_some());
 
         let search = navigator
             .search("old", ExplorerScope::AllHistory)
@@ -674,15 +510,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["old/old.txt"]
         );
-
-        let mut expanded = BTreeSet::new();
-        assert!(
-            navigator
-                .reveal_path("", "old/old.txt", ExplorerScope::AllHistory, &mut expanded)
-                .await
-                .unwrap()
-        );
-        assert!(expanded.contains("") && expanded.contains("old"));
 
         let _ = std::fs::remove_dir_all(directory);
     }

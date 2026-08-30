@@ -139,7 +139,7 @@ jobs:
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --bin gib --target ${{ matrix.target }}
 
       - name: Prepare artifact (Unix)
         if: matrix.os != 'windows-latest'

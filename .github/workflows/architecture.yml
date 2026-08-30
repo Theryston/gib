@@ -1,0 +1,22 @@
+name: Architecture
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  architecture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Check layer boundaries
+        run: bash scripts/check-architecture.sh
+      - name: Check library without CLI dependencies
+        run: cargo check --no-default-features --lib

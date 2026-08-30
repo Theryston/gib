@@ -24,5 +24,5 @@ pub(crate) use query::{
 };
 pub(crate) use update::index_backup_after_finalize;
 
-pub(crate) use storage::mark_catalog_degraded_state;
+pub(crate) use storage::{load_backup_manifest, mark_catalog_degraded_state};
 pub(crate) use update::remove_backup_from_catalog;
