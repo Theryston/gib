@@ -35,6 +35,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Run general tests
+        run: cargo test
+
       - name: Install release-plz
         uses: taiki-e/install-action@release-plz
 
