@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.44](https://github.com/Theryston/gib/compare/v0.0.43...v0.0.44) - 2026-08-30
+
+### Added
+
+- install ripgrep for architecture check workflow
+- lib API
+
 ## [0.0.43](https://github.com/Theryston/gib/compare/v0.0.42...v0.0.43) - 2026-08-29
 
 ### Added
