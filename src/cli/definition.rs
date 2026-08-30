@@ -348,7 +348,7 @@ pub fn command() -> Command {
 
     Command::new("gib")
         .about("⚡ Back up your files. Keep them in sync. Travel through their history.")
-        .version(env!("CARGO_PKG_VERSION"))
+        .version(gib::VERSION)
         .subcommand_required(true)
         .arg_required_else_help(true)
         .allow_external_subcommands(true)

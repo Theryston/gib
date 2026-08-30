@@ -117,7 +117,7 @@ impl WebDavFS {
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
-            .user_agent(format!("gib/{}", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("gib/{}", crate::VERSION))
             .build()
             .map_err(|error| format!("Failed to initialize the WebDAV client: {}", error))?;
 

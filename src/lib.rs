@@ -13,3 +13,6 @@ mod storage;
 mod utils;
 
 pub use api::{FS, Gib, GibBuilder, GibError, GibEvent, MemoryFS};
+
+/// Current version of the Gib package.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

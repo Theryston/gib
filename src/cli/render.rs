@@ -615,7 +615,7 @@ impl CliOutput {
         if self.is_json() {
             self.json_stdout(&json_envelope("version", TextData { text: value }));
         } else {
-            self.line_stdout(&value);
+            self.line_stdout(value.strip_suffix('\n').unwrap_or(&value));
         }
     }
 
