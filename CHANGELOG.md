@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.45](https://github.com/Theryston/gib/compare/v0.0.44...v0.0.45) - 2026-08-30
+
+### Added
+
+- add cross-platform support for autostart secret protection
+- add cargo test to release workflow
+
 ## [0.0.44](https://github.com/Theryston/gib/compare/v0.0.43...v0.0.44) - 2026-08-30
 
 ### Added

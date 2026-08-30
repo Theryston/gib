@@ -1,6 +1,6 @@
 [package]
 name = "gib"
-version = "0.0.44"
+version = "0.0.45"
 edition = "2024"
 description = "⚡ Back up your files. Keep them in sync. Travel through their history."
 license = "MIT"
