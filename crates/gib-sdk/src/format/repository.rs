@@ -1,14 +1,17 @@
 use crate::domain::{
     CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
-    CURRENT_REPOSITORY_FORMAT_VERSION, DomainError, REPOSITORY_DESCRIPTOR_OBJECT_KEY,
-    REPOSITORY_MAGIC, REQUIRED_REPOSITORY_FEATURE, RepositoryDescriptor, RepositoryFeature,
-    RepositoryIdentity, RepositoryKey, RepositoryObject, RepositoryRoots,
+    CURRENT_REPOSITORY_FORMAT_VERSION, CURRENT_REPOSITORY_HEAD_VERSION, DomainError,
+    REPOSITORY_DESCRIPTOR_OBJECT_KEY, REPOSITORY_MAGIC, REQUIRED_REPOSITORY_FEATURE,
+    RepositoryDescriptor, RepositoryFeature, RepositoryHead, RepositoryIdentity, RepositoryKey,
+    RepositoryObject, RepositoryRoots, SnapshotReference,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use std::io::Cursor;
 
 pub(crate) const MAX_BOOTSTRAP_BYTES: usize = 1_024;
 pub(crate) const MAX_DESCRIPTOR_BYTES: usize = 4_096;
+pub(crate) const MAX_HEAD_BYTES: usize = 1_024;
 
 const MAX_MESSAGEPACK_DEPTH: usize = 16;
 const MAX_MESSAGEPACK_COLLECTION_ITEMS: u32 = 32;
@@ -28,6 +31,7 @@ pub(crate) enum FormatError {
     UnsupportedRequiredFeature,
     UnsupportedVersion { version: u16 },
     VersionMismatch,
+    InvalidChecksum,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +90,33 @@ struct RootsWire<'a> {
 struct RootsWireOwned {
     format: String,
     descriptor: String,
+}
+
+#[derive(Serialize)]
+struct HeadUnsignedWire<'a> {
+    head_version: u16,
+    magic: &'a str,
+    generation: u64,
+    snapshot: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct HeadWire<'a> {
+    head_version: u16,
+    magic: &'a str,
+    generation: u64,
+    snapshot: Option<&'a str>,
+    checksum: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeadWireOwned {
+    head_version: u16,
+    magic: String,
+    generation: u64,
+    snapshot: Option<String>,
+    checksum: Vec<u8>,
 }
 
 pub(crate) fn encode_bootstrap() -> Result<Vec<u8>, FormatError> {
@@ -199,6 +230,57 @@ pub(crate) fn decode_descriptor(
         required_features,
         roots,
     ))
+}
+
+pub(crate) fn encode_head(head: &RepositoryHead) -> Result<Vec<u8>, FormatError> {
+    let snapshot = head.snapshot().map(SnapshotReference::as_str);
+    let unsigned = encode_head_unsigned(head.generation(), snapshot)?;
+    let checksum = Sha256::digest(&unsigned);
+    rmp_serde::to_vec_named(&HeadWire {
+        head_version: CURRENT_REPOSITORY_HEAD_VERSION,
+        magic: REPOSITORY_MAGIC,
+        generation: head.generation(),
+        snapshot,
+        checksum: checksum.to_vec(),
+    })
+    .map_err(|_| FormatError::Serialization)
+}
+
+pub(crate) fn decode_head(bytes: &[u8]) -> Result<RepositoryHead, FormatError> {
+    let wire: HeadWireOwned = decode_messagepack(bytes, MAX_HEAD_BYTES)?;
+    if wire.head_version != CURRENT_REPOSITORY_HEAD_VERSION {
+        return Err(FormatError::UnsupportedVersion {
+            version: wire.head_version,
+        });
+    }
+    if wire.magic != REPOSITORY_MAGIC {
+        return Err(FormatError::InvalidMagic);
+    }
+    if wire.checksum.len() != Sha256::output_size() {
+        return Err(FormatError::InvalidChecksum);
+    }
+    let unsigned = encode_head_unsigned(wire.generation, wire.snapshot.as_deref())?;
+    let checksum = Sha256::digest(&unsigned);
+    if wire.checksum.as_slice() != checksum.as_slice() {
+        return Err(FormatError::InvalidChecksum);
+    }
+
+    let snapshot = wire
+        .snapshot
+        .map(SnapshotReference::new)
+        .transpose()
+        .map_err(map_domain_error)?;
+    RepositoryHead::new(wire.generation, snapshot).map_err(map_domain_error)
+}
+
+fn encode_head_unsigned(generation: u64, snapshot: Option<&str>) -> Result<Vec<u8>, FormatError> {
+    rmp_serde::to_vec_named(&HeadUnsignedWire {
+        head_version: CURRENT_REPOSITORY_HEAD_VERSION,
+        magic: REPOSITORY_MAGIC,
+        generation,
+        snapshot,
+    })
+    .map_err(|_| FormatError::Serialization)
 }
 
 fn decode_messagepack<T>(bytes: &[u8], max_bytes: usize) -> Result<T, FormatError>
@@ -403,7 +485,9 @@ fn map_domain_error(error: DomainError) -> FormatError {
     match error {
         DomainError::InvalidRepositoryIdentity { .. }
         | DomainError::InvalidRepositoryKey { .. }
-        | DomainError::InvalidRepositoryObject { .. } => FormatError::InvalidField,
+        | DomainError::InvalidRepositoryObject { .. }
+        | DomainError::InvalidSnapshotReference { .. }
+        | DomainError::InvalidRepositoryHead { .. } => FormatError::InvalidField,
     }
 }
 
@@ -471,6 +555,40 @@ mod tests {
             Err(FormatError::InputTooLarge)
         );
         assert!(decode_bootstrap(b"\x81").is_err());
+    }
+
+    #[test]
+    fn head_wire_round_trips_and_rejects_checksum_tampering() {
+        let snapshot = SnapshotReference::new("snapshots/fixture");
+        assert!(snapshot.is_ok());
+        let head =
+            RepositoryHead::new(7, snapshot.ok()).unwrap_or_else(|_| RepositoryHead::empty());
+        let encoded = encode_head(&head).unwrap_or_default();
+        assert!(encoded.len() <= MAX_HEAD_BYTES);
+        assert_eq!(encoded.first().copied(), Some(0x85));
+        assert_eq!(decode_head(&encoded), Ok(head));
+
+        let mut corrupted = encoded;
+        if let Some(last) = corrupted.last_mut() {
+            *last ^= 1;
+        }
+        assert_eq!(decode_head(&corrupted), Err(FormatError::InvalidChecksum));
+    }
+
+    #[test]
+    fn unknown_head_versions_are_not_treated_as_empty() {
+        let bytes = rmp_serde::to_vec_named(&HeadWire {
+            head_version: 99,
+            magic: REPOSITORY_MAGIC,
+            generation: 0,
+            snapshot: None,
+            checksum: vec![0; 32],
+        });
+        assert!(bytes.is_ok());
+        assert_eq!(
+            decode_head(&bytes.unwrap_or_default()),
+            Err(FormatError::UnsupportedVersion { version: 99 })
+        );
     }
 
     #[test]

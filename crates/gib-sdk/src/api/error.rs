@@ -31,6 +31,16 @@ pub enum ErrorCode {
     RepositoryUnsupportedVersion,
     /// A repository is validly encoded but incompatible with this SDK.
     RepositoryIncompatible,
+    /// A repository HEAD publication lost its compare-and-swap race.
+    RepositoryPublicationConflict,
+    /// A requested snapshot object is missing.
+    RepositorySnapshotMissing,
+    /// An immutable object required by a requested snapshot is missing.
+    RepositoryRequiredObjectMissing,
+    /// The storage backend cannot perform conditional repository publication.
+    StorageCapabilityUnsupported,
+    /// The repository publication generation cannot be incremented.
+    RepositoryGenerationExhausted,
     /// The configured storage backend failed a lifecycle operation.
     StorageFailure,
 }
@@ -52,6 +62,11 @@ impl ErrorCode {
             Self::RepositoryMalformed => "repository_malformed",
             Self::RepositoryUnsupportedVersion => "repository_unsupported_version",
             Self::RepositoryIncompatible => "repository_incompatible",
+            Self::RepositoryPublicationConflict => "repository_publication_conflict",
+            Self::RepositorySnapshotMissing => "repository_snapshot_missing",
+            Self::RepositoryRequiredObjectMissing => "repository_required_object_missing",
+            Self::StorageCapabilityUnsupported => "storage_capability_unsupported",
+            Self::RepositoryGenerationExhausted => "repository_generation_exhausted",
             Self::StorageFailure => "storage_failure",
         }
     }
@@ -113,6 +128,16 @@ pub enum SdkError {
         /// A stable explanation of the incompatibility.
         reason: &'static str,
     },
+    /// Another publisher changed HEAD after the supplied versioned read.
+    RepositoryPublicationConflict,
+    /// The requested snapshot object is missing.
+    RepositorySnapshotMissing,
+    /// An immutable object required by the requested snapshot is missing.
+    RepositoryRequiredObjectMissing,
+    /// The storage backend does not provide conditional HEAD publication.
+    StorageCapabilityUnsupported,
+    /// The repository HEAD generation cannot be incremented safely.
+    RepositoryGenerationExhausted,
     /// A storage backend failed without exposing backend-specific details.
     StorageFailure {
         /// The lifecycle operation that failed.
@@ -153,6 +178,11 @@ impl SdkError {
             Self::RepositoryMalformed { .. } => ErrorCode::RepositoryMalformed,
             Self::RepositoryUnsupportedVersion { .. } => ErrorCode::RepositoryUnsupportedVersion,
             Self::RepositoryIncompatible { .. } => ErrorCode::RepositoryIncompatible,
+            Self::RepositoryPublicationConflict => ErrorCode::RepositoryPublicationConflict,
+            Self::RepositorySnapshotMissing => ErrorCode::RepositorySnapshotMissing,
+            Self::RepositoryRequiredObjectMissing => ErrorCode::RepositoryRequiredObjectMissing,
+            Self::StorageCapabilityUnsupported => ErrorCode::StorageCapabilityUnsupported,
+            Self::RepositoryGenerationExhausted => ErrorCode::RepositoryGenerationExhausted,
             Self::StorageFailure { .. } => ErrorCode::StorageFailure,
         }
     }
@@ -173,6 +203,11 @@ impl SdkError {
             | Self::RepositoryMalformed { .. }
             | Self::RepositoryUnsupportedVersion { .. }
             | Self::RepositoryIncompatible { .. }
+            | Self::RepositoryPublicationConflict
+            | Self::RepositorySnapshotMissing
+            | Self::RepositoryRequiredObjectMissing
+            | Self::StorageCapabilityUnsupported
+            | Self::RepositoryGenerationExhausted
             | Self::StorageFailure { .. } => None,
         }
     }
@@ -231,6 +266,21 @@ impl fmt::Display for SdkError {
             }
             Self::RepositoryIncompatible { reason } => {
                 write!(formatter, "repository is incompatible: {reason}")
+            }
+            Self::RepositoryPublicationConflict => {
+                formatter.write_str("repository HEAD publication conflicted with another publisher")
+            }
+            Self::RepositorySnapshotMissing => {
+                formatter.write_str("the requested snapshot object is missing")
+            }
+            Self::RepositoryRequiredObjectMissing => {
+                formatter.write_str("a required snapshot object is missing")
+            }
+            Self::StorageCapabilityUnsupported => {
+                formatter.write_str("storage does not support conditional HEAD publication")
+            }
+            Self::RepositoryGenerationExhausted => {
+                formatter.write_str("repository HEAD publication generation is exhausted")
             }
             Self::StorageFailure { operation } => {
                 write!(formatter, "repository storage {operation} operation failed")

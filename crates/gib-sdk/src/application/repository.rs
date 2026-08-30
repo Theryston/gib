@@ -1,11 +1,15 @@
-use super::ports::{RepositoryStorage, StorageError};
+use super::ports::{RepositoryStorage, StorageError, StorageVersion};
 use crate::domain::{
-    FORMAT_OBJECT_KEY, REPOSITORY_DESCRIPTOR_OBJECT_KEY, RepositoryDescriptor, RepositoryIdentity,
-    RepositoryKey,
+    FORMAT_OBJECT_KEY, HEAD_OBJECT_KEY, REPOSITORY_DESCRIPTOR_OBJECT_KEY, RepositoryDescriptor,
+    RepositoryHead, RepositoryIdentity, RepositoryKey, SnapshotPublication,
 };
 use crate::format::{
-    FormatError, decode_bootstrap, decode_descriptor, encode_bootstrap, encode_descriptor,
+    FormatError, decode_bootstrap, decode_descriptor, decode_head, encode_bootstrap,
+    encode_descriptor, encode_head,
 };
+use std::collections::HashSet;
+
+const MAX_PUBLICATION_OBJECTS: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RepositoryError {
@@ -14,6 +18,13 @@ pub(crate) enum RepositoryError {
     Malformed { reason: &'static str },
     UnsupportedVersion { version: u16 },
     Incompatible { reason: &'static str },
+    PublicationConflict,
+    SnapshotMissing,
+    RequiredObjectMissing,
+    InvalidPublication { reason: &'static str },
+    GenerationExhausted,
+    UnsupportedCapability,
+    Cancelled,
     Storage { operation: &'static str },
 }
 
@@ -21,6 +32,12 @@ pub(crate) enum RepositoryError {
 pub(crate) struct RepositoryOpenExpectations<'a> {
     pub(crate) identity: Option<&'a RepositoryIdentity>,
     pub(crate) repository_key: Option<&'a RepositoryKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HeadRead {
+    pub(crate) head: RepositoryHead,
+    pub(crate) version: Option<StorageVersion>,
 }
 
 pub(crate) fn initialize_repository(
@@ -77,7 +94,190 @@ pub(crate) fn open_repository(
         });
     }
 
+    validate_existing_head(storage)?;
+
     Ok(descriptor)
+}
+
+fn validate_existing_head(storage: &dyn RepositoryStorage) -> Result<(), RepositoryError> {
+    match storage.read(HEAD_OBJECT_KEY) {
+        Ok(_) => read_head(storage).map(|_| ()),
+        Err(StorageError::NotFound) => Ok(()),
+        Err(StorageError::InvalidObjectKey) => Err(RepositoryError::Malformed {
+            reason: "repository HEAD has an invalid storage representation",
+        }),
+        Err(
+            StorageError::AlreadyExists
+            | StorageError::Io
+            | StorageError::Unavailable
+            | StorageError::UnsupportedCapability
+            | StorageError::ConditionNotMet
+            | StorageError::InvalidVersion,
+        ) => Err(RepositoryError::Storage {
+            operation: "read_head",
+        }),
+    }
+}
+
+pub(crate) fn read_head(storage: &dyn RepositoryStorage) -> Result<HeadRead, RepositoryError> {
+    match storage.read_versioned(HEAD_OBJECT_KEY) {
+        Ok(object) => {
+            let head = decode_head(object.contents()).map_err(map_format_error)?;
+            Ok(HeadRead {
+                head,
+                version: Some(object.version().clone()),
+            })
+        }
+        Err(StorageError::NotFound) => Ok(HeadRead {
+            head: RepositoryHead::empty(),
+            version: None,
+        }),
+        Err(StorageError::UnsupportedCapability) => Err(RepositoryError::UnsupportedCapability),
+        Err(StorageError::InvalidObjectKey | StorageError::InvalidVersion) => {
+            Err(RepositoryError::Malformed {
+                reason: "repository HEAD has an invalid storage representation",
+            })
+        }
+        Err(StorageError::AlreadyExists | StorageError::Io | StorageError::Unavailable) => {
+            Err(RepositoryError::Storage {
+                operation: "read_head",
+            })
+        }
+        Err(StorageError::ConditionNotMet) => Err(RepositoryError::Storage {
+            operation: "read_head",
+        }),
+    }
+}
+
+pub(crate) fn publish_head(
+    storage: &dyn RepositoryStorage,
+    expected: &HeadRead,
+    publication: &SnapshotPublication,
+    is_cancelled: Option<&dyn Fn() -> bool>,
+) -> Result<HeadRead, RepositoryError> {
+    check_cancelled(is_cancelled)?;
+    validate_publication(publication)?;
+
+    let mut seen = HashSet::with_capacity(publication.required_objects().len() + 1);
+    let snapshot_key = publication.snapshot().as_str();
+    seen.insert(snapshot_key);
+    match storage.read(snapshot_key) {
+        Ok(contents) if !contents.is_empty() => {}
+        Ok(_) => {
+            return Err(RepositoryError::InvalidPublication {
+                reason: "the target snapshot object is empty",
+            });
+        }
+        Err(StorageError::NotFound) => return Err(RepositoryError::SnapshotMissing),
+        Err(StorageError::InvalidObjectKey) => {
+            return Err(RepositoryError::InvalidPublication {
+                reason: "the target snapshot reference is not a valid storage key",
+            });
+        }
+        Err(
+            StorageError::AlreadyExists
+            | StorageError::Io
+            | StorageError::Unavailable
+            | StorageError::UnsupportedCapability
+            | StorageError::ConditionNotMet
+            | StorageError::InvalidVersion,
+        ) => {
+            return Err(RepositoryError::Storage {
+                operation: "validate_snapshot",
+            });
+        }
+    }
+    for object in publication.required_objects() {
+        if !seen.insert(object.as_str()) {
+            continue;
+        }
+        match storage.read(object.as_str()) {
+            Ok(_) => {}
+            Err(StorageError::NotFound) => return Err(RepositoryError::RequiredObjectMissing),
+            Err(StorageError::InvalidObjectKey) => {
+                return Err(RepositoryError::InvalidPublication {
+                    reason: "required object reference is not a valid storage key",
+                });
+            }
+            Err(
+                StorageError::AlreadyExists
+                | StorageError::Io
+                | StorageError::Unavailable
+                | StorageError::UnsupportedCapability
+                | StorageError::ConditionNotMet
+                | StorageError::InvalidVersion,
+            ) => {
+                return Err(RepositoryError::Storage {
+                    operation: "validate_publication",
+                });
+            }
+        }
+    }
+
+    check_cancelled(is_cancelled)?;
+    let head = expected
+        .head
+        .advance_to(publication.snapshot().clone())
+        .map_err(|_| RepositoryError::GenerationExhausted)?;
+    let head_bytes = encode_head(&head).map_err(map_format_error)?;
+    check_cancelled(is_cancelled)?;
+    let version =
+        match storage.conditional_write(HEAD_OBJECT_KEY, expected.version.as_ref(), &head_bytes) {
+            Ok(version) => version,
+            Err(StorageError::ConditionNotMet) => return Err(RepositoryError::PublicationConflict),
+            Err(StorageError::UnsupportedCapability) => {
+                return Err(RepositoryError::UnsupportedCapability);
+            }
+            Err(StorageError::InvalidObjectKey | StorageError::InvalidVersion) => {
+                return Err(RepositoryError::Malformed {
+                    reason: "repository HEAD has an invalid storage representation",
+                });
+            }
+            Err(
+                StorageError::NotFound
+                | StorageError::AlreadyExists
+                | StorageError::Io
+                | StorageError::Unavailable,
+            ) => {
+                return Err(RepositoryError::Storage {
+                    operation: "publish_head",
+                });
+            }
+        };
+
+    Ok(HeadRead {
+        head,
+        version: Some(version),
+    })
+}
+
+fn validate_publication(publication: &SnapshotPublication) -> Result<(), RepositoryError> {
+    if publication.required_objects().len() > MAX_PUBLICATION_OBJECTS {
+        return Err(RepositoryError::InvalidPublication {
+            reason: "publication references too many required objects",
+        });
+    }
+    if publication.snapshot().as_str() == HEAD_OBJECT_KEY {
+        return Err(RepositoryError::InvalidPublication {
+            reason: "a publication cannot use HEAD as its snapshot",
+        });
+    }
+    for object in publication.required_objects() {
+        if object.as_str() == HEAD_OBJECT_KEY {
+            return Err(RepositoryError::InvalidPublication {
+                reason: "a required object cannot reference HEAD",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn check_cancelled(is_cancelled: Option<&dyn Fn() -> bool>) -> Result<(), RepositoryError> {
+    if is_cancelled.is_some_and(|is_cancelled| is_cancelled()) {
+        Err(RepositoryError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn map_create_error(error: StorageError, _object: &'static str) -> RepositoryError {
@@ -86,7 +286,10 @@ fn map_create_error(error: StorageError, _object: &'static str) -> RepositoryErr
         StorageError::NotFound
         | StorageError::InvalidObjectKey
         | StorageError::Io
-        | StorageError::Unavailable => RepositoryError::Storage {
+        | StorageError::Unavailable
+        | StorageError::UnsupportedCapability
+        | StorageError::ConditionNotMet
+        | StorageError::InvalidVersion => RepositoryError::Storage {
             operation: "create",
         },
     }
@@ -98,9 +301,12 @@ fn map_read_error(error: StorageError, _object: &'static str) -> RepositoryError
         StorageError::InvalidObjectKey => RepositoryError::Malformed {
             reason: "required repository object has an invalid storage type",
         },
-        StorageError::AlreadyExists | StorageError::Io | StorageError::Unavailable => {
-            RepositoryError::Storage { operation: "read" }
-        }
+        StorageError::AlreadyExists
+        | StorageError::Io
+        | StorageError::Unavailable
+        | StorageError::UnsupportedCapability
+        | StorageError::ConditionNotMet
+        | StorageError::InvalidVersion => RepositoryError::Storage { operation: "read" },
     }
 }
 
@@ -114,6 +320,11 @@ fn ensure_absent(
         Err(StorageError::AlreadyExists | StorageError::Io | StorageError::Unavailable) => {
             Err(RepositoryError::Storage { operation: "read" })
         }
+        Err(
+            StorageError::UnsupportedCapability
+            | StorageError::ConditionNotMet
+            | StorageError::InvalidVersion,
+        ) => Err(RepositoryError::Storage { operation: "read" }),
     }
 }
 
@@ -147,6 +358,9 @@ fn map_format_error(error: FormatError) -> RepositoryError {
         },
         FormatError::VersionMismatch => RepositoryError::Malformed {
             reason: "repository descriptor and bootstrap versions differ",
+        },
+        FormatError::InvalidChecksum => RepositoryError::Malformed {
+            reason: "repository object integrity check failed",
         },
         FormatError::Serialization => RepositoryError::Storage {
             operation: "encode",

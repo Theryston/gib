@@ -1,4 +1,6 @@
-use crate::application::ports::{RepositoryStorage, StorageError, StorageResult};
+use crate::application::ports::{
+    RepositoryStorage, StorageError, StorageResult, StorageVersion, VersionedObject,
+};
 use crate::domain::RepositoryObject;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -10,7 +12,18 @@ use std::sync::{Arc, Mutex};
 /// the backend lock, so concurrent initialization attempts have one winner.
 #[derive(Clone, Default)]
 pub struct MemoryStorage {
-    objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    state: Arc<Mutex<MemoryStorageState>>,
+}
+
+#[derive(Default)]
+struct MemoryStorageState {
+    objects: BTreeMap<String, StoredObject>,
+    next_version: u64,
+}
+
+struct StoredObject {
+    contents: Vec<u8>,
+    version: StorageVersion,
 }
 
 impl MemoryStorage {
@@ -21,8 +34,8 @@ impl MemoryStorage {
 
     /// Returns the logical object keys currently stored in sorted order.
     pub fn objects(&self) -> StorageResult<Vec<String>> {
-        let objects = self.objects.lock().map_err(|_| StorageError::Unavailable)?;
-        Ok(objects.keys().cloned().collect())
+        let state = self.state.lock().map_err(|_| StorageError::Unavailable)?;
+        Ok(state.objects.keys().cloned().collect())
     }
 
     /// Reads an object directly for diagnostics and test setup.
@@ -40,8 +53,15 @@ impl MemoryStorage {
         contents: impl AsRef<[u8]>,
     ) -> StorageResult<()> {
         validate_object_key(object_key)?;
-        let mut objects = self.objects.lock().map_err(|_| StorageError::Unavailable)?;
-        objects.insert(object_key.to_owned(), contents.as_ref().to_vec());
+        let mut state = self.state.lock().map_err(|_| StorageError::Unavailable)?;
+        let version = next_version(&mut state)?;
+        state.objects.insert(
+            object_key.to_owned(),
+            StoredObject {
+                contents: contents.as_ref().to_vec(),
+                version,
+            },
+        );
         Ok(())
     }
 
@@ -53,8 +73,8 @@ impl MemoryStorage {
     /// Removes an object for corruption and missing-root tests.
     pub fn remove_object(&self, object_key: &str) -> StorageResult<bool> {
         validate_object_key(object_key)?;
-        let mut objects = self.objects.lock().map_err(|_| StorageError::Unavailable)?;
-        Ok(objects.remove(object_key).is_some())
+        let mut state = self.state.lock().map_err(|_| StorageError::Unavailable)?;
+        Ok(state.objects.remove(object_key).is_some())
     }
 }
 
@@ -71,22 +91,80 @@ impl fmt::Debug for MemoryStorage {
 impl RepositoryStorage for MemoryStorage {
     fn create_if_absent(&self, object_key: &str, contents: &[u8]) -> StorageResult<()> {
         validate_object_key(object_key)?;
-        let mut objects = self.objects.lock().map_err(|_| StorageError::Unavailable)?;
-        if objects.contains_key(object_key) {
+        let mut state = self.state.lock().map_err(|_| StorageError::Unavailable)?;
+        if state.objects.contains_key(object_key) {
             return Err(StorageError::AlreadyExists);
         }
-        objects.insert(object_key.to_owned(), contents.to_vec());
+        let version = next_version(&mut state)?;
+        state.objects.insert(
+            object_key.to_owned(),
+            StoredObject {
+                contents: contents.to_vec(),
+                version,
+            },
+        );
         Ok(())
     }
 
     fn read(&self, object_key: &str) -> StorageResult<Vec<u8>> {
         validate_object_key(object_key)?;
-        let objects = self.objects.lock().map_err(|_| StorageError::Unavailable)?;
-        objects
+        let state = self.state.lock().map_err(|_| StorageError::Unavailable)?;
+        state
+            .objects
             .get(object_key)
-            .cloned()
+            .map(|object| object.contents.clone())
             .ok_or(StorageError::NotFound)
     }
+
+    fn read_with_version(&self, object_key: &str) -> StorageResult<VersionedObject> {
+        validate_object_key(object_key)?;
+        let state = self.state.lock().map_err(|_| StorageError::Unavailable)?;
+        let object = state
+            .objects
+            .get(object_key)
+            .ok_or(StorageError::NotFound)?;
+        Ok(VersionedObject::new(
+            object.contents.clone(),
+            object.version.clone(),
+        ))
+    }
+
+    fn compare_and_swap(
+        &self,
+        object_key: &str,
+        expected: Option<&StorageVersion>,
+        contents: &[u8],
+    ) -> StorageResult<StorageVersion> {
+        validate_object_key(object_key)?;
+        let mut state = self.state.lock().map_err(|_| StorageError::Unavailable)?;
+        let matches = match (state.objects.get(object_key), expected) {
+            (None, None) => true,
+            (Some(object), Some(expected)) => object.version == *expected,
+            (None, Some(_)) | (Some(_), None) => false,
+        };
+        if !matches {
+            return Err(StorageError::ConditionNotMet);
+        }
+
+        let version = next_version(&mut state)?;
+        state.objects.insert(
+            object_key.to_owned(),
+            StoredObject {
+                contents: contents.to_vec(),
+                version: version.clone(),
+            },
+        );
+        Ok(version)
+    }
+}
+
+fn next_version(state: &mut MemoryStorageState) -> StorageResult<StorageVersion> {
+    let next = state
+        .next_version
+        .checked_add(1)
+        .ok_or(StorageError::Unavailable)?;
+    state.next_version = next;
+    StorageVersion::from_bytes(next.to_be_bytes())
 }
 
 fn validate_object_key(object_key: &str) -> StorageResult<()> {

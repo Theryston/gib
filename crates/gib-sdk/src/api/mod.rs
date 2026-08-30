@@ -19,12 +19,17 @@ pub use operation::{
 };
 pub use repository::{
     CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
-    CURRENT_REPOSITORY_FORMAT_VERSION, FORMAT_OBJECT_KEY, InitializeRepositoryRequest,
-    LocalStorage, MemoryStorage, OpenRepositoryRequest, REPOSITORY_BOOTSTRAP_VERSION,
-    REPOSITORY_DESCRIPTOR_OBJECT_KEY, REPOSITORY_DESCRIPTOR_VERSION, REPOSITORY_FORMAT_VERSION,
-    REPOSITORY_MAGIC, REQUIRED_REPOSITORY_FEATURE, Repository, RepositoryDescriptor,
-    RepositoryFeature, RepositoryId, RepositoryIdentity, RepositoryInitRequest,
+    CURRENT_REPOSITORY_FORMAT_VERSION, CURRENT_REPOSITORY_HEAD_VERSION, FORMAT_OBJECT_KEY,
+    HEAD_OBJECT_KEY, Head, HeadPublication, HeadRead, HeadState, InitializeRepositoryRequest,
+    LATEST_REF_OBJECT_KEY, LocalStorage, MemoryStorage, OpenRepositoryRequest,
+    REPOSITORY_BOOTSTRAP_VERSION, REPOSITORY_DESCRIPTOR_OBJECT_KEY, REPOSITORY_DESCRIPTOR_VERSION,
+    REPOSITORY_FORMAT_VERSION, REPOSITORY_HEAD_KEY, REPOSITORY_HEAD_OBJECT_KEY,
+    REPOSITORY_HEAD_VERSION, REPOSITORY_MAGIC, REQUIRED_REPOSITORY_FEATURE, Repository,
+    RepositoryDescriptor, RepositoryFeature, RepositoryHead, RepositoryHeadRead,
+    RepositoryHeadState, RepositoryId, RepositoryIdentity, RepositoryInitRequest,
     RepositoryInitializationRequest, RepositoryKey, RepositoryObject, RepositoryOpenRequest,
-    RepositoryRoots, RepositoryStorage, StorageError, StorageHandle, StorageResult,
+    RepositoryRoots, RepositoryStorage, SnapshotPublication, SnapshotPublicationRequest,
+    SnapshotReference, StorageError, StorageHandle, StorageResult, StorageVersion,
+    StorageVersionToken, VersionToken, VersionedHead, VersionedObject, VersionedStorageObject,
     initialize_repository, open_repository,
 };

@@ -1,21 +1,29 @@
 use super::error::{SdkError, SdkResult};
+use super::operation::CancellationToken;
 use crate::application::repository::{
-    RepositoryError, RepositoryOpenExpectations, initialize_repository as initialize_use_case,
-    open_repository as open_use_case,
+    HeadRead as ApplicationHeadRead, RepositoryError, RepositoryOpenExpectations,
+    initialize_repository as initialize_use_case, open_repository as open_use_case,
+    publish_head as publish_head_use_case, read_head as read_head_use_case,
 };
 use crate::domain::DomainError;
 use std::fmt;
 use std::sync::Arc;
 
-pub use crate::application::ports::{RepositoryStorage, StorageError, StorageResult};
-pub use crate::domain::{
-    CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
-    CURRENT_REPOSITORY_FORMAT_VERSION, FORMAT_OBJECT_KEY, REPOSITORY_DESCRIPTOR_OBJECT_KEY,
-    REPOSITORY_MAGIC, REQUIRED_REPOSITORY_FEATURE,
+pub use crate::application::ports::{
+    RepositoryStorage, StorageError, StorageResult, StorageVersion, StorageVersionToken,
+    VersionToken, VersionedObject, VersionedStorageObject,
 };
 pub use crate::domain::{
-    RepositoryDescriptor, RepositoryFeature, RepositoryId, RepositoryIdentity, RepositoryKey,
-    RepositoryObject, RepositoryRoots,
+    CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
+    CURRENT_REPOSITORY_FORMAT_VERSION, CURRENT_REPOSITORY_HEAD_VERSION, FORMAT_OBJECT_KEY,
+    HEAD_OBJECT_KEY, LATEST_REF_OBJECT_KEY, REPOSITORY_DESCRIPTOR_OBJECT_KEY, REPOSITORY_HEAD_KEY,
+    REPOSITORY_HEAD_OBJECT_KEY, REPOSITORY_HEAD_VERSION, REPOSITORY_MAGIC,
+    REQUIRED_REPOSITORY_FEATURE,
+};
+pub use crate::domain::{
+    Head, HeadPublication, RepositoryDescriptor, RepositoryFeature, RepositoryHead, RepositoryId,
+    RepositoryIdentity, RepositoryKey, RepositoryObject, RepositoryRoots, SnapshotPublication,
+    SnapshotPublicationRequest, SnapshotReference,
 };
 pub use crate::infrastructure::storage::{LocalStorage, MemoryStorage};
 
@@ -203,6 +211,98 @@ impl Default for RepositoryOpenRequest {
 /// Compatibility alias for callers that use an imperative request name.
 pub type OpenRepositoryRequest = RepositoryOpenRequest;
 
+/// A repository HEAD value together with the storage token observed with it.
+///
+/// The token is part of the publication precondition. Callers should retain
+/// this value and pass the same instance to a publication attempt; a later
+/// attempt can explicitly read a fresh value after receiving a conflict.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeadState {
+    head: RepositoryHead,
+    version: Option<StorageVersion>,
+}
+
+impl HeadState {
+    fn from_read(read: ApplicationHeadRead) -> Self {
+        Self {
+            head: read.head,
+            version: read.version,
+        }
+    }
+
+    /// Returns the validated domain HEAD value.
+    pub fn head(&self) -> &RepositoryHead {
+        &self.head
+    }
+
+    /// Alias for [`Self::head`].
+    pub fn value(&self) -> &RepositoryHead {
+        self.head()
+    }
+
+    /// Returns the monotonically increasing publication generation.
+    pub fn generation(&self) -> u64 {
+        self.head.generation()
+    }
+
+    /// Returns the current snapshot reference, if one has been published.
+    pub fn snapshot(&self) -> Option<&SnapshotReference> {
+        self.head.snapshot()
+    }
+
+    /// Alias for [`Self::snapshot`] using the persisted-reference terminology.
+    pub fn snapshot_reference(&self) -> Option<&SnapshotReference> {
+        self.snapshot()
+    }
+
+    /// Alias for [`Self::snapshot`] using the short reference terminology.
+    pub fn snapshot_ref(&self) -> Option<&SnapshotReference> {
+        self.snapshot()
+    }
+
+    /// Returns whether this read names a published snapshot.
+    pub fn has_snapshot(&self) -> bool {
+        self.head.has_snapshot()
+    }
+
+    /// Returns the storage version token observed with this HEAD read.
+    pub fn version(&self) -> Option<&StorageVersion> {
+        self.version.as_ref()
+    }
+
+    /// Alias for [`Self::version`] using conditional-write terminology.
+    pub fn version_token(&self) -> Option<&StorageVersion> {
+        self.version()
+    }
+
+    /// Alias for [`Self::version`] using storage-version terminology.
+    pub fn storage_version(&self) -> Option<&StorageVersion> {
+        self.version()
+    }
+
+    /// Returns whether this read contains no published snapshot.
+    pub fn is_empty(&self) -> bool {
+        self.head.is_empty()
+    }
+
+    /// Consumes the read and returns the HEAD and its optional token.
+    pub fn into_parts(self) -> (RepositoryHead, Option<StorageVersion>) {
+        (self.head, self.version)
+    }
+}
+
+/// Compatibility name for [`HeadState`].
+pub type RepositoryHeadState = HeadState;
+
+/// Compatibility name for [`HeadState`] emphasizing the versioned read.
+pub type VersionedHead = HeadState;
+
+/// Compatibility name for [`HeadState`] emphasizing the read operation.
+pub type HeadRead = HeadState;
+
+/// Compatibility name for [`HeadState`] using the full repository terminology.
+pub type RepositoryHeadRead = HeadState;
+
 /// A usable handle for a repository whose root objects have been validated.
 #[derive(Clone)]
 pub struct Repository {
@@ -336,12 +436,124 @@ impl Repository {
         self.storage.clone()
     }
 
-    /// Returns whether a published snapshot exists.
+    /// Reads the current repository HEAD and its storage version token.
     ///
-    /// Snapshot publication is not part of repository initialization in 0.1.0,
-    /// so a newly initialized or opened repository always reports `false`.
-    pub const fn has_published_snapshot(&self) -> bool {
-        false
+    /// An absent HEAD is the valid empty repository state and is returned as
+    /// generation zero with no snapshot and no token. A present but malformed
+    /// HEAD is an error; it is never replaced with an empty fallback.
+    pub fn read_head(&self) -> SdkResult<HeadState> {
+        read_head_use_case(self.storage.as_storage())
+            .map(HeadState::from_read)
+            .map_err(SdkError::from)
+    }
+
+    /// Alias for [`Self::read_head`].
+    pub fn head(&self) -> SdkResult<HeadState> {
+        self.read_head()
+    }
+
+    /// Alias for [`Self::read_head`] emphasizing that the returned value is
+    /// paired with a backend version token.
+    pub fn read_head_with_version(&self) -> SdkResult<HeadState> {
+        self.read_head()
+    }
+
+    /// Publishes a snapshot after validating all listed immutable objects.
+    ///
+    /// The supplied HEAD read is the compare-and-swap precondition. Validation
+    /// and encoding happen before the final conditional write, so a missing or
+    /// malformed snapshot cannot advance HEAD.
+    pub fn publish_head<P>(&self, expected: &HeadState, publication: P) -> SdkResult<HeadState>
+    where
+        P: Into<SnapshotPublication>,
+    {
+        self.publish_head_with_cancellation(expected, publication, None)
+    }
+
+    /// Publishes a snapshot through the repository HEAD.
+    pub fn publish_snapshot<P>(&self, expected: &HeadState, publication: P) -> SdkResult<HeadState>
+    where
+        P: Into<SnapshotPublication>,
+    {
+        self.publish_head(expected, publication)
+    }
+
+    /// Alias for [`Self::publish_head`] using the short repository verb.
+    pub fn publish<P>(&self, expected: &HeadState, publication: P) -> SdkResult<HeadState>
+    where
+        P: Into<SnapshotPublication>,
+    {
+        self.publish_head(expected, publication)
+    }
+
+    /// Publishes a snapshot and explicitly supplies its required objects.
+    pub fn publish_snapshot_with_required_objects<I>(
+        &self,
+        expected: &HeadState,
+        snapshot: SnapshotReference,
+        required_objects: impl IntoIterator<Item = I>,
+    ) -> SdkResult<HeadState>
+    where
+        I: Into<RepositoryObject>,
+    {
+        self.publish_snapshot(
+            expected,
+            SnapshotPublication::with_required_objects(snapshot, required_objects),
+        )
+    }
+
+    /// Publishes a snapshot while observing a cooperative cancellation token.
+    ///
+    /// Cancellation is checked before object validation and immediately before
+    /// the storage CAS. A cancellation observed after the CAS has begun cannot
+    /// undo an already atomic publication; callers can read the resulting HEAD
+    /// and decide whether to continue subsequent work.
+    pub fn publish_head_with_cancellation<P>(
+        &self,
+        expected: &HeadState,
+        publication: P,
+        cancellation: Option<&CancellationToken>,
+    ) -> SdkResult<HeadState>
+    where
+        P: Into<SnapshotPublication>,
+    {
+        let publication = publication.into();
+        let is_cancelled = || cancellation.is_some_and(CancellationToken::is_cancelled);
+        publish_head_use_case(
+            self.storage.as_storage(),
+            &ApplicationHeadRead {
+                head: expected.head.clone(),
+                version: expected.version.clone(),
+            },
+            &publication,
+            Some(&is_cancelled),
+        )
+        .map(HeadState::from_read)
+        .map_err(SdkError::from)
+    }
+
+    /// Alias for [`Self::publish_head_with_cancellation`].
+    pub fn publish_snapshot_with_cancellation<P>(
+        &self,
+        expected: &HeadState,
+        publication: P,
+        cancellation: Option<&CancellationToken>,
+    ) -> SdkResult<HeadState>
+    where
+        P: Into<SnapshotPublication>,
+    {
+        self.publish_head_with_cancellation(expected, publication, cancellation)
+    }
+
+    /// Returns whether a valid published snapshot currently exists.
+    pub fn has_published_snapshot(&self) -> bool {
+        self.read_head().is_ok_and(|head| head.has_snapshot())
+    }
+
+    /// Returns whether a valid published snapshot currently exists, preserving
+    /// a typed error when HEAD cannot be read or decoded.
+    pub fn try_has_published_snapshot(&self) -> SdkResult<bool> {
+        self.read_head().map(|head| head.has_snapshot())
     }
 }
 
@@ -393,6 +605,14 @@ impl From<DomainError> for SdkError {
                 field: "repository_object",
                 reason,
             },
+            DomainError::InvalidSnapshotReference { reason } => SdkError::InvalidRequest {
+                field: "snapshot_reference",
+                reason,
+            },
+            DomainError::InvalidRepositoryHead { reason } => SdkError::InvalidRequest {
+                field: "repository_head",
+                reason,
+            },
         }
     }
 }
@@ -407,6 +627,16 @@ impl From<RepositoryError> for SdkError {
                 Self::RepositoryUnsupportedVersion { version }
             }
             RepositoryError::Incompatible { reason } => Self::RepositoryIncompatible { reason },
+            RepositoryError::PublicationConflict => Self::RepositoryPublicationConflict,
+            RepositoryError::SnapshotMissing => Self::RepositorySnapshotMissing,
+            RepositoryError::RequiredObjectMissing => Self::RepositoryRequiredObjectMissing,
+            RepositoryError::InvalidPublication { reason } => Self::InvalidRequest {
+                field: "snapshot_publication",
+                reason,
+            },
+            RepositoryError::GenerationExhausted => Self::RepositoryGenerationExhausted,
+            RepositoryError::UnsupportedCapability => Self::StorageCapabilityUnsupported,
+            RepositoryError::Cancelled => Self::OperationCancelled { operation_id: None },
             RepositoryError::Storage { operation } => Self::StorageFailure { operation },
         }
     }

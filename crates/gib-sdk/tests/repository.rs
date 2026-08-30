@@ -1,13 +1,14 @@
 use gib::{
-    CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_FORMAT_VERSION, Client, LocalStorage,
-    MemoryStorage, RepositoryIdentity, RepositoryInitRequest, RepositoryKey, RepositoryOpenRequest,
-    SdkError,
+    CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_FORMAT_VERSION, CancellationHandle,
+    Client, LocalStorage, MemoryStorage, Repository, RepositoryIdentity, RepositoryInitRequest,
+    RepositoryKey, RepositoryObject, RepositoryOpenRequest, RepositoryStorage, SdkError,
+    SnapshotPublication, SnapshotReference, StorageError, StorageVersion, VersionedObject,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -334,6 +335,32 @@ fn persisted_first_bootstrap_and_descriptor_fixtures_open() -> Result<(), Box<dy
 }
 
 #[test]
+fn persisted_head_fixture_reads_with_its_generation_and_snapshot() -> Result<(), Box<dyn Error>> {
+    let storage = MemoryStorage::new();
+    storage.put(
+        "format",
+        include_bytes!("../../../tests/fixtures/repository/v1/format"),
+    )?;
+    storage.put(
+        "config/repository",
+        include_bytes!("../../../tests/fixtures/repository/v1/config/repository"),
+    )?;
+    storage.put(
+        "refs/latest",
+        include_bytes!("../../../tests/fixtures/repository/v1/refs/latest"),
+    )?;
+
+    let repository = Client::default().open_repository(storage, RepositoryOpenRequest::new())?;
+    let head = repository.read_head()?;
+    assert_eq!(head.generation(), 1);
+    assert_eq!(
+        head.snapshot().map(SnapshotReference::as_str),
+        Some("snapshots/fixture")
+    );
+    Ok(())
+}
+
+#[test]
 fn opening_trailing_or_oversized_messagepack_is_rejected() -> Result<(), Box<dyn Error>> {
     let storage = MemoryStorage::new();
     Client::default().initialize_repository(
@@ -425,6 +452,389 @@ fn concurrent_initialization_has_one_winner_and_one_conflict() -> Result<(), Box
     assert_eq!(conflicts, 1);
     assert_eq!(storage.objects()?.len(), 2);
     Ok(())
+}
+
+#[test]
+fn first_and_later_publications_advance_head_generation_and_persist_across_open()
+-> Result<(), Box<dyn Error>> {
+    let storage = MemoryStorage::new();
+    let repository = initialize_repository(storage.clone())?;
+    let first = snapshot("snapshots/first")?;
+    let second = snapshot("snapshots/second")?;
+    let required = RepositoryObject::new("trees/first")?;
+    storage.put(first.as_str(), b"snapshot-first")?;
+    storage.put(second.as_str(), b"snapshot-second")?;
+    storage.put(required.as_str(), b"tree-first")?;
+
+    let empty = repository.read_head()?;
+    assert_eq!(empty.generation(), 0);
+    assert!(empty.snapshot().is_none());
+    assert!(empty.version().is_none());
+
+    let first_head = repository.publish_snapshot(
+        &empty,
+        SnapshotPublication::with_required_objects(first.clone(), [required.clone()]),
+    )?;
+    assert_eq!(first_head.generation(), 1);
+    assert_eq!(first_head.snapshot(), Some(&first));
+    assert!(first_head.version().is_some());
+
+    let second_head = repository.publish_snapshot(&first_head, second.clone())?;
+    assert_eq!(second_head.generation(), 2);
+    assert_eq!(second_head.snapshot(), Some(&second));
+
+    let reopened = Client::default().open_repository(storage, RepositoryOpenRequest::new())?;
+    let persisted = reopened.read_head()?;
+    assert_eq!(persisted.generation(), 2);
+    assert_eq!(persisted.snapshot(), Some(&second));
+    assert!(reopened.has_published_snapshot());
+    Ok(())
+}
+
+#[test]
+fn local_publication_replaces_head_atomically_and_reopens() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new();
+    let storage = LocalStorage::new(directory.path())?;
+    let repository = initialize_repository(storage.clone())?;
+    let first = snapshot("snapshots/local-first")?;
+    let second = snapshot("snapshots/local-second")?;
+    storage.create_if_absent(first.as_str(), b"snapshot-first")?;
+    storage.create_if_absent(second.as_str(), b"snapshot-second")?;
+
+    let first_head = repository.publish_snapshot(&repository.read_head()?, first)?;
+    let second_head = repository.publish_snapshot(&first_head, second.clone())?;
+    assert_eq!(second_head.generation(), 2);
+    assert_eq!(second_head.snapshot(), Some(&second));
+
+    let reopened = Client::default().open_repository(storage, RepositoryOpenRequest::new())?;
+    assert_eq!(reopened.read_head()?.snapshot(), Some(&second));
+    assert!(directory.path().join("refs/latest").is_file());
+    Ok(())
+}
+
+#[test]
+fn independent_local_storage_handles_serialize_head_cas() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new();
+    let first_storage = LocalStorage::new(directory.path())?;
+    let second_storage = LocalStorage::new(directory.path())?;
+    let repository = initialize_repository(first_storage.clone())?;
+    let first_repository =
+        Client::default().open_repository(first_storage, RepositoryOpenRequest::new())?;
+    let second_repository =
+        Client::default().open_repository(second_storage, RepositoryOpenRequest::new())?;
+    let first = snapshot("snapshots/independent-first")?;
+    let second = snapshot("snapshots/independent-second")?;
+    let storage = repository.storage();
+    storage
+        .as_storage()
+        .create_if_absent(first.as_str(), b"snapshot-first")?;
+    storage
+        .as_storage()
+        .create_if_absent(second.as_str(), b"snapshot-second")?;
+    let first_expected = first_repository.read_head()?;
+    let second_expected = second_repository.read_head()?;
+    let barrier = Arc::new(Barrier::new(2));
+
+    let first_barrier = barrier.clone();
+    let first_worker = thread::spawn(move || {
+        first_barrier.wait();
+        first_repository.publish_snapshot(&first_expected, first)
+    });
+    let second_barrier = barrier;
+    let second_worker = thread::spawn(move || {
+        second_barrier.wait();
+        second_repository.publish_snapshot(&second_expected, second)
+    });
+
+    let first_result = first_worker
+        .join()
+        .map_err(|_| "first publisher panicked")?;
+    let second_result = second_worker
+        .join()
+        .map_err(|_| "second publisher panicked")?;
+    let results = [first_result, second_result];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(SdkError::RepositoryPublicationConflict)))
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn stale_head_publication_returns_a_typed_conflict_and_keeps_the_winner()
+-> Result<(), Box<dyn Error>> {
+    let storage = MemoryStorage::new();
+    let repository = initialize_repository(storage.clone())?;
+    let first = snapshot("snapshots/stale-first")?;
+    let second = snapshot("snapshots/stale-second")?;
+    storage.put(first.as_str(), b"snapshot-first")?;
+    storage.put(second.as_str(), b"snapshot-second")?;
+    let expected = repository.read_head()?;
+
+    let winner = repository.publish_snapshot(&expected, first.clone())?;
+    let conflict = repository
+        .publish_snapshot(&expected, second)
+        .expect_err("the stale version must lose the CAS");
+    assert_eq!(conflict, SdkError::RepositoryPublicationConflict);
+    assert_eq!(repository.read_head()?.head(), winner.head());
+    assert_eq!(repository.read_head()?.generation(), 1);
+    Ok(())
+}
+
+#[test]
+fn missing_snapshot_dependencies_cannot_publish_head() -> Result<(), Box<dyn Error>> {
+    let storage = MemoryStorage::new();
+    let repository = initialize_repository(storage.clone())?;
+    let target = snapshot("snapshots/missing-dependency")?;
+    let required = RepositoryObject::new("trees/missing")?;
+    storage.put(target.as_str(), b"snapshot")?;
+    let expected = repository.read_head()?;
+
+    let error = repository
+        .publish_snapshot(
+            &expected,
+            SnapshotPublication::with_required_objects(target, [required]),
+        )
+        .expect_err("a snapshot with missing immutable dependencies is invalid");
+    assert_eq!(error, SdkError::RepositoryRequiredObjectMissing);
+    assert_eq!(
+        storage.read_object("refs/latest"),
+        Err(StorageError::NotFound)
+    );
+    Ok(())
+}
+
+#[test]
+fn missing_target_snapshot_cannot_publish_head() -> Result<(), Box<dyn Error>> {
+    let storage = MemoryStorage::new();
+    let repository = initialize_repository(storage.clone())?;
+    let expected = repository.read_head()?;
+
+    let error = repository
+        .publish_snapshot(&expected, snapshot("snapshots/missing")?)
+        .expect_err("the target snapshot must exist before publication");
+    assert_eq!(error, SdkError::RepositorySnapshotMissing);
+    assert_eq!(
+        storage.read_object("refs/latest"),
+        Err(StorageError::NotFound)
+    );
+    Ok(())
+}
+
+#[test]
+fn cancellation_before_cas_leaves_head_absent() -> Result<(), Box<dyn Error>> {
+    let storage = MemoryStorage::new();
+    let repository = initialize_repository(storage.clone())?;
+    let target = snapshot("snapshots/cancelled")?;
+    storage.put(target.as_str(), b"snapshot-cancelled")?;
+    let cancellation = CancellationHandle::new();
+    assert!(cancellation.cancel());
+
+    let error = repository
+        .publish_snapshot_with_cancellation(&repository.read_head()?, target, Some(&cancellation))
+        .expect_err("a cancelled publication must not write HEAD");
+    assert_eq!(error, SdkError::OperationCancelled { operation_id: None });
+    assert_eq!(
+        storage.read_object("refs/latest"),
+        Err(StorageError::NotFound)
+    );
+    Ok(())
+}
+
+#[test]
+fn injected_cas_failure_leaves_the_previous_head_unchanged() -> Result<(), Box<dyn Error>> {
+    let backend = FailingCasStorage::new();
+    let repository = initialize_repository(backend.clone())?;
+    let first = snapshot("snapshots/failure-first")?;
+    let second = snapshot("snapshots/failure-second")?;
+    backend.inner.put(first.as_str(), b"snapshot-first")?;
+    backend.inner.put(second.as_str(), b"snapshot-second")?;
+
+    let empty = repository.read_head()?;
+    let first_head = repository.publish_snapshot(&empty, first)?;
+    let bytes_before = backend.inner.read_object("refs/latest")?;
+    backend.fail_next_cas();
+
+    let error = repository
+        .publish_snapshot(&first_head, second)
+        .expect_err("the injected final write failure must be reported");
+    assert_eq!(
+        error,
+        SdkError::StorageFailure {
+            operation: "publish_head"
+        }
+    );
+    assert_eq!(backend.inner.read_object("refs/latest")?, bytes_before);
+    assert_eq!(repository.read_head()?.generation(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_backend_without_conditional_write_is_rejected_without_fallback() -> Result<(), Box<dyn Error>>
+{
+    let backend = ReadOnlyStorage::new();
+    let repository = initialize_repository(backend.clone())?;
+    let target = snapshot("snapshots/no-cas")?;
+    backend.inner.put(target.as_str(), b"snapshot")?;
+
+    let error = repository
+        .read_head()
+        .expect_err("HEAD reads require a versioned storage capability");
+    assert_eq!(error, SdkError::StorageCapabilityUnsupported);
+    assert_eq!(
+        backend.inner.read_object("refs/latest"),
+        Err(StorageError::NotFound)
+    );
+    Ok(())
+}
+
+#[test]
+fn concurrent_publishers_using_one_prior_head_have_exactly_one_success()
+-> Result<(), Box<dyn Error>> {
+    let storage = MemoryStorage::new();
+    let repository = initialize_repository(storage.clone())?;
+    let first = snapshot("snapshots/concurrent-first")?;
+    let second = snapshot("snapshots/concurrent-second")?;
+    storage.put(first.as_str(), b"snapshot-first")?;
+    storage.put(second.as_str(), b"snapshot-second")?;
+    let expected = repository.read_head()?;
+    let barrier = Arc::new(Barrier::new(2));
+    let mut workers = Vec::new();
+    for target in [first, second] {
+        let repository = repository.clone();
+        let expected = expected.clone();
+        let barrier = barrier.clone();
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            repository.publish_snapshot(&expected, target)
+        }));
+    }
+
+    let mut successes = 0;
+    let mut conflicts = 0;
+    for worker in workers {
+        match worker.join().map_err(|_| "publisher panicked")? {
+            Ok(head) => {
+                successes += 1;
+                assert_eq!(head.generation(), 1);
+            }
+            Err(SdkError::RepositoryPublicationConflict) => conflicts += 1,
+            Err(error) => return Err(format!("unexpected publication error: {error}").into()),
+        }
+    }
+    assert_eq!(successes, 1);
+    assert_eq!(conflicts, 1);
+    assert_eq!(repository.read_head()?.generation(), 1);
+    Ok(())
+}
+
+#[test]
+fn corrupt_head_is_not_treated_as_an_empty_head() -> Result<(), Box<dyn Error>> {
+    let storage = MemoryStorage::new();
+    let repository = initialize_repository(storage.clone())?;
+    let target = snapshot("snapshots/corrupt-head")?;
+    storage.put(target.as_str(), b"snapshot")?;
+    let _ = repository.publish_snapshot(&repository.read_head()?, target)?;
+    storage.replace_object("refs/latest", [0x81])?;
+
+    let error = repository
+        .read_head()
+        .expect_err("corrupt HEAD must remain an error");
+    assert!(matches!(error, SdkError::RepositoryMalformed { .. }));
+    let open_error = Client::default()
+        .open_repository(storage, RepositoryOpenRequest::new())
+        .expect_err("opening a repository with a corrupt HEAD must fail");
+    assert!(matches!(open_error, SdkError::RepositoryMalformed { .. }));
+    Ok(())
+}
+
+fn initialize_repository<S>(storage: S) -> Result<Repository, Box<dyn Error>>
+where
+    S: Into<gib::StorageHandle>,
+{
+    Ok(Client::default().initialize_repository(
+        storage,
+        RepositoryInitRequest::new(
+            RepositoryIdentity::new("head-test-repository")?,
+            RepositoryKey::new("default")?,
+        ),
+    )?)
+}
+
+fn snapshot(value: &str) -> Result<SnapshotReference, Box<dyn Error>> {
+    Ok(SnapshotReference::new(value)?)
+}
+
+#[derive(Clone)]
+struct FailingCasStorage {
+    inner: MemoryStorage,
+    fail_cas: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct ReadOnlyStorage {
+    inner: MemoryStorage,
+}
+
+impl ReadOnlyStorage {
+    fn new() -> Self {
+        Self {
+            inner: MemoryStorage::new(),
+        }
+    }
+}
+
+impl RepositoryStorage for ReadOnlyStorage {
+    fn create_if_absent(&self, object_key: &str, contents: &[u8]) -> Result<(), StorageError> {
+        self.inner.create_if_absent(object_key, contents)
+    }
+
+    fn read(&self, object_key: &str) -> Result<Vec<u8>, StorageError> {
+        self.inner.read(object_key)
+    }
+}
+
+impl FailingCasStorage {
+    fn new() -> Self {
+        Self {
+            inner: MemoryStorage::new(),
+            fail_cas: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn fail_next_cas(&self) {
+        self.fail_cas.store(true, Ordering::Release);
+    }
+}
+
+impl RepositoryStorage for FailingCasStorage {
+    fn create_if_absent(&self, object_key: &str, contents: &[u8]) -> Result<(), StorageError> {
+        self.inner.create_if_absent(object_key, contents)
+    }
+
+    fn read(&self, object_key: &str) -> Result<Vec<u8>, StorageError> {
+        self.inner.read(object_key)
+    }
+
+    fn read_with_version(&self, object_key: &str) -> Result<VersionedObject, StorageError> {
+        self.inner.read_with_version(object_key)
+    }
+
+    fn compare_and_swap(
+        &self,
+        object_key: &str,
+        expected: Option<&StorageVersion>,
+        contents: &[u8],
+    ) -> Result<StorageVersion, StorageError> {
+        if self.fail_cas.swap(false, Ordering::AcqRel) {
+            return Err(StorageError::Io);
+        }
+        self.inner.compare_and_swap(object_key, expected, contents)
+    }
 }
 
 struct TestDirectory {
