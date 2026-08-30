@@ -14,6 +14,7 @@ fn release_configuration_separates_package_and_cli_tags() {
             .any(|line| line.trim() == "git_tag_name = \"gib-sdk-v{{version}}\"")
     );
     assert!(release_workflow.contains("BASELINE_TAG=\"gib-sdk-v0.0.45\""));
+    assert!(release_workflow.contains("token: ${{ secrets.RELEASE_TOKEN }}"));
     assert!(release_workflow.contains("TAG=\"v${VERSION}\""));
     assert!(release_workflow.contains("PACKAGE_TAG=\"gib-sdk-v${VERSION}\""));
     assert!(release_workflow.contains("git push origin \"${TAG}\" \"${PACKAGE_TAG}\""));
