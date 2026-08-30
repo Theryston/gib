@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.47](https://github.com/Theryston/gib/compare/gib-v0.0.45...gib-v0.0.47) - 2026-08-30
+
+### Fixed
+
+- use package-specific git tag for gib release history
+- authorize release tag creation
+- restore gib-sdk release pipeline
+- publish Rust package as gib-sdk
+
+### Other
+
+- Update release.yml
+- Update Cargo.toml
+- Revert changes after 5ecc335
+- *(release)* v0.0.46
+- Update AGENTS.md
+
 ## [0.0.43](https://github.com/Theryston/gib/compare/v0.0.42...v0.0.43) - 2026-08-29
 
 ### Added
