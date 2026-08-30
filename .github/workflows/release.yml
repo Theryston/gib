@@ -38,6 +38,21 @@ jobs:
       - name: Install release-plz
         uses: taiki-e/install-action@release-plz
 
+      - name: Initialize gib release history
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASELINE_TAG="gib-v0.0.45"
+          BASELINE_SHA="6f77e05e5618e00b758146b63be397ec36decb96"
+
+          if ! git rev-parse "refs/tags/${BASELINE_TAG}" >/dev/null 2>&1; then
+            git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              tag -a "${BASELINE_TAG}" "${BASELINE_SHA}" -m "${BASELINE_TAG}"
+            git push origin "${BASELINE_TAG}"
+          fi
+
       - name: Run release-plz update (bump + changelog)
         run: release-plz update
 
@@ -60,6 +75,7 @@ jobs:
           )"
 
           TAG="v${VERSION}"
+          PACKAGE_TAG="gib-v${VERSION}"
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}"       >> "$GITHUB_OUTPUT"
@@ -77,8 +93,14 @@ jobs:
             exit 1
           fi
 
+          if git rev-parse "${PACKAGE_TAG}" >/dev/null 2>&1; then
+            echo "Tag ${PACKAGE_TAG} already exists; aborting."
+            exit 1
+          fi
+
           git tag -a "${TAG}" -m "${TAG}"
-          git push origin "${TAG}"
+          git tag -a "${PACKAGE_TAG}" -m "${PACKAGE_TAG}"
+          git push origin "${TAG}" "${PACKAGE_TAG}"
 
           SHA="$(git rev-parse HEAD)"
           echo "sha=${SHA}"       >> "$GITHUB_OUTPUT"

@@ -2,6 +2,8 @@
 git_only = true
 release_always = false
 git_release_enable = false
-git_tag_name = "v{{version}}"
+# v0.0.46 belongs to the former gib-sdk package. Keep gib's release history
+# in its own tag namespace so release-plz never compares different packages.
+git_tag_name = "gib-v{{version}}"
 publish = false
 release_commits = "^(feat|fix|perf|refactor|docs)(\\(.+\\))?:"
