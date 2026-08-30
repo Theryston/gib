@@ -1,0 +1,12 @@
+[package]
+name = "gib-cli"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "gib"
+path = "src/main.rs"
+
+[dependencies]
+gib-sdk = { path = "../gib-sdk" }
