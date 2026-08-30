@@ -16,6 +16,8 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt
+      - name: Install ripgrep
+        run: sudo apt-get install -y ripgrep
       - name: Check layer boundaries
         run: bash scripts/check-architecture.sh
       - name: Check library without CLI dependencies
