@@ -70,6 +70,7 @@ Tokio, terminal libraries, environment variables, or platform APIs.
   non-obvious invariants, security reasoning, format/protocol decisions,
   platform constraints, compatibility workarounds, and required `SAFETY`
   explanations. Public Rustdoc is mandatory and is not restricted by this rule.
+  Avoid using comments as much as possible; only use them when truly necessary!
 - Do not use production `unwrap`, `expect`, or `panic`, except for a truly
   unavoidable invariant documented at the call site and covered by tests.
 - Unsafe code is allowed only when unavoidable, isolated behind a safe API,

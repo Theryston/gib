@@ -35,9 +35,6 @@ pub(crate) struct ValidatedBootstrap {
     pub(crate) format_version: u16,
 }
 
-// These are named MessagePack wire structs rather than unordered maps.
-// `to_vec_named` writes their declared fields in a stable order, while the
-// decoder rejects unknown and duplicate fields through Serde's struct visitor.
 #[derive(Serialize)]
 struct BootstrapWire<'a> {
     bootstrap_version: u16,
