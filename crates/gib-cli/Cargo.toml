@@ -7,6 +7,7 @@ publish = false
 [[bin]]
 name = "gib"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 gib-sdk = { path = "../gib-sdk" }
