@@ -3,4 +3,5 @@ resolver = "3"
 members = [
     "crates/gib-sdk",
     "crates/gib-cli",
+    "crates/gib-examples",
 ]

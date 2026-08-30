@@ -1,0 +1,12 @@
+[package]
+name = "gib-examples"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "gib_examples"
+path = "src/lib.rs"
+
+[dependencies]
+gib-sdk = { path = "../gib-sdk" }

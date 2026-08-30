@@ -1,0 +1,1 @@
+{"descriptor_version":1,"magic":"GIB","format_version":1,"repository_id":"fixture-repository","repository_key":"fixture-key","required_features":["repository.lifecycle.v1"],"roots":{"format":"format","descriptor":"config/repository"}}

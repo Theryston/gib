@@ -21,6 +21,18 @@ pub enum ErrorCode {
     EventConsumerRegistration,
     /// An operation exhausted its event sequence range.
     OperationSequenceExhausted,
+    /// A repository initialization found an existing root object.
+    RepositoryAlreadyExists,
+    /// A required repository root object is missing.
+    RepositoryMissing,
+    /// A repository root object or descriptor is malformed.
+    RepositoryMalformed,
+    /// A repository format or descriptor version is not supported.
+    RepositoryUnsupportedVersion,
+    /// A repository is validly encoded but incompatible with this SDK.
+    RepositoryIncompatible,
+    /// The configured storage backend failed a lifecycle operation.
+    StorageFailure,
 }
 
 impl ErrorCode {
@@ -35,6 +47,12 @@ impl ErrorCode {
             Self::EventDispatcherClosed => "event_dispatcher_closed",
             Self::EventConsumerRegistration => "event_consumer_registration",
             Self::OperationSequenceExhausted => "operation_sequence_exhausted",
+            Self::RepositoryAlreadyExists => "repository_already_exists",
+            Self::RepositoryMissing => "repository_missing",
+            Self::RepositoryMalformed => "repository_malformed",
+            Self::RepositoryUnsupportedVersion => "repository_unsupported_version",
+            Self::RepositoryIncompatible => "repository_incompatible",
+            Self::StorageFailure => "storage_failure",
         }
     }
 }
@@ -76,6 +94,30 @@ pub enum SdkError {
         /// The operation whose sequence cannot advance.
         operation_id: OperationId,
     },
+    /// Initialization cannot proceed because a repository root object exists.
+    RepositoryAlreadyExists,
+    /// A required repository root object is missing.
+    RepositoryMissing,
+    /// A repository object is present but malformed.
+    RepositoryMalformed {
+        /// A stable explanation of the malformed condition.
+        reason: &'static str,
+    },
+    /// A repository format or descriptor version is unsupported.
+    RepositoryUnsupportedVersion {
+        /// The version found in the persisted object.
+        version: u16,
+    },
+    /// The repository is validly encoded but not compatible with this SDK.
+    RepositoryIncompatible {
+        /// A stable explanation of the incompatibility.
+        reason: &'static str,
+    },
+    /// A storage backend failed without exposing backend-specific details.
+    StorageFailure {
+        /// The lifecycle operation that failed.
+        operation: &'static str,
+    },
     /// An operation method conflicts with its current state.
     OperationStateConflict {
         /// The operation involved in the conflict.
@@ -106,6 +148,12 @@ impl SdkError {
             Self::OperationCancelled { .. } => ErrorCode::OperationCancelled,
             Self::EventDispatcherClosed => ErrorCode::EventDispatcherClosed,
             Self::EventConsumerRegistration => ErrorCode::EventConsumerRegistration,
+            Self::RepositoryAlreadyExists => ErrorCode::RepositoryAlreadyExists,
+            Self::RepositoryMissing => ErrorCode::RepositoryMissing,
+            Self::RepositoryMalformed { .. } => ErrorCode::RepositoryMalformed,
+            Self::RepositoryUnsupportedVersion { .. } => ErrorCode::RepositoryUnsupportedVersion,
+            Self::RepositoryIncompatible { .. } => ErrorCode::RepositoryIncompatible,
+            Self::StorageFailure { .. } => ErrorCode::StorageFailure,
         }
     }
 
@@ -119,7 +167,13 @@ impl SdkError {
             | Self::InvalidRequest { .. }
             | Self::OperationIdExhausted
             | Self::EventDispatcherClosed
-            | Self::EventConsumerRegistration => None,
+            | Self::EventConsumerRegistration
+            | Self::RepositoryAlreadyExists
+            | Self::RepositoryMissing
+            | Self::RepositoryMalformed { .. }
+            | Self::RepositoryUnsupportedVersion { .. }
+            | Self::RepositoryIncompatible { .. }
+            | Self::StorageFailure { .. } => None,
         }
     }
 
@@ -161,6 +215,25 @@ impl fmt::Display for SdkError {
             Self::EventDispatcherClosed => formatter.write_str("event dispatcher is closed"),
             Self::EventConsumerRegistration => {
                 formatter.write_str("event consumer could not be registered")
+            }
+            Self::RepositoryAlreadyExists => formatter.write_str("repository already exists"),
+            Self::RepositoryMissing => {
+                formatter.write_str("repository is missing a required root object")
+            }
+            Self::RepositoryMalformed { reason } => {
+                write!(formatter, "repository is malformed: {reason}")
+            }
+            Self::RepositoryUnsupportedVersion { version } => {
+                write!(
+                    formatter,
+                    "repository format version {version} is unsupported"
+                )
+            }
+            Self::RepositoryIncompatible { reason } => {
+                write!(formatter, "repository is incompatible: {reason}")
+            }
+            Self::StorageFailure { operation } => {
+                write!(formatter, "repository storage {operation} operation failed")
             }
         }
     }

@@ -2,6 +2,10 @@ use super::builder::DEFAULT_EVENT_BUFFER_CAPACITY;
 use super::error::{SdkError, SdkResult};
 use super::event::{EventConsumer, EventDispatcher, EventSubscription};
 use super::operation::{OperationHandle, OperationKind, OperationRequest};
+use super::repository::{
+    Repository, RepositoryIdentity, RepositoryInitRequest, RepositoryKey, RepositoryOpenRequest,
+    StorageHandle,
+};
 use std::fmt;
 
 /// Entry point for programmatic use of the Gib SDK.
@@ -65,6 +69,82 @@ impl Client {
     /// Returns the configured queue capacity per event consumer.
     pub fn event_buffer_capacity(&self) -> usize {
         self.events.capacity()
+    }
+
+    /// Initializes a repository through an injected storage backend.
+    pub fn initialize_repository<S>(
+        &self,
+        storage: S,
+        request: RepositoryInitRequest,
+    ) -> SdkResult<Repository>
+    where
+        S: Into<StorageHandle>,
+    {
+        Repository::initialize_with_request(storage, request)
+    }
+
+    /// Opens and validates a repository through an injected storage backend.
+    pub fn open_repository<S>(
+        &self,
+        storage: S,
+        request: RepositoryOpenRequest,
+    ) -> SdkResult<Repository>
+    where
+        S: Into<StorageHandle>,
+    {
+        Repository::open_with_request(storage, request)
+    }
+
+    /// Convenience form of [`Self::initialize_repository`] for validated
+    /// identity and key values.
+    pub fn initialize_repository_with_identity<S>(
+        &self,
+        storage: S,
+        identity: RepositoryIdentity,
+        repository_key: RepositoryKey,
+    ) -> SdkResult<Repository>
+    where
+        S: Into<StorageHandle>,
+    {
+        self.initialize_repository(
+            storage,
+            RepositoryInitRequest::new(identity, repository_key),
+        )
+    }
+
+    /// Convenience form of [`Self::open_repository`] that verifies identity
+    /// and namespace key.
+    pub fn open_repository_with_identity<S>(
+        &self,
+        storage: S,
+        identity: RepositoryIdentity,
+        repository_key: RepositoryKey,
+    ) -> SdkResult<Repository>
+    where
+        S: Into<StorageHandle>,
+    {
+        self.open_repository(
+            storage,
+            RepositoryOpenRequest::for_repository(identity, repository_key),
+        )
+    }
+
+    /// Alias for [`Self::initialize_repository`] for callers using the shorter
+    /// lifecycle method name.
+    pub fn initialize<S>(&self, storage: S, request: RepositoryInitRequest) -> SdkResult<Repository>
+    where
+        S: Into<StorageHandle>,
+    {
+        self.initialize_repository(storage, request)
+    }
+
+    /// Alias for [`Self::open_repository`] for callers using the shorter
+    /// lifecycle method name.
+    pub fn open<S>(&self, storage: S, request: RepositoryOpenRequest) -> SdkResult<Repository>
+    where
+        S: Into<StorageHandle>,
+    {
+        self.open_repository(storage, request)
     }
 }
 
