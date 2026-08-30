@@ -468,7 +468,7 @@ Using `release: published` ensures the crate is not published if binary builds o
 
 Keep `publish = false` in `release-plz.toml` if the dedicated workflow owns `cargo publish`; this prevents duplicate publication attempts. This setting is separate from Cargo's `[package].publish` manifest field.
 
-The same package version applies to both CLI and library. The GitHub release distributes precompiled executables; crates.io distributes the Rust package sources used by `cargo add gib` and, because the package also has a binary target, potentially `cargo install gib`.
+The same package version applies to both CLI and library. The GitHub release distributes precompiled executables; crates.io distributes the `gib-sdk` package sources used by `cargo add gib-sdk`. The library and binary targets remain named `gib`, so Rust imports and the installed executable keep the product name.
 
 ### 12.3 Required validation commands
 
@@ -535,7 +535,7 @@ The migration is complete only when:
 - CLI interactive and JSON behavior remain compatible.
 - Existing persisted data remains compatible.
 - Binary GitHub releases still work for all current targets.
-- The single Cargo package can be consumed with `cargo add gib` and published through the new crates.io CI.
+- The single `gib-sdk` Cargo package can be consumed with `cargo add gib-sdk`, imported as `gib`, and published through the new crates.io CI.
 - Formatting, checks, tests, documentation, packaging dry-run, and the repository's required `cargo check` all pass.
 
 ## 16. Implementation discipline

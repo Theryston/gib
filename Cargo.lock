@@ -1274,7 +1274,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gib"
+name = "gib-sdk"
 version = "0.0.45"
 dependencies = [
  "argon2",

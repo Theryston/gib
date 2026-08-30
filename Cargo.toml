@@ -1,5 +1,5 @@
 [package]
-name = "gib"
+name = "gib-sdk"
 version = "0.0.45"
 edition = "2024"
 description = "⚡ Back up your files. Keep them in sync. Travel through their history."

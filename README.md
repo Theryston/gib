@@ -547,11 +547,11 @@ gib --help
 
 ## Rust library
 
-GIB is also published as a library from the same Cargo package. Add it to an
-application with:
+GIB is published on crates.io as `gib-sdk`, while the Rust crate remains named
+`gib`. Add it to an application with:
 
 ```bash
-cargo add gib
+cargo add gib-sdk
 ```
 
 The library is silent by default. Configure a client, pass complete typed
