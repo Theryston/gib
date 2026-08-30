@@ -7,31 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.0.46](https://github.com/Theryston/gib/compare/gib-sdk-v0.0.45...gib-sdk-v0.0.46) - 2026-08-30
-
-### Fixed
-
-- authorize release tag creation
-- restore gib-sdk release pipeline
-
-### Other
-
-- Update AGENTS.md
-
-## [0.0.45](https://github.com/Theryston/gib/compare/v0.0.44...v0.0.45) - 2026-08-30
-
-### Added
-
-- add cross-platform support for autostart secret protection
-- add cargo test to release workflow
-
-## [0.0.44](https://github.com/Theryston/gib/compare/v0.0.43...v0.0.44) - 2026-08-30
-
-### Added
-
-- install ripgrep for architecture check workflow
-- lib API
-
 ## [0.0.43](https://github.com/Theryston/gib/compare/v0.0.42...v0.0.43) - 2026-08-29
 
 ### Added

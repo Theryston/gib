@@ -545,41 +545,6 @@ Then:
 gib --help
 ```
 
-## Rust library
-
-GIB is published on crates.io as `gib-sdk`, while the Rust crate remains named
-`gib`. Add it to an application with:
-
-```bash
-cargo add gib-sdk
-```
-
-The library is silent by default. Configure a client, pass complete typed
-requests, and use the returned result as the authoritative operation outcome:
-
-```rust
-use gib::api::{BackupRequest, Gib, RepositoryRequest};
-
-let gib = Gib::builder()
-    .on_event(|event| eprintln!("{}", event.to_json_line()))
-    .build()?;
-
-let request = BackupRequest::new(
-    RepositoryRequest::new("my-project", "local"),
-    ".",
-    "Application backup",
-    "Your Name <you@example.com>",
-);
-let result = gib.backup(request).await?;
-println!("{}", result.backup.hash);
-```
-
-Without `on_event`, no terminal output is produced. Callbacks receive typed,
-serializable `GibEvent` values; `to_json_line()` produces the JSON object shape
-used by the CLI's JSONL protocol. Live operations return a `LiveHandle` that can
-be stopped and awaited by the embedding application, so the library never
-installs a Ctrl+C handler or changes the process working directory.
-
 ---
 
 # 📚 Detailed Setup Guide
@@ -836,9 +801,9 @@ gib autostart add \
   --conflict local
 ```
 
-The job is enabled and started immediately by default. Use `--no-start` when you
-want to register it without starting the live process now; it will still be
-available for automatic startup after login.
+The job is enabled and started immediately by default. Use `--no-start` when
+you want to register it without starting the live process now; it will still
+be available for automatic startup after login.
 
 After login, GIB can automatically resume synchronization.
 

@@ -1,9 +1,13 @@
-use crate::storage::FS;
+use crate::fs::FS;
+use crate::output::is_json_mode;
+use crate::utils::handle_error;
 use crate::utils::{decrypt_bytes, encrypt_bytes, is_encrypted};
+use dialoguer::Password;
 use std::sync::Arc;
 
-pub(crate) struct ReadDecryption {
+pub struct ReadDecryption {
     pub bytes: Vec<u8>,
+    pub was_encrypted: bool,
 }
 
 pub(crate) async fn read_file_maybe_decrypt(
@@ -12,13 +16,13 @@ pub(crate) async fn read_file_maybe_decrypt(
     password: Option<&str>,
     encrypted_without_password_error: &str,
 ) -> Result<ReadDecryption, String> {
-    let file_bytes = fs
-        .read_file(path)
-        .await
-        .map_err(|error| format!("Failed to read file {path}: {error}"))?;
+    let file_bytes = fs.read_file(path).await.unwrap_or_else(|_| Vec::new());
 
     if file_bytes.is_empty() {
-        return Ok(ReadDecryption { bytes: Vec::new() });
+        return Ok(ReadDecryption {
+            bytes: Vec::new(),
+            was_encrypted: false,
+        });
     }
 
     let was_encrypted = is_encrypted(&file_bytes);
@@ -42,6 +46,7 @@ pub(crate) async fn read_file_maybe_decrypt(
 
     Ok(ReadDecryption {
         bytes: decrypted_bytes,
+        was_encrypted,
     })
 }
 
@@ -65,4 +70,44 @@ pub(crate) fn encode_file_bytes(data: &[u8], password: Option<&str>) -> Result<V
         Some(password) => encrypt_bytes(data, password.as_bytes()),
         None => Ok(data.to_vec()),
     }
+}
+
+pub(crate) fn get_password(is_required: bool, is_readonly: bool) -> Option<String> {
+    if is_json_mode() {
+        if is_required {
+            handle_error(
+                "Password is required in --mode json. Provide --password.".to_string(),
+                None,
+            );
+        }
+        return None;
+    }
+
+    let password = Password::new()
+        .allow_empty_password(!is_required)
+        .with_prompt("Enter your repository password (leave empty to skip encryption)")
+        .interact()
+        .unwrap();
+
+    let password = if !password.is_empty() {
+        if is_readonly {
+            return Some(password);
+        }
+
+        let confirm = Password::new()
+            .with_prompt("Repeat password")
+            .allow_empty_password(false)
+            .interact()
+            .unwrap();
+
+        if password != confirm {
+            handle_error("Error: the passwords don't match.".to_string(), None);
+        }
+
+        Some(password)
+    } else {
+        None
+    };
+
+    password
 }

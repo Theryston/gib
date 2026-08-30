@@ -1,6 +1,6 @@
 use crate::core::crypto::encode_file_bytes;
 use crate::core::metadata::{Backup, BackupObject};
-use crate::storage::FS;
+use crate::fs::FS;
 use crate::utils::{compress_bytes, decrypt_bytes, is_encrypted};
 use serde::Serialize;
 use serde::de::DeserializeOwned;

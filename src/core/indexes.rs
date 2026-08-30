@@ -1,6 +1,6 @@
-use crate::core::crypto::encode_file_bytes;
+use crate::core::crypto::{encode_file_bytes, read_file_maybe_decrypt};
 use crate::core::metadata::{Backup, BackupSummary, ChunkIndex, RepositoryHead};
-use crate::storage::FS;
+use crate::fs::FS;
 use crate::utils::{compress_bytes, decompress_bytes};
 use crate::utils::{decrypt_bytes, is_encrypted};
 use sha2::{Digest, Sha256};
@@ -13,6 +13,19 @@ const HEAD_FILE_NAME: &str = "HEAD";
 pub(crate) struct RepositoryHeadSnapshot {
     pub(crate) head: RepositoryHead,
     pub(crate) version: Option<String>,
+}
+
+pub(crate) async fn load_chunk_indexes(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+    prev_not_encrypted_but_now_yes: Arc<Mutex<bool>>,
+) -> Result<HashMap<String, ChunkIndex>, String> {
+    Ok(
+        load_chunk_indexes_with_version(fs, key, password, prev_not_encrypted_but_now_yes)
+            .await?
+            .0,
+    )
 }
 
 pub(crate) async fn load_chunk_indexes_with_version(
@@ -38,9 +51,7 @@ pub(crate) async fn load_chunk_indexes_with_version(
     };
 
     if password.is_some() && !was_encrypted && !bytes.is_empty() {
-        let mut prev_not_encrypted_guard = prev_not_encrypted_but_now_yes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut prev_not_encrypted_guard = prev_not_encrypted_but_now_yes.lock().unwrap();
         *prev_not_encrypted_guard = true;
     }
 
@@ -60,12 +71,35 @@ pub(crate) async fn list_backup_summaries(
     key: String,
     password: Option<String>,
 ) -> Result<Vec<BackupSummary>, String> {
+    let read_result = read_file_maybe_decrypt(
+        &fs,
+        format!("{}/indexes/backups", key).as_str(),
+        password.as_deref(),
+        "Backup summaries are encrypted but no password provided",
+    )
+    .await?;
+
+    deserialize_backup_summaries(&read_result.bytes)
+}
+
+/// Reads the backup index without hiding storage read failures.
+///
+/// The regular listing function intentionally preserves the historical
+/// best-effort behavior used by interactive commands. Live synchronization
+/// uses this strict variant while repairing stale references, so a temporary
+/// storage failure cannot be mistaken for an empty repository.
+pub(crate) async fn list_backup_summaries_strict(
+    fs: Arc<dyn FS>,
+    key: String,
+    password: Option<String>,
+) -> Result<Vec<BackupSummary>, String> {
     let index_path = format!("{}/indexes/backups", key);
     let raw_bytes = match fs.read_file(&index_path).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => return Err(format!("Failed to read backup index: {}", error)),
     };
+
     let bytes = if is_encrypted(&raw_bytes) {
         let password = password
             .as_deref()
@@ -133,7 +167,7 @@ pub(crate) fn create_new_backup(message: String, author: String) -> Backup {
     let now = std::time::SystemTime::now();
     let timestamp = now
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+        .expect("system clock is before the Unix epoch");
     let backup_hash =
         Sha256::digest(format!("{}:{}:{}", message, author, timestamp.as_nanos()).as_bytes());
 
@@ -437,61 +471,12 @@ pub(crate) async fn add_backup_summary(
     Err("Failed to update backup index after several concurrent changes".to_string())
 }
 
-pub(crate) async fn remove_backup_summary(
-    fs: Arc<dyn FS>,
-    key: String,
-    password: Option<String>,
-    compress: i32,
-    backup_hash: &str,
-) -> Result<Vec<BackupSummary>, String> {
-    let index_path = format!("{}/indexes/backups", key);
-    for _attempt in 0..5 {
-        let current = match fs.read_file_with_version(&index_path).await {
-            Ok((data, version)) => Some((data, version)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(format!("Failed to read backup index: {}", error)),
-        };
-        let mut summaries = match current.as_ref() {
-            Some((data, _)) if !data.is_empty() => {
-                let decoded = if is_encrypted(data) {
-                    let password = password.as_deref().ok_or_else(|| {
-                        "Backup summaries are encrypted but no password provided".to_string()
-                    })?;
-                    decrypt_bytes(data, password.as_bytes())?
-                } else {
-                    data.clone()
-                };
-                deserialize_backup_summaries(&decoded)?
-            }
-            _ => Vec::new(),
-        };
-        summaries.retain(|summary| summary.hash != backup_hash);
-        let serialized = rmp_serde::to_vec_named(&summaries)
-            .map_err(|error| format!("Failed to serialize backup summaries: {error}"))?;
-        let encoded =
-            encode_file_bytes(&compress_bytes(&serialized, compress), password.as_deref())?;
-        let expected_version = current.as_ref().map(|(_, version)| version.as_str());
-        match fs
-            .write_file_if_version(&index_path, &encoded, expected_version)
-            .await
-        {
-            Ok(()) => return Ok(summaries),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("Failed to write backup index: {error}")),
-        }
-    }
-    Err(
-        "Failed to remove backup from the backup index after several concurrent changes"
-            .to_string(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::resolve_backup_reference_from_summaries;
-    use super::{load_chunk_indexes_with_version, write_chunk_indexes_with_merge};
+    use super::{load_chunk_indexes, write_chunk_indexes_with_merge};
     use crate::core::metadata::{BackupSummary, ChunkIndex};
-    use crate::storage::{FS, LocalFS};
+    use crate::fs::{FS, LocalFS};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -577,15 +562,10 @@ mod tests {
         .await
         .unwrap();
 
-        let indexes = load_chunk_indexes_with_version(
-            fs,
-            "project".to_string(),
-            None,
-            Arc::new(Mutex::new(false)),
-        )
-        .await
-        .unwrap()
-        .0;
+        let indexes =
+            load_chunk_indexes(fs, "project".to_string(), None, Arc::new(Mutex::new(false)))
+                .await
+                .unwrap();
         assert_eq!(indexes.get("chunk-a").map(|index| index.refcount), Some(1));
         assert_eq!(indexes.get("chunk-b").map(|index| index.refcount), Some(1));
 

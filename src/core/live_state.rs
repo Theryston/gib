@@ -24,16 +24,12 @@ pub(crate) struct LiveFileCache {
     pub(crate) hash: String,
 }
 
-fn legacy_state_directory() -> PathBuf {
+fn state_directory() -> PathBuf {
     dirs::data_local_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(std::env::temp_dir)
         .join("gib")
         .join("live-state")
-}
-
-fn state_directory(data_dir: &Path) -> PathBuf {
-    data_dir.join("live-state")
 }
 
 fn state_file_name(root: &Path, storage: &str, key: &str) -> String {
@@ -43,8 +39,8 @@ fn state_file_name(root: &Path, storage: &str, key: &str) -> String {
     format!("{:x}.msgpack", digest)
 }
 
-fn state_path(data_dir: &Path, root: &Path, storage: &str, key: &str) -> PathBuf {
-    state_directory(data_dir).join(state_file_name(root, storage, key))
+fn state_path(root: &Path, storage: &str, key: &str) -> PathBuf {
+    state_directory().join(state_file_name(root, storage, key))
 }
 
 fn fallback_state_path(root: &Path, storage: &str, key: &str) -> PathBuf {
@@ -54,22 +50,13 @@ fn fallback_state_path(root: &Path, storage: &str, key: &str) -> PathBuf {
         .join(state_file_name(root, storage, key))
 }
 
-pub(crate) fn load_live_state_at(
-    data_dir: &Path,
-    root: &Path,
-    storage: &str,
-    key: &str,
-) -> Result<LiveState, String> {
-    let context_path = state_path(data_dir, root, storage, key);
-    let legacy_path = legacy_state_directory().join(state_file_name(root, storage, key));
-    let path = [
-        context_path,
-        legacy_path,
-        fallback_state_path(root, storage, key),
-    ]
-    .into_iter()
-    .find(|path| path.exists())
-    .unwrap_or_else(|| state_path(data_dir, root, storage, key));
+pub(crate) fn load_live_state(root: &Path, storage: &str, key: &str) -> Result<LiveState, String> {
+    let primary_path = state_path(root, storage, key);
+    let path = if primary_path.exists() {
+        primary_path
+    } else {
+        fallback_state_path(root, storage, key)
+    };
     if !path.exists() {
         return Ok(LiveState {
             version: STATE_VERSION,
@@ -96,8 +83,7 @@ pub(crate) fn load_live_state_at(
     Ok(state)
 }
 
-pub(crate) fn save_live_state_at(
-    data_dir: &Path,
+pub(crate) fn save_live_state(
     root: &Path,
     storage: &str,
     key: &str,
@@ -105,11 +91,10 @@ pub(crate) fn save_live_state_at(
 ) -> Result<(), String> {
     let bytes = rmp_serde::to_vec_named(state)
         .map_err(|error| format!("Failed to serialize live state: {}", error))?;
-    let primary_path = state_path(data_dir, root, storage, key);
-    let legacy_path = legacy_state_directory().join(state_file_name(root, storage, key));
+    let primary_path = state_path(root, storage, key);
     let fallback_path = fallback_state_path(root, storage, key);
 
-    for path in [primary_path, legacy_path, fallback_path] {
+    for path in [primary_path, fallback_path] {
         let parent = path
             .parent()
             .ok_or_else(|| "Live state path has no parent directory".to_string())?;

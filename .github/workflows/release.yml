@@ -31,31 +31,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_TOKEN }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run general tests
-        run: cargo test
-
       - name: Install release-plz
         uses: taiki-e/install-action@release-plz
-
-      - name: Initialize gib-sdk release history
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          BASELINE_TAG="gib-sdk-v0.0.45"
-          BASELINE_SHA="5099ebf0fbc38545f48d34b2a65f4c8d75ce29de"
-
-          if ! git rev-parse "refs/tags/${BASELINE_TAG}" >/dev/null 2>&1; then
-            git -c user.name="github-actions[bot]" \
-              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              tag -a "${BASELINE_TAG}" "${BASELINE_SHA}" -m "${BASELINE_TAG}"
-            git push origin "${BASELINE_TAG}"
-          fi
 
       - name: Run release-plz update (bump + changelog)
         run: release-plz update
@@ -79,7 +60,6 @@ jobs:
           )"
 
           TAG="v${VERSION}"
-          PACKAGE_TAG="gib-sdk-v${VERSION}"
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}"       >> "$GITHUB_OUTPUT"
@@ -97,14 +77,8 @@ jobs:
             exit 1
           fi
 
-          if git rev-parse "${PACKAGE_TAG}" >/dev/null 2>&1; then
-            echo "Tag ${PACKAGE_TAG} already exists; aborting."
-            exit 1
-          fi
-
           git tag -a "${TAG}" -m "${TAG}"
-          git tag -a "${PACKAGE_TAG}" -m "${PACKAGE_TAG}"
-          git push origin "${TAG}" "${PACKAGE_TAG}"
+          git push origin "${TAG}"
 
           SHA="$(git rev-parse HEAD)"
           echo "sha=${SHA}"       >> "$GITHUB_OUTPUT"
@@ -165,7 +139,7 @@ jobs:
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
       - name: Build release binary
-        run: cargo build --release --bin gib --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare artifact (Unix)
         if: matrix.os != 'windows-latest'
@@ -222,8 +196,8 @@ jobs:
 
       - name: Create/Update GitHub Release and upload assets (gh)
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare.outputs.tag }}
           VERSION: ${{ needs.prepare.outputs.version }}
           SHA: ${{ needs.prepare.outputs.sha }}
