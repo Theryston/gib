@@ -798,6 +798,12 @@ fn protect_secret_path(path: &Path) -> Result<(), GibError> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .map_err(|error| GibError::new(ErrorCode::Io, error.to_string()))?;
     }
+    #[cfg(not(unix))]
+    {
+        // std does not expose portable ACL management. Windows inherits the
+        // permissions of the protected secrets directory created below.
+        let _ = path;
+    }
     Ok(())
 }
 
@@ -807,6 +813,12 @@ fn protect_directory(path: &Path) -> Result<(), GibError> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .map_err(|error| GibError::new(ErrorCode::Io, error.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        // Keep this helper explicit on Windows, where ACLs are inherited from
+        // the user's profile and are not configurable through std alone.
+        let _ = path;
     }
     Ok(())
 }
