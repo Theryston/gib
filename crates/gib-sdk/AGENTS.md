@@ -9,6 +9,20 @@ or direct process output.
 
 The crates.io package name is `gib-sdk`; the Rust library name is `gib`.
 
+## Binary output and persistence policy
+
+The SDK produces no JSON. Every SDK-owned repository object, metadata record,
+event payload, operation artifact, and other durable output must use a binary
+representation; never add JSON serialization, JSON repository fixtures, or a
+`serde_json` dependency to this crate. The standard binary representation for
+structured information is versioned, deterministic MessagePack using explicit
+wire structs. Chunk, pack, encryption, and codec outputs must use their own
+documented binary formats.
+
+JSON may exist only in an outer CLI or integration adapter that translates the
+public SDK contract. It must never be written to repository storage or emitted
+by an SDK persistence or infrastructure path.
+
 ## Crate responsibilities
 
 The SDK owns:

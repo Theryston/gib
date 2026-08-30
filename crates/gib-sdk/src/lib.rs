@@ -2,7 +2,9 @@
 //!
 //! The crate root intentionally exposes only stable API types. Repository
 //! lifecycle operations use validated domain values and injectable storage
-//! backends; snapshot and backup operations will build on these contracts.
+//! backends. Repository metadata is persisted as versioned MessagePack bytes;
+//! the SDK does not write JSON. Snapshot and backup operations will build on
+//! these contracts.
 //!
 //! ```
 //! use gib::{Client, EventEnvelope, OperationKind};
@@ -32,17 +34,18 @@ pub use api::{
     EventDelivery, EventDispatcher, EventEnvelope, EventKind, EventMessage, EventPayload,
     EventPhase, EventSubscription, InitializeRepositoryRequest, LocalStorage, MemoryStorage,
     OpenRepositoryRequest, OperationHandle, OperationId, OperationKind, OperationRequest,
-    OperationResult, OperationStatus, Progress, REPOSITORY_DESCRIPTOR_VERSION,
-    REPOSITORY_FORMAT_VERSION, RecoveryPoint, Repository, RepositoryDescriptor, RepositoryFeature,
-    RepositoryId, RepositoryIdentity, RepositoryInitRequest, RepositoryInitializationRequest,
-    RepositoryKey, RepositoryObject, RepositoryOpenRequest, RepositoryRoots, RepositoryStorage,
-    Request, Result, SdkError, SdkResult, StorageError, StorageHandle, StorageResult,
-    initialize_repository, open_repository,
+    OperationResult, OperationStatus, Progress, REPOSITORY_BOOTSTRAP_VERSION,
+    REPOSITORY_DESCRIPTOR_VERSION, REPOSITORY_FORMAT_VERSION, RecoveryPoint, Repository,
+    RepositoryDescriptor, RepositoryFeature, RepositoryId, RepositoryIdentity,
+    RepositoryInitRequest, RepositoryInitializationRequest, RepositoryKey, RepositoryObject,
+    RepositoryOpenRequest, RepositoryRoots, RepositoryStorage, Request, Result, SdkError,
+    SdkResult, StorageError, StorageHandle, StorageResult, initialize_repository, open_repository,
 };
 
 pub use api::{
-    CURRENT_REPOSITORY_DESCRIPTOR_VERSION, CURRENT_REPOSITORY_FORMAT_VERSION, FORMAT_OBJECT_KEY,
-    REPOSITORY_DESCRIPTOR_OBJECT_KEY, REPOSITORY_MAGIC, REQUIRED_REPOSITORY_FEATURE,
+    CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
+    CURRENT_REPOSITORY_FORMAT_VERSION, FORMAT_OBJECT_KEY, REPOSITORY_DESCRIPTOR_OBJECT_KEY,
+    REPOSITORY_MAGIC, REQUIRED_REPOSITORY_FEATURE,
 };
 
 pub use domain::DomainError;

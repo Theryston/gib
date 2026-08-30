@@ -1,7 +1,9 @@
 use gib::{
-    Client, LocalStorage, MemoryStorage, RepositoryIdentity, RepositoryInitRequest, RepositoryKey,
-    RepositoryOpenRequest, SdkError,
+    CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_FORMAT_VERSION, Client, LocalStorage,
+    MemoryStorage, RepositoryIdentity, RepositoryInitRequest, RepositoryKey, RepositoryOpenRequest,
+    SdkError,
 };
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
@@ -25,6 +27,12 @@ fn memory_initialize_and_open_round_trip_without_snapshot_or_indexes() -> Result
     assert_eq!(initialized.format_version(), 1);
     assert_eq!(initialized.descriptor_version(), 1);
     assert!(!initialized.has_published_snapshot());
+    let format_bytes = storage.read_object("format")?;
+    let descriptor_bytes = storage.read_object("config/repository")?;
+    assert_eq!(format_bytes.first().copied(), Some(0x84));
+    assert_eq!(descriptor_bytes.first().copied(), Some(0x87));
+    assert_ne!(format_bytes.first().copied(), Some(b'{'));
+    assert_ne!(descriptor_bytes.first().copied(), Some(b'{'));
     assert_eq!(
         storage.objects()?,
         vec![String::from("config/repository"), String::from("format")]
@@ -57,6 +65,16 @@ fn local_initialize_and_open_round_trip_creates_only_required_root_objects()
     assert_eq!(opened.format_version(), initialized.format_version());
     assert!(directory.path().join("format").is_file());
     assert!(directory.path().join("config/repository").is_file());
+    assert_ne!(
+        fs::read(directory.path().join("format"))?.first().copied(),
+        Some(b'{')
+    );
+    assert_ne!(
+        fs::read(directory.path().join("config/repository"))?
+            .first()
+            .copied(),
+        Some(b'{')
+    );
     assert!(!directory.path().join("refs/latest").exists());
     assert!(!directory.path().join("indexes").exists());
     Ok(())
@@ -127,17 +145,17 @@ fn opening_truncated_or_corrupted_objects_returns_malformed_without_repair()
         ),
     )?;
 
-    storage.replace_object("config/repository", b"{\"magic\":")?;
+    storage.replace_object("config/repository", [0x87])?;
     let truncated = Client::default()
         .open_repository(storage.clone(), RepositoryOpenRequest::new())
         .expect_err("truncated descriptor must fail");
     assert!(matches!(truncated, SdkError::RepositoryMalformed { .. }));
-    assert_eq!(storage.read_object("config/repository")?, b"{\"magic\":");
+    assert_eq!(storage.read_object("config/repository")?, [0x87]);
 
-    storage.replace_object("format", b"not-json")?;
+    storage.replace_object("format", [0xc1])?;
     let corrupted = Client::default()
         .open_repository(storage, RepositoryOpenRequest::new())
-        .expect_err("corrupted format marker must fail");
+        .expect_err("corrupted bootstrap record must fail");
     assert!(matches!(corrupted, SdkError::RepositoryMalformed { .. }));
     Ok(())
 }
@@ -153,19 +171,17 @@ fn opening_invalid_magic_or_root_references_returns_malformed() -> Result<(), Bo
         ),
     )?;
 
-    storage.replace_object(
-        "format",
-        br#"{"magic":"OTHER","format_version":1,"descriptor":"config/repository"}"#,
-    )?;
+    let mut bootstrap = decode_fixture::<TestBootstrap>(&storage.read_object("format")?)?;
+    bootstrap.magic = String::from("OTHER");
+    storage.replace_object("format", encode_fixture(&bootstrap)?)?;
     let magic_error = Client::default()
         .open_repository(storage.clone(), RepositoryOpenRequest::new())
         .expect_err("invalid magic must fail");
     assert!(matches!(magic_error, SdkError::RepositoryMalformed { .. }));
 
-    storage.replace_object(
-        "format",
-        br#"{"magic":"GIB","format_version":1,"descriptor":"wrong"}"#,
-    )?;
+    let mut bootstrap = decode_fixture::<TestBootstrap>(&storage.read_object("format")?)?;
+    bootstrap.descriptor = String::from("wrong");
+    storage.replace_object("format", encode_fixture(&bootstrap)?)?;
     let root_error = Client::default()
         .open_repository(storage, RepositoryOpenRequest::new())
         .expect_err("invalid root reference must fail");
@@ -179,11 +195,10 @@ fn opening_invalid_magic_or_root_references_returns_malformed() -> Result<(), Bo
             RepositoryKey::new("default")?,
         ),
     )?;
-    let descriptor = String::from_utf8(descriptor_storage.read_object("config/repository")?)?;
-    descriptor_storage.replace_object(
-        "config/repository",
-        descriptor.replace("\"format\":\"format\"", "\"format\":\"wrong\""),
-    )?;
+    let mut descriptor =
+        decode_fixture::<TestDescriptor>(&descriptor_storage.read_object("config/repository")?)?;
+    descriptor.roots.format = String::from("wrong");
+    descriptor_storage.replace_object("config/repository", encode_fixture(&descriptor)?)?;
     let descriptor_root_error = Client::default()
         .open_repository(descriptor_storage, RepositoryOpenRequest::new())
         .expect_err("descriptor root references must be validated");
@@ -199,7 +214,12 @@ fn unknown_format_and_descriptor_versions_fail_explicitly() -> Result<(), Box<dy
     let storage = MemoryStorage::new();
     storage.put(
         "format",
-        br#"{"magic":"GIB","format_version":99,"descriptor":"config/repository"}"#,
+        encode_fixture(&TestBootstrap {
+            bootstrap_version: CURRENT_REPOSITORY_BOOTSTRAP_VERSION,
+            magic: String::from("GIB"),
+            format_version: 99,
+            descriptor: String::from("config/repository"),
+        })?,
     )?;
     storage.put("config/repository", b"legacy-data")?;
     let format_error = Client::default()
@@ -218,11 +238,10 @@ fn unknown_format_and_descriptor_versions_fail_explicitly() -> Result<(), Box<dy
             RepositoryKey::new("default")?,
         ),
     )?;
-    let descriptor = String::from_utf8(descriptor_storage.read_object("config/repository")?)?;
-    descriptor_storage.replace_object(
-        "config/repository",
-        descriptor.replace("\"descriptor_version\":1", "\"descriptor_version\":99"),
-    )?;
+    let mut descriptor =
+        decode_fixture::<TestDescriptor>(&descriptor_storage.read_object("config/repository")?)?;
+    descriptor.descriptor_version = 99;
+    descriptor_storage.replace_object("config/repository", encode_fixture(&descriptor)?)?;
     let descriptor_error = Client::default()
         .open_repository(descriptor_storage, RepositoryOpenRequest::new())
         .expect_err("unknown descriptor versions must be explicit");
@@ -244,11 +263,10 @@ fn missing_required_feature_and_mismatched_identity_are_incompatible() -> Result
         RepositoryInitRequest::new(identity.clone(), repository_key.clone()),
     )?;
 
-    let descriptor = String::from_utf8(storage.read_object("config/repository")?)?;
-    storage.replace_object(
-        "config/repository",
-        descriptor.replace("\"repository.lifecycle.v1\"", "\"future.feature\""),
-    )?;
+    let mut descriptor =
+        decode_fixture::<TestDescriptor>(&storage.read_object("config/repository")?)?;
+    descriptor.required_features = vec![String::from("future.feature")];
+    storage.replace_object("config/repository", encode_fixture(&descriptor)?)?;
     let feature_error = Client::default()
         .open_repository(storage.clone(), RepositoryOpenRequest::new())
         .expect_err("unknown required features must be incompatible");
@@ -265,14 +283,11 @@ fn missing_required_feature_and_mismatched_identity_are_incompatible() -> Result
             RepositoryKey::new("default")?,
         ),
     )?;
-    let descriptor = String::from_utf8(missing_feature_storage.read_object("config/repository")?)?;
-    missing_feature_storage.replace_object(
-        "config/repository",
-        descriptor.replace(
-            "\"required_features\":[\"repository.lifecycle.v1\"]",
-            "\"required_features\":[]",
-        ),
+    let mut descriptor = decode_fixture::<TestDescriptor>(
+        &missing_feature_storage.read_object("config/repository")?,
     )?;
+    descriptor.required_features.clear();
+    missing_feature_storage.replace_object("config/repository", encode_fixture(&descriptor)?)?;
     let missing_feature_error = Client::default()
         .open_repository(missing_feature_storage, RepositoryOpenRequest::new())
         .expect_err("a missing required feature must be incompatible");
@@ -301,7 +316,7 @@ fn missing_required_feature_and_mismatched_identity_are_incompatible() -> Result
 }
 
 #[test]
-fn persisted_first_descriptor_fixture_opens() -> Result<(), Box<dyn Error>> {
+fn persisted_first_bootstrap_and_descriptor_fixtures_open() -> Result<(), Box<dyn Error>> {
     let storage = MemoryStorage::new();
     storage.put(
         "format",
@@ -315,6 +330,64 @@ fn persisted_first_descriptor_fixture_opens() -> Result<(), Box<dyn Error>> {
     assert_eq!(repository.identity().as_str(), "fixture-repository");
     assert_eq!(repository.repository_key().as_str(), "fixture-key");
     assert_eq!(repository.format_version(), 1);
+    Ok(())
+}
+
+#[test]
+fn opening_trailing_or_oversized_messagepack_is_rejected() -> Result<(), Box<dyn Error>> {
+    let storage = MemoryStorage::new();
+    Client::default().initialize_repository(
+        storage.clone(),
+        RepositoryInitRequest::new(
+            RepositoryIdentity::new("bounded-input")?,
+            RepositoryKey::new("default")?,
+        ),
+    )?;
+
+    let mut trailing = storage.read_object("format")?;
+    trailing.push(0);
+    storage.replace_object("format", trailing)?;
+    let trailing_error = Client::default()
+        .open_repository(storage.clone(), RepositoryOpenRequest::new())
+        .expect_err("trailing MessagePack bytes must fail");
+    assert!(matches!(
+        trailing_error,
+        SdkError::RepositoryMalformed { .. }
+    ));
+
+    let oversized = vec![0; 16 * 1024];
+    storage.replace_object("format", oversized)?;
+    let oversized_error = Client::default()
+        .open_repository(storage, RepositoryOpenRequest::new())
+        .expect_err("oversized MessagePack input must fail");
+    assert!(matches!(
+        oversized_error,
+        SdkError::RepositoryMalformed { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn an_unknown_bootstrap_version_is_not_a_legacy_fallback() -> Result<(), Box<dyn Error>> {
+    let storage = MemoryStorage::new();
+    storage.put(
+        "format",
+        encode_fixture(&TestBootstrap {
+            bootstrap_version: 99,
+            magic: String::from("GIB"),
+            format_version: CURRENT_REPOSITORY_FORMAT_VERSION,
+            descriptor: String::from("config/repository"),
+        })?,
+    )?;
+    storage.put("config/repository", [0xc1])?;
+
+    let error = Client::default()
+        .open_repository(storage, RepositoryOpenRequest::new())
+        .expect_err("unknown bootstrap versions must fail explicitly");
+    assert_eq!(
+        error,
+        SdkError::RepositoryUnsupportedVersion { version: 99 }
+    );
     Ok(())
 }
 
@@ -377,4 +450,43 @@ impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+#[derive(Deserialize, Serialize)]
+struct TestBootstrap {
+    bootstrap_version: u16,
+    magic: String,
+    format_version: u16,
+    descriptor: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct TestDescriptor {
+    descriptor_version: u16,
+    magic: String,
+    format_version: u16,
+    repository_id: String,
+    repository_key: String,
+    required_features: Vec<String>,
+    roots: TestRoots,
+}
+
+#[derive(Deserialize, Serialize)]
+struct TestRoots {
+    format: String,
+    descriptor: String,
+}
+
+fn decode_fixture<T>(bytes: &[u8]) -> Result<T, Box<dyn Error>>
+where
+    T: DeserializeOwned,
+{
+    Ok(rmp_serde::from_slice(bytes)?)
+}
+
+fn encode_fixture<T>(value: &T) -> Result<Vec<u8>, Box<dyn Error>>
+where
+    T: Serialize,
+{
+    Ok(rmp_serde::to_vec_named(value)?)
 }

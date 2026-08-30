@@ -18,8 +18,9 @@ pub use operation::{
     OperationRequest, OperationResult, OperationStatus, Request,
 };
 pub use repository::{
-    CURRENT_REPOSITORY_DESCRIPTOR_VERSION, CURRENT_REPOSITORY_FORMAT_VERSION, FORMAT_OBJECT_KEY,
-    InitializeRepositoryRequest, LocalStorage, MemoryStorage, OpenRepositoryRequest,
+    CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
+    CURRENT_REPOSITORY_FORMAT_VERSION, FORMAT_OBJECT_KEY, InitializeRepositoryRequest,
+    LocalStorage, MemoryStorage, OpenRepositoryRequest, REPOSITORY_BOOTSTRAP_VERSION,
     REPOSITORY_DESCRIPTOR_OBJECT_KEY, REPOSITORY_DESCRIPTOR_VERSION, REPOSITORY_FORMAT_VERSION,
     REPOSITORY_MAGIC, REQUIRED_REPOSITORY_FEATURE, Repository, RepositoryDescriptor,
     RepositoryFeature, RepositoryId, RepositoryIdentity, RepositoryInitRequest,

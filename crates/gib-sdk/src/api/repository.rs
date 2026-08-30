@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 pub use crate::application::ports::{RepositoryStorage, StorageError, StorageResult};
 pub use crate::domain::{
-    CURRENT_REPOSITORY_DESCRIPTOR_VERSION, CURRENT_REPOSITORY_FORMAT_VERSION, FORMAT_OBJECT_KEY,
-    REPOSITORY_DESCRIPTOR_OBJECT_KEY, REPOSITORY_MAGIC, REQUIRED_REPOSITORY_FEATURE,
+    CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
+    CURRENT_REPOSITORY_FORMAT_VERSION, FORMAT_OBJECT_KEY, REPOSITORY_DESCRIPTOR_OBJECT_KEY,
+    REPOSITORY_MAGIC, REQUIRED_REPOSITORY_FEATURE,
 };
 pub use crate::domain::{
     RepositoryDescriptor, RepositoryFeature, RepositoryId, RepositoryIdentity, RepositoryKey,
@@ -413,6 +414,9 @@ impl From<RepositoryError> for SdkError {
 
 /// Alias for the current repository format version.
 pub const REPOSITORY_FORMAT_VERSION: u16 = CURRENT_REPOSITORY_FORMAT_VERSION;
+
+/// Alias for the current repository bootstrap schema version.
+pub const REPOSITORY_BOOTSTRAP_VERSION: u16 = CURRENT_REPOSITORY_BOOTSTRAP_VERSION;
 
 /// Alias for the current repository descriptor version.
 pub const REPOSITORY_DESCRIPTOR_VERSION: u16 = CURRENT_REPOSITORY_DESCRIPTOR_VERSION;

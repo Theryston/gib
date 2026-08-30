@@ -4,7 +4,7 @@ use crate::domain::{
     RepositoryKey,
 };
 use crate::format::{
-    FormatError, decode_descriptor, decode_format_marker, encode_descriptor, encode_format_marker,
+    FormatError, decode_bootstrap, decode_descriptor, encode_bootstrap, encode_descriptor,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,7 +29,7 @@ pub(crate) fn initialize_repository(
     repository_key: RepositoryKey,
 ) -> Result<RepositoryDescriptor, RepositoryError> {
     let descriptor = RepositoryDescriptor::new(identity, repository_key);
-    let format_bytes = encode_format_marker().map_err(map_format_error)?;
+    let format_bytes = encode_bootstrap().map_err(map_format_error)?;
     let descriptor_bytes = encode_descriptor(&descriptor).map_err(map_format_error)?;
 
     ensure_absent(storage, FORMAT_OBJECT_KEY)?;
@@ -52,13 +52,13 @@ pub(crate) fn open_repository(
     let format_bytes = storage
         .read(FORMAT_OBJECT_KEY)
         .map_err(|error| map_read_error(error, "format"))?;
-    let marker = decode_format_marker(&format_bytes).map_err(map_format_error)?;
+    let bootstrap = decode_bootstrap(&format_bytes).map_err(map_format_error)?;
 
     let descriptor_bytes = storage
         .read(REPOSITORY_DESCRIPTOR_OBJECT_KEY)
         .map_err(|error| map_read_error(error, "descriptor"))?;
     let descriptor =
-        decode_descriptor(&descriptor_bytes, marker.version).map_err(map_format_error)?;
+        decode_descriptor(&descriptor_bytes, bootstrap.format_version).map_err(map_format_error)?;
 
     if expectations
         .identity
@@ -128,7 +128,13 @@ fn map_format_error(error: FormatError) -> RepositoryError {
             }
         }
         FormatError::InvalidEncoding => RepositoryError::Malformed {
-            reason: "repository object is not valid JSON",
+            reason: "repository object is not valid MessagePack",
+        },
+        FormatError::InputTooLarge => RepositoryError::Malformed {
+            reason: "repository object exceeds the MessagePack size limit",
+        },
+        FormatError::TrailingBytes => RepositoryError::Malformed {
+            reason: "repository object contains trailing MessagePack bytes",
         },
         FormatError::InvalidMagic => RepositoryError::Malformed {
             reason: "repository magic is invalid",
@@ -140,7 +146,7 @@ fn map_format_error(error: FormatError) -> RepositoryError {
             reason: "repository descriptor field is invalid",
         },
         FormatError::VersionMismatch => RepositoryError::Malformed {
-            reason: "repository descriptor and format marker versions differ",
+            reason: "repository descriptor and bootstrap versions differ",
         },
         FormatError::Serialization => RepositoryError::Storage {
             operation: "encode",

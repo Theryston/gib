@@ -3,13 +3,16 @@ use std::fmt;
 /// The repository format supported by this SDK release.
 pub const CURRENT_REPOSITORY_FORMAT_VERSION: u16 = 1;
 
+/// The version of the persisted repository bootstrap schema.
+pub const CURRENT_REPOSITORY_BOOTSTRAP_VERSION: u16 = 1;
+
 /// The version of the persisted repository descriptor schema.
 pub const CURRENT_REPOSITORY_DESCRIPTOR_VERSION: u16 = 1;
 
 /// Magic value written to every 0.1 repository root object.
 pub const REPOSITORY_MAGIC: &str = "GIB";
 
-/// Logical object containing the repository format marker.
+/// Logical object containing the repository bootstrap record.
 pub const FORMAT_OBJECT_KEY: &str = "format";
 
 /// Logical object containing the repository descriptor.
@@ -307,7 +310,7 @@ impl RepositoryRoots {
         }
     }
 
-    /// Returns the format marker object reference.
+    /// Returns the bootstrap record object reference.
     pub fn format(&self) -> &RepositoryObject {
         &self.format
     }
@@ -344,8 +347,8 @@ impl RepositoryFeature {
 
 /// The validated domain representation of a repository descriptor.
 ///
-/// This type is intentionally separate from the JSON wire model. Only a
-/// descriptor that has passed all format and domain checks can be constructed
+/// This type is intentionally separate from the MessagePack wire model. Only
+/// a descriptor that has passed all format and domain checks can be constructed
 /// from persisted bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositoryDescriptor {
