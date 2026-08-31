@@ -86,6 +86,23 @@ fn external_consumer_uses_only_the_public_sdk_surface() -> Result<(), Box<dyn Er
     Ok(())
 }
 
+#[cfg(feature = "s3")]
+#[test]
+fn s3_backend_is_exposed_through_provider_neutral_sdk_types() -> Result<(), Box<dyn Error>> {
+    let config =
+        gib::S3StorageConfig::new("us-east-1", "gib-public-api", "access-key", "secret-key")?
+            .with_endpoint("http://127.0.0.1:9000");
+    let storage = gib::S3Storage::new(config)?;
+    let handle: gib::StorageHandle = (&storage).into();
+    assert!(
+        handle
+            .as_storage()
+            .capabilities()
+            .contains(gib::StorageCapabilities::ALL)
+    );
+    Ok(())
+}
+
 #[test]
 fn builder_rejects_an_unbounded_by_zero_event_queue() {
     let error = ClientBuilder::new().event_buffer_capacity(0).build().err();

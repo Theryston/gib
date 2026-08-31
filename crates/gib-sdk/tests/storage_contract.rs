@@ -1,3 +1,8 @@
+#[cfg(feature = "s3")]
+use gib::{
+    CancellationHandle, DEFAULT_S3_MULTIPART_PART_SIZE, MIN_S3_MULTIPART_PART_SIZE, S3Storage,
+    S3StorageConfig,
+};
 use gib::{
     LocalStorage, LocalStorageOperation, MemoryStorage, MemoryStorageOperation, ObjectKey,
     ObjectListRequest, ObjectPrefix, ObjectRange, ObjectStorage, ObjectWriteOptions,
@@ -19,6 +24,13 @@ fn run_storage_contract<S>(storage: S) -> Result<(), Box<dyn Error>>
 where
     S: ObjectStorage + Clone + 'static,
 {
+    run_storage_contract_in_namespace(storage, "objects")
+}
+
+fn run_storage_contract_in_namespace<S>(storage: S, namespace: &str) -> Result<(), Box<dyn Error>>
+where
+    S: ObjectStorage + Clone + 'static,
+{
     assert_object_storage::<S>();
     let all = storage.capabilities();
     assert!(all.contains(StorageCapabilities::ALL));
@@ -34,7 +46,7 @@ where
         assert!(all.supports(capability));
     }
 
-    let empty_key = ObjectKey::new("objects/empty")?;
+    let empty_key = namespaced_key(namespace, "empty")?;
     let mut empty_source = Cursor::new(Vec::<u8>::new());
     let empty_metadata = storage.write_stream(
         &empty_key,
@@ -69,7 +81,7 @@ where
     assert_eq!(replacement.size(), 11);
 
     let large_size = 3 * 1024 * 1024 + 37;
-    let large_key = ObjectKey::new("objects/large")?;
+    let large_key = namespaced_key(namespace, "large")?;
     let requests = Arc::new(Mutex::new(Vec::new()));
     let mut large_source = PatternReader::new(large_size, 97, requests.clone());
     let large_metadata = storage.write_stream(
@@ -110,12 +122,12 @@ where
         Err(StorageError::InvalidRange)
     );
 
-    for key in ["objects/list/a", "objects/list/c", "objects/list/b/nested"] {
-        let key = ObjectKey::new(key)?;
+    for suffix in ["list/a", "list/c", "list/b/nested"] {
+        let key = namespaced_key(namespace, suffix)?;
         let mut source = Cursor::new(key.as_str().as_bytes().to_vec());
         storage.write_stream(&key, &mut source, ObjectWriteOptions::if_absent())?;
     }
-    let outside_key = ObjectKey::new("objects/listing-outside")?;
+    let outside_key = namespaced_key(namespace, "listing-outside")?;
     let mut outside_source = Cursor::new(b"outside".to_vec());
     storage.write_stream(
         &outside_key,
@@ -123,7 +135,8 @@ where
         ObjectWriteOptions::if_absent(),
     )?;
 
-    let prefix = ObjectPrefix::new("objects/list/")?;
+    let list_prefix = format!("{namespace}/list");
+    let prefix = ObjectPrefix::new(format!("{list_prefix}/"))?;
     let mut request = ObjectListRequest::new(prefix).with_limit(2);
     let mut listed = Vec::new();
     let mut page_count = 0;
@@ -144,22 +157,26 @@ where
     assert!(page_count >= 2);
     assert_eq!(
         listed,
-        vec!["objects/list/a", "objects/list/b/nested", "objects/list/c"]
+        vec![
+            format!("{list_prefix}/a"),
+            format!("{list_prefix}/b/nested"),
+            format!("{list_prefix}/c"),
+        ]
     );
-    assert_eq!(storage.list_objects("objects/list")?, listed);
+    assert_eq!(storage.list_objects(&list_prefix)?, listed);
     let root_page = storage.list_page(&ObjectListRequest::root().with_limit(1000))?;
     assert!(
         root_page
             .objects()
             .iter()
-            .any(|object| object.key().as_str() == "objects/list/a")
+            .any(|object| object.key().as_str() == format!("{list_prefix}/a"))
     );
 
     storage.delete(&empty_key)?;
     assert_eq!(storage.metadata(&empty_key), Err(StorageError::NotFound));
     assert_eq!(storage.delete(&empty_key), Err(StorageError::NotFound));
 
-    let conditional_key = ObjectKey::new("objects/conditional")?;
+    let conditional_key = namespaced_key(namespace, "conditional")?;
     let mut initial_source = Cursor::new(b"initial".to_vec());
     let initial = storage.write_stream(
         &conditional_key,
@@ -212,27 +229,39 @@ where
     let mut failed_source = InterruptingReader::new(2);
     assert_eq!(
         storage.write_stream(
-            &ObjectKey::new("objects/cancelled")?,
+            &namespaced_key(namespace, "cancelled")?,
             &mut failed_source,
             ObjectWriteOptions::if_absent(),
         ),
         Err(StorageError::Cancelled)
     );
     assert_eq!(
-        storage.read(&ObjectKey::new("objects/cancelled")?.into_string()),
+        storage.read(&namespaced_key(namespace, "cancelled")?.into_string()),
         Err(StorageError::NotFound)
     );
 
     let mut size_mismatch_source = Cursor::new(b"short".to_vec());
     assert_eq!(
         storage.write_stream(
-            &ObjectKey::new("objects/size-mismatch")?,
+            &namespaced_key(namespace, "size-mismatch")?,
             &mut size_mismatch_source,
             ObjectWriteOptions::if_absent().with_expected_size(100),
         ),
         Err(StorageError::InvalidRequest)
     );
     Ok(())
+}
+
+fn namespaced_key(namespace: &str, suffix: &str) -> StorageResult<ObjectKey> {
+    ObjectKey::new(format!("{namespace}/{suffix}"))
+}
+
+fn unique_storage_namespace(prefix: &str) -> String {
+    format!(
+        "{prefix}/{process}-{sequence}",
+        process = std::process::id(),
+        sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed),
+    )
 }
 
 #[test]
@@ -244,7 +273,127 @@ fn memory_storage_runs_the_shared_contract_suite() -> Result<(), Box<dyn Error>>
 fn local_storage_runs_the_shared_contract_suite() -> Result<(), Box<dyn Error>> {
     let directory = TestDirectory::new()?;
     let storage = LocalStorage::new(directory.path())?;
+    run_storage_contract_in_namespace(storage, &unique_storage_namespace("s3-contract"))
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_storage_runs_the_shared_contract_suite_when_configured() -> Result<(), Box<dyn Error>> {
+    let Some(storage) = s3_storage_from_environment()? else {
+        eprintln!("skipping S3 contract: GIB_S3_TEST_* environment is not configured");
+        return Ok(());
+    };
     run_storage_contract(storage)
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_storage_supports_multipart_boundary_ranges_and_cancellation() -> Result<(), Box<dyn Error>> {
+    let Some(storage) = s3_storage_from_environment()? else {
+        eprintln!("skipping S3 multipart test: GIB_S3_TEST_* environment is not configured");
+        return Ok(());
+    };
+    let namespace = unique_storage_namespace("s3-contract");
+    let multipart_key = namespaced_key(&namespace, "multipart")?;
+    match storage.delete(&multipart_key) {
+        Ok(()) | Err(StorageError::NotFound) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let part_size = usize::try_from(storage.config().multipart_part_size())?;
+    let size = part_size
+        .checked_mul(3)
+        .and_then(|value| value.checked_add(19))
+        .ok_or("multipart test size overflow")?;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut source = PatternReader::new(size, 13_777, requests.clone());
+    let metadata = storage.write_stream(
+        &multipart_key,
+        &mut source,
+        ObjectWriteOptions::if_absent().with_expected_size(size as u64),
+    )?;
+    assert_eq!(metadata.size(), size as u64);
+    assert!(
+        requests
+            .lock()
+            .map_err(|_| "request lock poisoned")?
+            .iter()
+            .all(|size| *size <= STORAGE_TRANSFER_BUFFER_SIZE)
+    );
+
+    let start = part_size - 31;
+    let range = ObjectRange::new(start as u64, 79)?;
+    let mut range_read = storage.read_range(&multipart_key, range)?;
+    let mut contents = Vec::new();
+    range_read.read_to_end(&mut contents)?;
+    assert_eq!(contents, pattern(size)[start..start + 79]);
+
+    let cancelled_key = namespaced_key(&namespace, "cancelled")?;
+    match storage.delete(&cancelled_key) {
+        Ok(()) | Err(StorageError::NotFound) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let cancellation = CancellationHandle::new();
+    let writer_storage = storage.clone();
+    let writer_key = cancelled_key.clone();
+    let writer_cancellation = cancellation.clone();
+    let writer = thread::spawn(move || {
+        let mut source = SlowPatternReader {
+            length: size,
+            position: 0,
+            delay: std::time::Duration::from_millis(2),
+        };
+        writer_storage.write_stream_with_cancellation(
+            &writer_key,
+            &mut source,
+            ObjectWriteOptions::if_absent().with_expected_size(size as u64),
+            Some(&writer_cancellation),
+        )
+    });
+    thread::sleep(std::time::Duration::from_millis(100));
+    cancellation.cancel();
+    assert_eq!(
+        writer
+            .join()
+            .map_err(|_| "S3 cancellation writer panicked")?,
+        Err(StorageError::Cancelled)
+    );
+    assert_eq!(
+        storage.metadata(&cancelled_key),
+        Err(StorageError::NotFound)
+    );
+    storage.delete(&multipart_key)?;
+    Ok(())
+}
+
+#[cfg(feature = "s3")]
+fn s3_storage_from_environment() -> Result<Option<S3Storage>, Box<dyn Error>> {
+    let names = [
+        "GIB_S3_TEST_REGION",
+        "GIB_S3_TEST_BUCKET",
+        "GIB_S3_TEST_ACCESS_KEY",
+        "GIB_S3_TEST_SECRET_KEY",
+    ];
+    let [
+        Some(region),
+        Some(bucket),
+        Some(access_key),
+        Some(secret_key),
+    ] = names.map(|name| std::env::var(name).ok())
+    else {
+        return Ok(None);
+    };
+    let mut config = S3StorageConfig::new(region, bucket, access_key, secret_key)?;
+    if let Ok(endpoint) = std::env::var("GIB_S3_TEST_ENDPOINT") {
+        config = config.with_endpoint(endpoint);
+    }
+    if let Ok(session_token) = std::env::var("GIB_S3_TEST_SESSION_TOKEN") {
+        config = config.with_session_token(session_token);
+    }
+    Ok(Some(S3Storage::new(
+        config
+            .with_multipart_threshold(MIN_S3_MULTIPART_PART_SIZE)
+            .with_multipart_part_size(DEFAULT_S3_MULTIPART_PART_SIZE),
+    )?))
 }
 
 #[test]
@@ -641,6 +790,29 @@ impl Read for PatternReader {
 struct InterruptingReader {
     successful_reads: usize,
     position: usize,
+}
+
+#[cfg(feature = "s3")]
+struct SlowPatternReader {
+    length: usize,
+    position: usize,
+    delay: std::time::Duration,
+}
+
+#[cfg(feature = "s3")]
+impl Read for SlowPatternReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.position == self.length || buffer.is_empty() {
+            return Ok(0);
+        }
+        let amount = (self.length - self.position).min(buffer.len());
+        for (offset, byte) in buffer[..amount].iter_mut().enumerate() {
+            *byte = ((self.position + offset) % 251) as u8;
+        }
+        self.position += amount;
+        thread::sleep(self.delay);
+        Ok(amount)
+    }
 }
 
 impl InterruptingReader {

@@ -79,3 +79,9 @@ pub use repository::{
     VersionedStorageObject, WriteCondition, decode_snapshot_object, encode_snapshot_object,
     initialize_repository, open_repository,
 };
+#[cfg(feature = "s3")]
+pub use repository::{
+    DEFAULT_S3_MAX_CONCURRENCY, DEFAULT_S3_MULTIPART_PART_SIZE, DEFAULT_S3_MULTIPART_THRESHOLD,
+    MAX_S3_MULTIPART_PART_SIZE, MAX_S3_MULTIPART_THRESHOLD, MAX_S3_MULTIPART_UPLOAD_PARTS,
+    MIN_S3_MULTIPART_PART_SIZE, S3Storage, S3StorageConfig,
+};

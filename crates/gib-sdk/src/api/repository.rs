@@ -45,6 +45,12 @@ pub use crate::domain::{
     RepositoryIdentity, RepositoryKey, RepositoryObject, RepositoryRoots, SnapshotPublication,
     SnapshotPublicationRequest, SnapshotReference,
 };
+#[cfg(feature = "s3")]
+pub use crate::infrastructure::storage::{
+    DEFAULT_S3_MAX_CONCURRENCY, DEFAULT_S3_MULTIPART_PART_SIZE, DEFAULT_S3_MULTIPART_THRESHOLD,
+    MAX_S3_MULTIPART_PART_SIZE, MAX_S3_MULTIPART_THRESHOLD, MAX_S3_MULTIPART_UPLOAD_PARTS,
+    MIN_S3_MULTIPART_PART_SIZE, S3Storage, S3StorageConfig,
+};
 pub use crate::infrastructure::storage::{
     LocalStorage, LocalStorageOperation, MemoryStorage, MemoryStorageOperation,
 };
@@ -94,6 +100,13 @@ impl From<&MemoryStorage> for StorageHandle {
 
 impl From<&LocalStorage> for StorageHandle {
     fn from(storage: &LocalStorage) -> Self {
+        Self::new(storage.clone())
+    }
+}
+
+#[cfg(feature = "s3")]
+impl From<&S3Storage> for StorageHandle {
+    fn from(storage: &S3Storage) -> Self {
         Self::new(storage.clone())
     }
 }

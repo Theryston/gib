@@ -1,0 +1,61 @@
+name: S3 storage contract
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  s3-contract:
+    runs-on: ubuntu-latest
+    env:
+      GIB_S3_TEST_REGION: us-east-1
+      GIB_S3_TEST_BUCKET: gib-storage-contract
+      GIB_S3_TEST_ACCESS_KEY: gib-contract-access
+      GIB_S3_TEST_SECRET_KEY: gib-contract-secret
+      GIB_S3_TEST_ENDPOINT: http://127.0.0.1:9000
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Start MinIO
+        run: |
+          docker run --detach --name gib-minio \
+            --publish 9000:9000 --publish 9001:9001 \
+            --env MINIO_ROOT_USER="$GIB_S3_TEST_ACCESS_KEY" \
+            --env MINIO_ROOT_PASSWORD="$GIB_S3_TEST_SECRET_KEY" \
+            minio/minio:RELEASE.2024-12-18T13-15-44Z \
+            server /data --console-address ":9001"
+
+      - name: Wait for MinIO
+        shell: bash
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent "$GIB_S3_TEST_ENDPOINT/minio/health/ready" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become ready" >&2
+          exit 1
+
+      - name: Create test bucket
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location \
+            https://dl.min.io/client/mc/release/linux-amd64/mc \
+            --output "$RUNNER_TEMP/mc"
+          chmod +x "$RUNNER_TEMP/mc"
+          "$RUNNER_TEMP/mc" alias set local "$GIB_S3_TEST_ENDPOINT" \
+            "$GIB_S3_TEST_ACCESS_KEY" "$GIB_S3_TEST_SECRET_KEY" >/dev/null
+          "$RUNNER_TEMP/mc" mb --ignore-existing "local/$GIB_S3_TEST_BUCKET" >/dev/null
+
+      - name: Run S3 contract
+        run: cargo test -p gib-sdk --features s3 --test storage_contract --no-fail-fast
+
+      - name: Stop MinIO
+        if: ${{ always() }}
+        run: docker rm --force gib-minio >/dev/null 2>&1 || true

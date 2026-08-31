@@ -53,3 +53,36 @@ cargo run -p gib-examples --example local_storage_qa -- /tmp/gib-local-qa smoke
 cargo run -p gib-examples --example local_storage_qa -- /tmp/gib-local-qa conflict
 cargo run -p gib-examples --example local_storage_qa -- /tmp/gib-local-qa hold-write 1073741824 10
 ```
+
+The S3 storage QA example requires the `s3` feature and explicit credentials.
+It works with AWS S3 and S3-compatible services. The endpoint is optional for
+standard AWS S3 and should be set to the service URL for MinIO or LocalStack:
+
+```text
+export GIB_S3_REGION=us-east-1
+export GIB_S3_BUCKET=gib-qa
+export GIB_S3_ACCESS_KEY=minioadmin
+export GIB_S3_SECRET_KEY=minioadmin
+export GIB_S3_ENDPOINT=http://127.0.0.1:9000
+cargo run -p gib-examples --features s3 --example s3_storage_qa -- all
+```
+
+The commands `smoke`, `multipart`, `paginate`, and `cancel` run each check
+individually. `GIB_S3_SESSION_TOKEN`, `GIB_S3_MULTIPART_THRESHOLD`,
+`GIB_S3_MULTIPART_PART_SIZE`, and `GIB_S3_MAX_CONCURRENCY` are optional. The
+cancel command verifies that no usable object remains; use the provider CLI to
+inspect multipart uploads and confirm that the abort request removed any
+incomplete upload, for example:
+
+```text
+aws --endpoint-url "$GIB_S3_ENDPOINT" s3api list-multipart-uploads --bucket "$GIB_S3_BUCKET"
+```
+
+The S3 contract integration tests use the same adapter with an isolated object
+namespace. Set `GIB_S3_TEST_REGION`, `GIB_S3_TEST_BUCKET`,
+`GIB_S3_TEST_ACCESS_KEY`, and `GIB_S3_TEST_SECRET_KEY` (plus the optional
+`GIB_S3_TEST_ENDPOINT` and `GIB_S3_TEST_SESSION_TOKEN`) before running:
+
+```text
+cargo test -p gib-sdk --features s3 --test storage_contract --no-fail-fast
+```
