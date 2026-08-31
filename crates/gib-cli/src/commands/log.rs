@@ -1,9 +1,10 @@
 use super::{CommandError, open_repository};
 use crate::input::LogRequest;
+use crate::input::OutputMode;
 use crate::output;
 use gib::SnapshotListRequest;
 
-pub fn run(request: LogRequest) -> Result<(), CommandError> {
+pub fn run(request: LogRequest, mode: OutputMode) -> Result<(), CommandError> {
     let repository = open_repository(request.repository_path())?;
     let mut cursor = request.after;
     let mut emitted = false;
@@ -18,7 +19,7 @@ pub fn run(request: LogRequest) -> Result<(), CommandError> {
             .list_history(page_request)
             .map_err(CommandError::Sdk)?;
         emitted |= !page.is_empty();
-        output::render_history(&page);
+        output::render_history(&page, mode);
         cursor = page.next_cursor().cloned();
         if cursor.is_none() {
             break;
@@ -26,7 +27,7 @@ pub fn run(request: LogRequest) -> Result<(), CommandError> {
     }
 
     if !emitted {
-        output::render_empty_history();
+        output::render_empty_history(mode);
     }
     Ok(())
 }

@@ -48,6 +48,11 @@ pub enum DomainError {
         /// The stable reason for rejecting the identity.
         reason: &'static str,
     },
+    /// An author identity is not a valid `Name <email>` value.
+    InvalidAuthorIdentity {
+        /// The stable reason for rejecting the identity.
+        reason: &'static str,
+    },
     /// The repository key is not a valid namespace identifier.
     InvalidRepositoryKey {
         /// The stable reason for rejecting the key.
@@ -90,6 +95,7 @@ impl DomainError {
     pub const fn reason(self) -> &'static str {
         match self {
             Self::InvalidRepositoryIdentity { reason }
+            | Self::InvalidAuthorIdentity { reason }
             | Self::InvalidRepositoryKey { reason }
             | Self::InvalidRepositoryObject { reason }
             | Self::InvalidSnapshotReference { reason }
@@ -106,6 +112,9 @@ impl fmt::Display for DomainError {
         match self {
             Self::InvalidRepositoryIdentity { reason } => {
                 write!(formatter, "invalid repository identity: {reason}")
+            }
+            Self::InvalidAuthorIdentity { reason } => {
+                write!(formatter, "invalid author identity: {reason}")
             }
             Self::InvalidRepositoryKey { reason } => {
                 write!(formatter, "invalid repository key: {reason}")

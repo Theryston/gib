@@ -640,7 +640,7 @@ fn encode_head_unsigned(generation: u64, snapshot: Option<&str>) -> Result<Vec<u
     .map_err(|_| FormatError::Serialization)
 }
 
-fn decode_messagepack<T>(bytes: &[u8], max_bytes: usize) -> Result<T, FormatError>
+pub(crate) fn decode_messagepack<T>(bytes: &[u8], max_bytes: usize) -> Result<T, FormatError>
 where
     T: DeserializeOwned,
 {
@@ -841,6 +841,7 @@ impl MessagePackScanner<'_> {
 fn map_domain_error(error: DomainError) -> FormatError {
     match error {
         DomainError::InvalidRepositoryIdentity { .. }
+        | DomainError::InvalidAuthorIdentity { .. }
         | DomainError::InvalidRepositoryKey { .. }
         | DomainError::InvalidRepositoryObject { .. }
         | DomainError::InvalidSnapshotReference { .. }

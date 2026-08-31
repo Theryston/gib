@@ -1,5 +1,7 @@
+pub mod config;
 pub mod log;
 pub mod resolve;
+pub mod whoami;
 
 use gib::{LocalStorage, Repository, RepositoryOpenRequest, SdkError, StorageError};
 use std::fmt;
@@ -9,6 +11,15 @@ use std::path::Path;
 pub enum CommandError {
     Storage(StorageError),
     Sdk(SdkError),
+}
+
+impl CommandError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Storage(_) => "storage_failure",
+            Self::Sdk(error) => error.code().as_str(),
+        }
+    }
 }
 
 impl fmt::Display for CommandError {

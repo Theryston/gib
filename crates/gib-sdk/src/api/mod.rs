@@ -2,6 +2,7 @@ mod builder;
 mod client;
 mod error;
 mod event;
+mod identity;
 mod operation;
 mod repository;
 
@@ -12,6 +13,16 @@ pub use event::{
     CancellationInfo, EVENT_SCHEMA_VERSION, EventConsumer, EventDelivery, EventDispatcher,
     EventEnvelope, EventKind, EventMessage, EventPayload, EventPhase, EventSubscription, Progress,
     RecoveryPoint,
+};
+pub use identity::{
+    Author, AuthorIdentity, CURRENT_IDENTITY_CONFIGURATION_VERSION, ConfigurationError,
+    ConfigurationHandle, ConfigurationResult, ConfigurationStorage, GLOBAL_CONFIG_DIRECTORY,
+    GLOBAL_CONFIG_FILE_NAME, GLOBAL_CONFIGURATION_DIRECTORY, GlobalConfiguration,
+    IDENTITY_CONFIGURATION_FILE_NAME, IdentityConfigurationStorage, IdentityStorageResult,
+    LocalConfiguration, LocalIdentityConfiguration, MAX_AUTHOR_IDENTITY_LENGTH, MAX_AUTHOR_LENGTH,
+    MemoryConfiguration, MemoryIdentityConfiguration, SetAuthorRequest, SetIdentityRequest,
+    UserIdentity, get_author, get_global_identity, get_identity, read_identity, set_author,
+    set_global_identity, set_identity,
 };
 pub use operation::{
     CancellationHandle, CancellationToken, OperationHandle, OperationId, OperationKind,

@@ -1,6 +1,8 @@
+mod author;
 mod repository;
 mod snapshot;
 
+pub use author::{AuthorIdentity, MAX_AUTHOR_IDENTITY_LENGTH};
 pub use repository::{
     CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
     CURRENT_REPOSITORY_FORMAT_VERSION, CURRENT_REPOSITORY_HEAD_VERSION, DomainError,

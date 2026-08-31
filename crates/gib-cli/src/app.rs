@@ -5,23 +5,38 @@ use std::process::ExitCode;
 
 pub fn run() -> ExitCode {
     let cli = input::parse();
+    let mode = cli.mode;
     let Some(command) = cli.command else {
         input::print_help();
         return ExitCode::SUCCESS;
     };
 
     match command {
-        Command::Log(request) => match commands::log::run(request) {
+        Command::Config(request) => match commands::config::run(request, mode) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                output::render_error(&error);
+                output::render_error(&error, error.code(), mode);
                 ExitCode::from(error.exit_code())
             }
         },
-        Command::Resolve(request) => match commands::resolve::run(request) {
+        Command::Log(request) => match commands::log::run(request, mode) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                output::render_error(&error);
+                output::render_error(&error, error.code(), mode);
+                ExitCode::from(error.exit_code())
+            }
+        },
+        Command::Resolve(request) => match commands::resolve::run(request, mode) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                output::render_error(&error, error.code(), mode);
+                ExitCode::from(error.exit_code())
+            }
+        },
+        Command::Whoami(request) => match commands::whoami::run(request, mode) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                output::render_error(&error, error.code(), mode);
                 ExitCode::from(error.exit_code())
             }
         },
@@ -38,6 +53,7 @@ impl CommandError {
                 | gib::SdkError::SnapshotReferenceNotFound
                 | gib::SdkError::SnapshotReferenceAmbiguous
                 | gib::SdkError::RepositoryNoSnapshots
+                | gib::SdkError::IdentityNotConfigured
                 | gib::SdkError::InvalidRequest { .. } => 2,
                 _ => 1,
             },

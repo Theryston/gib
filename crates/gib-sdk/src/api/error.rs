@@ -9,6 +9,14 @@ pub enum ErrorCode {
     InvalidConfiguration,
     /// A request or event contains an invalid value.
     InvalidRequest,
+    /// No global author identity has been configured.
+    IdentityNotConfigured,
+    /// The persisted global identity configuration is malformed.
+    ConfigurationMalformed,
+    /// The persisted global identity configuration version is unsupported.
+    ConfigurationUnsupportedVersion,
+    /// The global identity configuration could not be read or written.
+    ConfigurationFailure,
     /// No more operation identifiers are available in this process.
     OperationIdExhausted,
     /// An operation method was called after an incompatible terminal state.
@@ -61,6 +69,10 @@ impl ErrorCode {
         match self {
             Self::InvalidConfiguration => "invalid_configuration",
             Self::InvalidRequest => "invalid_request",
+            Self::IdentityNotConfigured => "identity_not_configured",
+            Self::ConfigurationMalformed => "configuration_malformed",
+            Self::ConfigurationUnsupportedVersion => "configuration_unsupported_version",
+            Self::ConfigurationFailure => "configuration_failure",
             Self::OperationIdExhausted => "operation_id_exhausted",
             Self::OperationStateConflict => "operation_state_conflict",
             Self::OperationCancelled => "operation_cancelled",
@@ -116,6 +128,23 @@ pub enum SdkError {
         field: &'static str,
         /// The stable reason for rejection.
         reason: &'static str,
+    },
+    /// No global author identity has been configured.
+    IdentityNotConfigured,
+    /// The persisted global identity configuration is malformed.
+    ConfigurationMalformed {
+        /// A stable explanation of the malformed configuration.
+        reason: &'static str,
+    },
+    /// The persisted global identity configuration version is unsupported.
+    ConfigurationUnsupportedVersion {
+        /// The version found in the persisted configuration.
+        version: u16,
+    },
+    /// A global identity configuration storage operation failed.
+    ConfigurationFailure {
+        /// The configuration operation that failed.
+        operation: &'static str,
     },
     /// The process-wide operation identifier sequence is exhausted.
     OperationIdExhausted,
@@ -192,6 +221,12 @@ impl SdkError {
         match self {
             Self::InvalidConfiguration { .. } => ErrorCode::InvalidConfiguration,
             Self::InvalidRequest { .. } => ErrorCode::InvalidRequest,
+            Self::IdentityNotConfigured => ErrorCode::IdentityNotConfigured,
+            Self::ConfigurationMalformed { .. } => ErrorCode::ConfigurationMalformed,
+            Self::ConfigurationUnsupportedVersion { .. } => {
+                ErrorCode::ConfigurationUnsupportedVersion
+            }
+            Self::ConfigurationFailure { .. } => ErrorCode::ConfigurationFailure,
             Self::OperationIdExhausted => ErrorCode::OperationIdExhausted,
             Self::OperationSequenceExhausted { .. } => ErrorCode::OperationSequenceExhausted,
             Self::OperationStateConflict { .. } => ErrorCode::OperationStateConflict,
@@ -225,6 +260,10 @@ impl SdkError {
             Self::OperationCancelled { operation_id } => *operation_id,
             Self::InvalidConfiguration { .. }
             | Self::InvalidRequest { .. }
+            | Self::IdentityNotConfigured
+            | Self::ConfigurationMalformed { .. }
+            | Self::ConfigurationUnsupportedVersion { .. }
+            | Self::ConfigurationFailure { .. }
             | Self::OperationIdExhausted
             | Self::EventDispatcherClosed
             | Self::EventConsumerRegistration
@@ -262,6 +301,27 @@ impl fmt::Display for SdkError {
             }
             Self::InvalidRequest { field, reason } => {
                 write!(formatter, "invalid request field {field}: {reason}")
+            }
+            Self::IdentityNotConfigured => {
+                formatter.write_str("global author identity is not configured")
+            }
+            Self::ConfigurationMalformed { reason } => {
+                write!(
+                    formatter,
+                    "global identity configuration is malformed: {reason}"
+                )
+            }
+            Self::ConfigurationUnsupportedVersion { version } => {
+                write!(
+                    formatter,
+                    "global identity configuration version {version} is unsupported"
+                )
+            }
+            Self::ConfigurationFailure { operation } => {
+                write!(
+                    formatter,
+                    "global identity configuration {operation} operation failed"
+                )
             }
             Self::OperationIdExhausted => {
                 formatter.write_str("operation identifier space exhausted")

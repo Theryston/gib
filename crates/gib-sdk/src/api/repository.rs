@@ -676,6 +676,10 @@ impl From<DomainError> for SdkError {
                 field: "repository_identity",
                 reason,
             },
+            DomainError::InvalidAuthorIdentity { reason } => SdkError::InvalidRequest {
+                field: "author",
+                reason,
+            },
             DomainError::InvalidRepositoryKey { reason } => SdkError::InvalidRequest {
                 field: "repository_key",
                 reason,
