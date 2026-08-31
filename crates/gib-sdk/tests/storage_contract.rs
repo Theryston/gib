@@ -1,7 +1,8 @@
 use gib::{
-    MemoryStorage, MemoryStorageOperation, ObjectKey, ObjectListRequest, ObjectPrefix, ObjectRange,
-    ObjectStorage, ObjectWriteOptions, RepositoryStorage, STORAGE_TRANSFER_BUFFER_SIZE,
-    StorageCapabilities, StorageCapability, StorageError, StorageResult,
+    LocalStorage, LocalStorageOperation, MemoryStorage, MemoryStorageOperation, ObjectKey,
+    ObjectListRequest, ObjectPrefix, ObjectRange, ObjectStorage, ObjectWriteOptions,
+    RepositoryStorage, STORAGE_TRANSFER_BUFFER_SIZE, StorageCapabilities, StorageCapability,
+    StorageError, StorageResult,
 };
 use std::error::Error;
 use std::io::{self, Cursor, Read};
@@ -242,8 +243,211 @@ fn memory_storage_runs_the_shared_contract_suite() -> Result<(), Box<dyn Error>>
 #[test]
 fn local_storage_runs_the_shared_contract_suite() -> Result<(), Box<dyn Error>> {
     let directory = TestDirectory::new()?;
-    let storage = gib::LocalStorage::new(directory.path())?;
+    let storage = LocalStorage::new(directory.path())?;
     run_storage_contract(storage)
+}
+
+#[test]
+fn local_storage_lists_root_and_canonicalizes_trailing_prefixes() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new()?;
+    let storage = LocalStorage::new(directory.path())?;
+    let key = ObjectKey::new("objects/root-list")?;
+    let mut source = Cursor::new(b"root-list".to_vec());
+    storage.write_stream(&key, &mut source, ObjectWriteOptions::if_absent())?;
+
+    assert_eq!(storage.list_objects("")?, vec!["objects/root-list"]);
+    assert_eq!(storage.list_objects("objects/")?, vec!["objects/root-list"]);
+    Ok(())
+}
+
+#[test]
+fn local_storage_faults_never_publish_partial_objects() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new()?;
+    let storage = LocalStorage::new(directory.path())?;
+    let key = ObjectKey::new("objects/atomic")?;
+
+    storage.inject_failure(LocalStorageOperation::Write, StorageError::Transient);
+    let mut source = Cursor::new(b"write-failure".to_vec());
+    assert_eq!(
+        storage.write_stream(&key, &mut source, ObjectWriteOptions::if_absent()),
+        Err(StorageError::Transient)
+    );
+    assert_eq!(storage.read(key.as_str()), Err(StorageError::NotFound));
+
+    let mut source = Cursor::new(b"old-complete-object".to_vec());
+    storage.write_stream(&key, &mut source, ObjectWriteOptions::if_absent())?;
+
+    for operation in [LocalStorageOperation::Flush, LocalStorageOperation::Rename] {
+        storage.inject_failure(operation, StorageError::Transient);
+        let mut replacement = Cursor::new(b"replacement-that-must-not-publish".to_vec());
+        assert_eq!(
+            storage.write_stream(&key, &mut replacement, ObjectWriteOptions::new()),
+            Err(StorageError::Transient)
+        );
+        assert_eq!(storage.read(key.as_str())?, b"old-complete-object");
+    }
+
+    storage.inject_failure(
+        LocalStorageOperation::DirectorySync,
+        StorageError::Transient,
+    );
+    let mut replacement = Cursor::new(b"complete-before-directory-sync-error".to_vec());
+    assert_eq!(
+        storage.write_stream(&key, &mut replacement, ObjectWriteOptions::new()),
+        Err(StorageError::Transient)
+    );
+    assert_eq!(
+        storage.read(key.as_str())?,
+        b"complete-before-directory-sync-error"
+    );
+
+    let mut failed = InterruptingReader::new(1);
+    assert_eq!(
+        storage.write_stream(&key, &mut failed, ObjectWriteOptions::new()),
+        Err(StorageError::Cancelled)
+    );
+    assert_eq!(
+        storage.read(key.as_str())?,
+        b"complete-before-directory-sync-error"
+    );
+    Ok(())
+}
+
+#[test]
+fn local_storage_rejects_invalid_and_symlinked_paths() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new()?;
+    let storage = LocalStorage::new(directory.path())?;
+    for key in [
+        "../escape",
+        "/absolute",
+        "objects/../../escape",
+        "objects\\escape",
+        "objects//escape",
+        "objects/escape:name",
+    ] {
+        assert_eq!(
+            storage.read(key),
+            Err(StorageError::InvalidObjectKey),
+            "invalid key should be rejected: {key}"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        let outside = directory.path().join("outside");
+        std::fs::create_dir_all(&outside)?;
+        let outside_file = outside.join("outside-object");
+        std::fs::write(&outside_file, b"outside")?;
+        std::os::unix::fs::symlink(&outside, directory.path().join("linked-parent"))?;
+        std::os::unix::fs::symlink(&outside_file, directory.path().join("linked-object"))?;
+
+        let parent_key = ObjectKey::new("linked-parent/created")?;
+        assert!(matches!(
+            storage.read_stream(&parent_key),
+            Err(StorageError::InvalidObjectKey)
+        ));
+        let mut source = Cursor::new(b"must-stay-inside".to_vec());
+        assert_eq!(
+            storage.write_stream(&parent_key, &mut source, ObjectWriteOptions::new()),
+            Err(StorageError::InvalidObjectKey)
+        );
+        assert_eq!(
+            storage.delete(&parent_key),
+            Err(StorageError::InvalidObjectKey)
+        );
+
+        let final_key = ObjectKey::new("linked-object")?;
+        assert_eq!(
+            storage.metadata(&final_key),
+            Err(StorageError::InvalidObjectKey)
+        );
+        assert_eq!(
+            storage.read(final_key.as_str()),
+            Err(StorageError::InvalidObjectKey)
+        );
+        let mut source = Cursor::new(b"must-not-follow".to_vec());
+        assert_eq!(
+            storage.write_stream(&final_key, &mut source, ObjectWriteOptions::new()),
+            Err(StorageError::InvalidObjectKey)
+        );
+        assert_eq!(
+            storage.delete(&final_key),
+            Err(StorageError::InvalidObjectKey)
+        );
+        assert_eq!(std::fs::read(&outside_file)?, b"outside");
+        assert!(!outside.join("created").exists());
+        assert!(
+            !storage
+                .list_objects("")?
+                .iter()
+                .any(|key| { key.starts_with("linked-parent/") || key == "linked-object" })
+        );
+
+        let root_link = directory.path().join("root-link");
+        std::os::unix::fs::symlink(&outside, &root_link)?;
+        assert_eq!(
+            LocalStorage::new(&root_link),
+            Err(StorageError::InvalidObjectKey)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn local_storage_conditional_writes_are_race_safe_across_handles() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new()?;
+    let first_storage =
+        LocalStorage::new(directory.path()).map_err(|error| format!("first storage: {error:?}"))?;
+    let second_storage = LocalStorage::new(directory.path())
+        .map_err(|error| format!("second storage: {error:?}"))?;
+    let key = ObjectKey::new("objects/cross-handle")?;
+    let mut initial_source = Cursor::new(b"initial".to_vec());
+    let initial = first_storage
+        .write_stream(&key, &mut initial_source, ObjectWriteOptions::if_absent())
+        .map_err(|error| format!("initial write: {error:?}"))?;
+    let version = initial
+        .version()
+        .cloned()
+        .ok_or("local storage should return a version")?;
+    let barrier = Arc::new(Barrier::new(2));
+
+    let first_barrier = barrier.clone();
+    let first_key = key.clone();
+    let first_version = version.clone();
+    let first = thread::spawn(move || {
+        first_barrier.wait();
+        let mut source = Cursor::new(b"winner-one".to_vec());
+        first_storage.write_stream(
+            &first_key,
+            &mut source,
+            ObjectWriteOptions::if_version(first_version),
+        )
+    });
+    let second_barrier = barrier;
+    let second_key = key.clone();
+    let second = thread::spawn(move || {
+        second_barrier.wait();
+        let mut source = Cursor::new(b"winner-two".to_vec());
+        second_storage.write_stream(
+            &second_key,
+            &mut source,
+            ObjectWriteOptions::if_version(version),
+        )
+    });
+
+    let results = [
+        first.join().map_err(|_| "first writer panicked")?,
+        second.join().map_err(|_| "second writer panicked")?,
+    ];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(StorageError::Conflict)))
+            .count(),
+        1
+    );
+    Ok(())
 }
 
 #[test]

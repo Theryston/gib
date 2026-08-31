@@ -45,7 +45,9 @@ pub use crate::domain::{
     RepositoryIdentity, RepositoryKey, RepositoryObject, RepositoryRoots, SnapshotPublication,
     SnapshotPublicationRequest, SnapshotReference,
 };
-pub use crate::infrastructure::storage::{LocalStorage, MemoryStorage, MemoryStorageOperation};
+pub use crate::infrastructure::storage::{
+    LocalStorage, LocalStorageOperation, MemoryStorage, MemoryStorageOperation,
+};
 
 /// A cloneable type-erased handle for a repository storage backend.
 #[derive(Clone)]

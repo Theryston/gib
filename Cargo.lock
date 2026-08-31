@@ -185,6 +185,7 @@ dependencies = [
 name = "gib-sdk"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "parse-size",
  "rmp-serde",
  "serde",
