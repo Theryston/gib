@@ -1,8 +1,16 @@
 mod author;
+mod configuration;
 mod repository;
 mod snapshot;
 
 pub use author::{AuthorIdentity, MAX_AUTHOR_IDENTITY_LENGTH};
+pub(crate) use configuration::{
+    BackupConfigurationInput, CURRENT_CONFIGURATION_VERSION, ConfigurationInput,
+    ConfigurationValidationError, LiveConfigurationInput, MAX_BACKUP_CONCURRENCY,
+    MAX_CHUNK_SIZE_BYTES, MAX_COMPRESSION_LEVEL, MAX_LIVE_INTERVAL_MS, MIN_COMPRESSION_LEVEL,
+    RepositoryConfigurationInput, RestoreConfigurationInput, ValidatedConfiguration,
+    validate_configuration,
+};
 pub use repository::{
     CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
     CURRENT_REPOSITORY_FORMAT_VERSION, CURRENT_REPOSITORY_HEAD_VERSION, DomainError,

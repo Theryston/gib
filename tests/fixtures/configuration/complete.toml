@@ -1,0 +1,21 @@
+version = 1
+
+[repository]
+storage = "mybackups"
+key = "my-project"
+
+[backup]
+root_path = "./source"
+message = "Project backup"
+compress = 3
+chunk_size = "4096 B"
+concurrency = 8
+ignore = ["node_modules", "dist"]
+
+[live]
+message = "Project live synchronization"
+debounce_ms = 1500
+poll_ms = 2000
+
+[restore]
+target_path = "./.gib-restore"

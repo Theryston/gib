@@ -68,6 +68,20 @@ pub use api::{
     REQUIRED_REPOSITORY_FEATURE,
 };
 
+pub use api::{
+    BackupConfig, BackupConfiguration, ByteSize, CONFIGURATION_FILE_NAME,
+    CURRENT_CONFIGURATION_VERSION, CURRENT_GIB_CONFIGURATION_VERSION, ConfigError, ConfigErrorKind,
+    Configuration, ConfigurationFileError, ConfigurationParseError, GIB_CONFIGURATION_FILE_NAME,
+    GibConfig, GibConfiguration, GibConfigurationError, GibConfigurationErrorKind,
+    LOCAL_CONFIGURATION_FILE_NAME, LiveConfig, LiveConfiguration, LocalConfig,
+    MAX_BACKUP_CONCURRENCY, MAX_CHUNK_SIZE_BYTES, MAX_COMPRESSION_LEVEL, MAX_CONFIGURATION_BYTES,
+    MAX_LIVE_INTERVAL_MS, MIN_COMPRESSION_LEVEL, PROJECT_CONFIGURATION_FILE_NAME, ProjectConfig,
+    ProjectConfigError, ProjectConfiguration, ProjectConfigurationError,
+    ProjectConfigurationErrorKind, ProjectRepositoryConfiguration, RepositoryConfig,
+    RepositoryConfiguration, RestoreConfig, RestoreConfiguration, load_configuration,
+    parse_configuration,
+};
+
 pub use domain::DomainError;
 
 /// Compatibility name for the repository storage abstraction.
