@@ -142,6 +142,16 @@ impl RepositoryStorage for LocalStorage {
         fs::read(path).map_err(map_io_error)
     }
 
+    fn list_objects(&self, prefix: &str) -> StorageResult<Vec<String>> {
+        RepositoryObject::new(prefix).map_err(|_| StorageError::InvalidObjectKey)?;
+        ensure_directory_is_safe(&self.state.root)?;
+
+        let mut object_keys = Vec::new();
+        collect_object_keys(&self.state.root, &self.state.root, prefix, &mut object_keys)?;
+        object_keys.sort();
+        Ok(object_keys)
+    }
+
     fn read_with_version(&self, object_key: &str) -> StorageResult<VersionedObject> {
         let contents = self.read(object_key)?;
         let version = version_for_contents(&contents)?;
@@ -292,6 +302,53 @@ fn write_temporary_file(path: &Path, contents: &[u8]) -> StorageResult<PathBuf> 
 fn version_for_contents(contents: &[u8]) -> StorageResult<StorageVersion> {
     let digest = Sha256::digest(contents);
     StorageVersion::from_bytes(digest.to_vec())
+}
+
+fn collect_object_keys(
+    root: &Path,
+    directory: &Path,
+    prefix: &str,
+    object_keys: &mut Vec<String>,
+) -> StorageResult<()> {
+    for entry in fs::read_dir(directory).map_err(map_io_error)? {
+        let entry = entry.map_err(map_io_error)?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(map_io_error)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_object_keys(root, &path, prefix, object_keys)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| StorageError::InvalidObjectKey)?;
+        let Some(relative) = relative.to_str() else {
+            return Err(StorageError::InvalidObjectKey);
+        };
+        let object_key = relative.replace(std::path::MAIN_SEPARATOR, "/");
+        if path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.contains(".gib-tmp-"))
+        {
+            continue;
+        }
+        let valid = RepositoryObject::new(&object_key).is_ok();
+        if !valid {
+            continue;
+        }
+        let prefix_with_separator = format!("{prefix}/");
+        if object_key == prefix || object_key.starts_with(&prefix_with_separator) {
+            object_keys.push(object_key);
+        }
+    }
+    Ok(())
 }
 
 struct CasFileLock {

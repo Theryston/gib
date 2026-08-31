@@ -1,4 +1,5 @@
 mod repository;
+mod snapshot;
 
 pub use repository::{
     CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
@@ -9,4 +10,15 @@ pub use repository::{
     RepositoryFeature, RepositoryHead, RepositoryId, RepositoryIdentity, RepositoryKey,
     RepositoryObject, RepositoryRoots, SnapshotPublication, SnapshotPublicationRequest,
     SnapshotReference,
+};
+
+pub use snapshot::{
+    BackupReference, CURRENT_SNAPSHOT_HISTORY_VERSION, CURRENT_SNAPSHOT_SUMMARY_VERSION,
+    CURRENT_SNAPSHOT_VERSION, DEFAULT_SNAPSHOT_PAGE_SIZE, LATEST_SNAPSHOT_ALIAS,
+    MAX_SNAPSHOT_AUTHOR_LENGTH, MAX_SNAPSHOT_CURSOR_LENGTH, MAX_SNAPSHOT_ID_LENGTH,
+    MAX_SNAPSHOT_MESSAGE_LENGTH, MAX_SNAPSHOT_PAGE_SIZE, SNAPSHOT_HISTORY_OBJECT_PREFIX,
+    SNAPSHOT_OBJECT_PREFIX, Snapshot, SnapshotCursor, SnapshotHistoryPage, SnapshotHistoryRequest,
+    SnapshotId, SnapshotListRequest, SnapshotPage, SnapshotRef, SnapshotReferenceInput,
+    SnapshotReferenceSelector, SnapshotSelector, SnapshotSummary, SnapshotSummaryListRequest,
+    SnapshotSummaryPage,
 };

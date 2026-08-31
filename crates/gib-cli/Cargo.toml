@@ -2,6 +2,7 @@
 name = "gib-cli"
 version = "0.1.0"
 edition = "2024"
+description.workspace = true
 publish = false
 
 [[bin]]
@@ -10,4 +11,5 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
+clap = { version = "4.5", features = ["derive"] }
 gib-sdk = { path = "../gib-sdk" }

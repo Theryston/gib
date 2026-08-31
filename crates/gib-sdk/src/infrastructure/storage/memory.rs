@@ -116,6 +116,20 @@ impl RepositoryStorage for MemoryStorage {
             .ok_or(StorageError::NotFound)
     }
 
+    fn list_objects(&self, prefix: &str) -> StorageResult<Vec<String>> {
+        validate_object_key(prefix)?;
+        let state = self.state.lock().map_err(|_| StorageError::Unavailable)?;
+        let prefix_with_separator = format!("{prefix}/");
+        Ok(state
+            .objects
+            .keys()
+            .filter(|object_key| {
+                object_key.as_str() == prefix || object_key.starts_with(&prefix_with_separator)
+            })
+            .cloned()
+            .collect())
+    }
+
     fn read_with_version(&self, object_key: &str) -> StorageResult<VersionedObject> {
         validate_object_key(object_key)?;
         let state = self.state.lock().map_err(|_| StorageError::Unavailable)?;

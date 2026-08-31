@@ -464,6 +464,11 @@ only required capabilities.
 - Enable `#![warn(missing_docs)]` and make documentation warnings fail CI.
 - Document every public item, errors, cancellation, atomicity, resource limits,
   callback behavior, examples, and required features.
+- Keep public Rustdoc concise and focused on public behavior and contracts. Do
+  not repeat an item's signature or implementation; aliases should use a
+  single-line reference. Comments outside required Rustdoc are forbidden unless
+  they explain a non-obvious invariant, security or compatibility constraint
+  that cannot be expressed more clearly in code.
 - Use doctests with `?`, not `unwrap`.
 - Unit-test pure domain rules.
 - Apply one shared contract suite to Memory, Local, S3, and WebDAV adapters.

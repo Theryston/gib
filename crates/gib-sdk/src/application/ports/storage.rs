@@ -145,6 +145,23 @@ pub trait RepositoryStorage: Send + Sync {
     /// Reads one object without creating or modifying it.
     fn read(&self, object_key: &str) -> StorageResult<Vec<u8>>;
 
+    /// Lists logical object keys below a validated prefix in deterministic
+    /// lexical order.
+    ///
+    /// Listing is an explicit capability because some remote backends expose
+    /// it through a paginated API while others do not. Snapshot history uses
+    /// this capability for its compact index and falls back to authoritative
+    /// snapshot-object reconstruction when the index is absent.
+    fn list_objects(&self, prefix: &str) -> StorageResult<Vec<String>> {
+        let _ = prefix;
+        Err(StorageError::UnsupportedCapability)
+    }
+
+    /// Alias for [`Self::list_objects`] using shorter storage terminology.
+    fn list(&self, prefix: &str) -> StorageResult<Vec<String>> {
+        self.list_objects(prefix)
+    }
+
     /// Reads one object and returns the backend version token for that read.
     ///
     /// This is a required capability for repository HEAD reads. The default
@@ -198,6 +215,14 @@ where
 
     fn read(&self, object_key: &str) -> StorageResult<Vec<u8>> {
         self.as_ref().read(object_key)
+    }
+
+    fn list_objects(&self, prefix: &str) -> StorageResult<Vec<String>> {
+        self.as_ref().list_objects(prefix)
+    }
+
+    fn list(&self, prefix: &str) -> StorageResult<Vec<String>> {
+        self.as_ref().list(prefix)
     }
 
     fn read_with_version(&self, object_key: &str) -> StorageResult<VersionedObject> {

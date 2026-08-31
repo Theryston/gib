@@ -43,6 +43,16 @@ pub enum ErrorCode {
     RepositoryGenerationExhausted,
     /// The configured storage backend failed a lifecycle operation.
     StorageFailure,
+    /// A repository contains no published snapshots for the `latest` alias.
+    RepositoryNoSnapshots,
+    /// A snapshot reference was empty.
+    SnapshotReferenceEmpty,
+    /// A snapshot reference has invalid syntax.
+    SnapshotReferenceMalformed,
+    /// No snapshot matches a requested reference.
+    SnapshotReferenceNotFound,
+    /// More than one snapshot matches a requested prefix.
+    SnapshotReferenceAmbiguous,
 }
 
 impl ErrorCode {
@@ -68,6 +78,11 @@ impl ErrorCode {
             Self::StorageCapabilityUnsupported => "storage_capability_unsupported",
             Self::RepositoryGenerationExhausted => "repository_generation_exhausted",
             Self::StorageFailure => "storage_failure",
+            Self::RepositoryNoSnapshots => "repository_no_snapshots",
+            Self::SnapshotReferenceEmpty => "snapshot_reference_empty",
+            Self::SnapshotReferenceMalformed => "snapshot_reference_malformed",
+            Self::SnapshotReferenceNotFound => "snapshot_reference_not_found",
+            Self::SnapshotReferenceAmbiguous => "snapshot_reference_ambiguous",
         }
     }
 }
@@ -143,6 +158,16 @@ pub enum SdkError {
         /// The lifecycle operation that failed.
         operation: &'static str,
     },
+    /// The repository has no published snapshot for a `latest` request.
+    RepositoryNoSnapshots,
+    /// A snapshot reference is empty.
+    SnapshotReferenceEmpty,
+    /// A snapshot reference is malformed.
+    SnapshotReferenceMalformed,
+    /// No published snapshot matches a requested full ID or prefix.
+    SnapshotReferenceNotFound,
+    /// Multiple published snapshots match a requested prefix.
+    SnapshotReferenceAmbiguous,
     /// An operation method conflicts with its current state.
     OperationStateConflict {
         /// The operation involved in the conflict.
@@ -184,6 +209,11 @@ impl SdkError {
             Self::StorageCapabilityUnsupported => ErrorCode::StorageCapabilityUnsupported,
             Self::RepositoryGenerationExhausted => ErrorCode::RepositoryGenerationExhausted,
             Self::StorageFailure { .. } => ErrorCode::StorageFailure,
+            Self::RepositoryNoSnapshots => ErrorCode::RepositoryNoSnapshots,
+            Self::SnapshotReferenceEmpty => ErrorCode::SnapshotReferenceEmpty,
+            Self::SnapshotReferenceMalformed => ErrorCode::SnapshotReferenceMalformed,
+            Self::SnapshotReferenceNotFound => ErrorCode::SnapshotReferenceNotFound,
+            Self::SnapshotReferenceAmbiguous => ErrorCode::SnapshotReferenceAmbiguous,
         }
     }
 
@@ -208,7 +238,12 @@ impl SdkError {
             | Self::RepositoryRequiredObjectMissing
             | Self::StorageCapabilityUnsupported
             | Self::RepositoryGenerationExhausted
-            | Self::StorageFailure { .. } => None,
+            | Self::StorageFailure { .. }
+            | Self::RepositoryNoSnapshots
+            | Self::SnapshotReferenceEmpty
+            | Self::SnapshotReferenceMalformed
+            | Self::SnapshotReferenceNotFound
+            | Self::SnapshotReferenceAmbiguous => None,
         }
     }
 
@@ -284,6 +319,21 @@ impl fmt::Display for SdkError {
             }
             Self::StorageFailure { operation } => {
                 write!(formatter, "repository storage {operation} operation failed")
+            }
+            Self::RepositoryNoSnapshots => {
+                formatter.write_str("repository contains no published snapshots")
+            }
+            Self::SnapshotReferenceEmpty => {
+                formatter.write_str("snapshot reference must not be empty")
+            }
+            Self::SnapshotReferenceMalformed => {
+                formatter.write_str("snapshot reference is malformed")
+            }
+            Self::SnapshotReferenceNotFound => {
+                formatter.write_str("no snapshot matches the requested reference")
+            }
+            Self::SnapshotReferenceAmbiguous => {
+                formatter.write_str("snapshot reference is ambiguous; provide a longer reference")
             }
         }
     }

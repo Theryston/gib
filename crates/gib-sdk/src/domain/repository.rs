@@ -63,6 +63,21 @@ pub enum DomainError {
         /// The stable reason for rejecting the snapshot reference.
         reason: &'static str,
     },
+    /// A snapshot identifier is not a valid immutable identifier.
+    InvalidSnapshotId {
+        /// The stable reason for rejecting the identifier.
+        reason: &'static str,
+    },
+    /// A snapshot selector is not a valid user-facing reference.
+    InvalidSnapshotSelector {
+        /// The stable reason for rejecting the selector.
+        reason: &'static str,
+    },
+    /// Snapshot metadata exceeds a domain limit or contains an invalid value.
+    InvalidSnapshotMetadata {
+        /// The stable reason for rejecting the metadata.
+        reason: &'static str,
+    },
     /// A repository HEAD contains an invalid generation or snapshot state.
     InvalidRepositoryHead {
         /// The stable reason for rejecting the HEAD state.
@@ -78,6 +93,9 @@ impl DomainError {
             | Self::InvalidRepositoryKey { reason }
             | Self::InvalidRepositoryObject { reason }
             | Self::InvalidSnapshotReference { reason }
+            | Self::InvalidSnapshotId { reason }
+            | Self::InvalidSnapshotSelector { reason }
+            | Self::InvalidSnapshotMetadata { reason }
             | Self::InvalidRepositoryHead { reason } => reason,
         }
     }
@@ -97,6 +115,15 @@ impl fmt::Display for DomainError {
             }
             Self::InvalidSnapshotReference { reason } => {
                 write!(formatter, "invalid snapshot reference: {reason}")
+            }
+            Self::InvalidSnapshotId { reason } => {
+                write!(formatter, "invalid snapshot ID: {reason}")
+            }
+            Self::InvalidSnapshotSelector { reason } => {
+                write!(formatter, "invalid snapshot selector: {reason}")
+            }
+            Self::InvalidSnapshotMetadata { reason } => {
+                write!(formatter, "invalid snapshot metadata: {reason}")
             }
             Self::InvalidRepositoryHead { reason } => {
                 write!(formatter, "invalid repository HEAD: {reason}")
@@ -377,6 +404,12 @@ impl fmt::Display for SnapshotReference {
     }
 }
 
+impl AsRef<str> for SnapshotReference {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 impl TryFrom<&str> for SnapshotReference {
     type Error = DomainError;
 
@@ -497,6 +530,7 @@ pub type Head = RepositoryHead;
 pub struct SnapshotPublication {
     snapshot: SnapshotReference,
     required_objects: Vec<RepositoryObject>,
+    summary: Option<crate::domain::SnapshotSummary>,
 }
 
 impl SnapshotPublication {
@@ -505,6 +539,7 @@ impl SnapshotPublication {
         Self {
             snapshot,
             required_objects: Vec::new(),
+            summary: None,
         }
     }
 
@@ -519,7 +554,35 @@ impl SnapshotPublication {
         Self {
             snapshot,
             required_objects: required_objects.into_iter().map(Into::into).collect(),
+            summary: None,
         }
+    }
+
+    /// Creates a publication target with a compact summary supplied by the
+    /// snapshot producer. The summary is written only as a derived history
+    /// record; the immutable snapshot object remains authoritative.
+    pub fn with_summary(
+        snapshot: SnapshotReference,
+        summary: crate::domain::SnapshotSummary,
+    ) -> Result<Self, DomainError> {
+        if summary.reference() != &snapshot {
+            return Err(DomainError::InvalidSnapshotMetadata {
+                reason: "publication summary must reference the published snapshot",
+            });
+        }
+        Ok(Self {
+            snapshot,
+            required_objects: Vec::new(),
+            summary: Some(summary),
+        })
+    }
+
+    /// Creates a publication target from an authoritative compact snapshot.
+    pub fn from_snapshot(snapshot: crate::domain::Snapshot) -> Result<Self, DomainError> {
+        let reference = snapshot.reference()?;
+        let summary =
+            crate::domain::SnapshotSummary::from_snapshot_at(&snapshot, reference.clone(), None);
+        Self::with_summary(reference, summary)
     }
 
     /// Alias for [`Self::with_required_objects`] using constructor wording.
@@ -554,9 +617,26 @@ impl SnapshotPublication {
         &self.required_objects
     }
 
+    /// Returns the optional compact summary supplied with this publication.
+    pub fn summary(&self) -> Option<&crate::domain::SnapshotSummary> {
+        self.summary.as_ref()
+    }
+
     /// Consumes the target and returns its parts.
     pub fn into_parts(self) -> (SnapshotReference, Vec<RepositoryObject>) {
         (self.snapshot, self.required_objects)
+    }
+
+    /// Consumes the target and returns its snapshot, required objects, and
+    /// optional summary.
+    pub fn into_parts_with_summary(
+        self,
+    ) -> (
+        SnapshotReference,
+        Vec<RepositoryObject>,
+        Option<crate::domain::SnapshotSummary>,
+    ) {
+        (self.snapshot, self.required_objects, self.summary)
     }
 }
 

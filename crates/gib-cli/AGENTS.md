@@ -35,6 +35,22 @@ The CLI must not:
 If required behavior is missing, add it to the public SDK first and then adapt
 it in the CLI.
 
+## Argument parsing
+
+Use `clap`, preferably its derive API, for all commands, subcommands, options,
+positional arguments, help, and version parsing. Do not hand-roll argument
+parsing or help text. Keep CLI syntax and argument relationships in Clap, map
+the parsed values to public SDK requests, and leave domain validation to the
+SDK.
+
+## Comments
+
+Never add comments to CLI source unless they are genuinely necessary to explain
+a non-obvious invariant, security or compatibility constraint, or behavior that
+cannot be expressed in code or Clap metadata. Use the smallest possible number
+of comments and the shortest wording; remove comments that merely restate the
+code. User-facing help belongs in Clap attributes, not comments.
+
 ## Required source structure
 
 ```text

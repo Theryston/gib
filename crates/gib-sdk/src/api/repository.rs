@@ -2,16 +2,31 @@ use super::error::{SdkError, SdkResult};
 use super::operation::CancellationToken;
 use crate::application::repository::{
     HeadRead as ApplicationHeadRead, RepositoryError, RepositoryOpenExpectations,
-    initialize_repository as initialize_use_case, open_repository as open_use_case,
+    initialize_repository as initialize_use_case,
+    list_snapshot_summaries as list_snapshot_summaries_use_case, open_repository as open_use_case,
     publish_head as publish_head_use_case, read_head as read_head_use_case,
+    read_snapshot_summary as read_snapshot_summary_use_case,
+    rebuild_snapshot_summaries as rebuild_snapshot_summaries_use_case,
+    resolve_snapshot_reference as resolve_snapshot_reference_use_case,
 };
 use crate::domain::DomainError;
+use crate::format::{FormatError, decode_snapshot, encode_snapshot};
 use std::fmt;
 use std::sync::Arc;
 
 pub use crate::application::ports::{
     RepositoryStorage, StorageError, StorageResult, StorageVersion, StorageVersionToken,
     VersionToken, VersionedObject, VersionedStorageObject,
+};
+pub use crate::domain::{
+    BackupReference, CURRENT_SNAPSHOT_HISTORY_VERSION, CURRENT_SNAPSHOT_SUMMARY_VERSION,
+    CURRENT_SNAPSHOT_VERSION, DEFAULT_SNAPSHOT_PAGE_SIZE, LATEST_SNAPSHOT_ALIAS,
+    MAX_SNAPSHOT_AUTHOR_LENGTH, MAX_SNAPSHOT_CURSOR_LENGTH, MAX_SNAPSHOT_ID_LENGTH,
+    MAX_SNAPSHOT_MESSAGE_LENGTH, MAX_SNAPSHOT_PAGE_SIZE, SNAPSHOT_HISTORY_OBJECT_PREFIX,
+    SNAPSHOT_OBJECT_PREFIX, Snapshot, SnapshotCursor, SnapshotHistoryPage, SnapshotHistoryRequest,
+    SnapshotId, SnapshotListRequest, SnapshotPage, SnapshotRef, SnapshotReferenceInput,
+    SnapshotReferenceSelector, SnapshotSelector, SnapshotSummary, SnapshotSummaryListRequest,
+    SnapshotSummaryPage,
 };
 pub use crate::domain::{
     CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
@@ -555,6 +570,70 @@ impl Repository {
     pub fn try_has_published_snapshot(&self) -> SdkResult<bool> {
         self.read_head().map(|head| head.has_snapshot())
     }
+
+    /// Lists compact snapshot summaries in deterministic newest-first order.
+    ///
+    /// The operation reads history records or compact authoritative snapshot
+    /// headers only. It never follows root-tree or path-delta references.
+    pub fn list_snapshot_summaries(
+        &self,
+        request: impl Into<SnapshotListRequest>,
+    ) -> SdkResult<SnapshotSummaryPage> {
+        let request = request.into();
+        list_snapshot_summaries_use_case(self.storage.as_storage(), &request)
+            .map_err(SdkError::from)
+    }
+
+    /// Alias for [`Self::list_snapshot_summaries`] using history terminology.
+    pub fn list_history(
+        &self,
+        request: impl Into<SnapshotListRequest>,
+    ) -> SdkResult<SnapshotHistoryPage> {
+        self.list_snapshot_summaries(request)
+    }
+
+    /// Alias for [`Self::list_snapshot_summaries`] using snapshot terminology.
+    pub fn list_snapshots(
+        &self,
+        request: impl Into<SnapshotListRequest>,
+    ) -> SdkResult<SnapshotPage> {
+        self.list_snapshot_summaries(request)
+    }
+
+    /// Rebuilds summaries directly from immutable snapshot objects.
+    ///
+    /// This is a read-only recovery path for a missing or incomplete derived
+    /// history index. The returned values are not written back automatically.
+    pub fn rebuild_snapshot_summaries(&self) -> SdkResult<Vec<SnapshotSummary>> {
+        rebuild_snapshot_summaries_use_case(self.storage.as_storage()).map_err(SdkError::from)
+    }
+
+    /// Resolves a full snapshot ID, a unique ID prefix, or `latest` to its
+    /// immutable repository object reference.
+    pub fn resolve_snapshot_reference(
+        &self,
+        reference: impl AsRef<str>,
+    ) -> SdkResult<SnapshotReference> {
+        resolve_snapshot_reference_use_case(self.storage.as_storage(), reference.as_ref())
+            .map_err(SdkError::from)
+    }
+
+    /// Alias for [`Self::resolve_snapshot_reference`].
+    pub fn resolve_snapshot(&self, reference: impl AsRef<str>) -> SdkResult<SnapshotReference> {
+        self.resolve_snapshot_reference(reference)
+    }
+
+    /// Resolves a full ID, unique prefix, or `latest` and returns its ID.
+    pub fn resolve_snapshot_id(&self, reference: impl AsRef<str>) -> SdkResult<SnapshotId> {
+        self.resolve_snapshot_reference(reference)
+            .and_then(|reference| reference.snapshot_id().map_err(SdkError::from))
+    }
+
+    /// Reads one compact summary after resolving its reference.
+    pub fn snapshot_summary(&self, reference: impl AsRef<str>) -> SdkResult<SnapshotSummary> {
+        read_snapshot_summary_use_case(self.storage.as_storage(), reference.as_ref())
+            .map_err(SdkError::from)
+    }
 }
 
 impl PartialEq for Repository {
@@ -609,6 +688,18 @@ impl From<DomainError> for SdkError {
                 field: "snapshot_reference",
                 reason,
             },
+            DomainError::InvalidSnapshotId { reason } => SdkError::InvalidRequest {
+                field: "snapshot_id",
+                reason,
+            },
+            DomainError::InvalidSnapshotSelector { reason } => SdkError::InvalidRequest {
+                field: "snapshot_reference",
+                reason,
+            },
+            DomainError::InvalidSnapshotMetadata { reason } => SdkError::InvalidRequest {
+                field: "snapshot_metadata",
+                reason,
+            },
             DomainError::InvalidRepositoryHead { reason } => SdkError::InvalidRequest {
                 field: "repository_head",
                 reason,
@@ -637,8 +728,80 @@ impl From<RepositoryError> for SdkError {
             RepositoryError::GenerationExhausted => Self::RepositoryGenerationExhausted,
             RepositoryError::UnsupportedCapability => Self::StorageCapabilityUnsupported,
             RepositoryError::Cancelled => Self::OperationCancelled { operation_id: None },
+            RepositoryError::NoSnapshots => Self::RepositoryNoSnapshots,
+            RepositoryError::SnapshotReferenceEmpty => Self::SnapshotReferenceEmpty,
+            RepositoryError::SnapshotReferenceMalformed => Self::SnapshotReferenceMalformed,
+            RepositoryError::SnapshotReferenceNotFound => Self::SnapshotReferenceNotFound,
+            RepositoryError::SnapshotReferenceAmbiguous => Self::SnapshotReferenceAmbiguous,
+            RepositoryError::SnapshotHistoryRequestInvalid => Self::InvalidRequest {
+                field: "snapshot_history",
+                reason: "history page size is outside the supported range",
+            },
+            RepositoryError::SnapshotHistoryCursorInvalid => Self::InvalidRequest {
+                field: "snapshot_history_cursor",
+                reason: "history cursor is not present in the current snapshot history",
+            },
             RepositoryError::Storage { operation } => Self::StorageFailure { operation },
         }
+    }
+}
+
+impl Snapshot {
+    /// Encodes this compact authoritative snapshot header as versioned binary
+    /// MessagePack suitable for an immutable snapshot object.
+    pub fn to_bytes(&self) -> SdkResult<Vec<u8>> {
+        encode_snapshot(self).map_err(map_snapshot_format_error)
+    }
+
+    /// Alias for [`Self::to_bytes`].
+    pub fn encode(&self) -> SdkResult<Vec<u8>> {
+        self.to_bytes()
+    }
+
+    /// Decodes and validates a compact authoritative snapshot header.
+    pub fn from_bytes(bytes: &[u8]) -> SdkResult<Self> {
+        decode_snapshot(bytes).map_err(map_snapshot_format_error)
+    }
+}
+
+/// Encodes one compact authoritative snapshot header.
+pub fn encode_snapshot_object(snapshot: &Snapshot) -> SdkResult<Vec<u8>> {
+    snapshot.to_bytes()
+}
+
+/// Decodes one compact authoritative snapshot header.
+pub fn decode_snapshot_object(bytes: &[u8]) -> SdkResult<Snapshot> {
+    Snapshot::from_bytes(bytes)
+}
+
+fn map_snapshot_format_error(error: FormatError) -> SdkError {
+    match error {
+        FormatError::UnsupportedVersion { version } => {
+            SdkError::RepositoryUnsupportedVersion { version }
+        }
+        FormatError::InvalidEncoding => SdkError::RepositoryMalformed {
+            reason: "snapshot object is not valid MessagePack",
+        },
+        FormatError::InputTooLarge => SdkError::RepositoryMalformed {
+            reason: "snapshot object exceeds the supported size limit",
+        },
+        FormatError::TrailingBytes => SdkError::RepositoryMalformed {
+            reason: "snapshot object contains trailing MessagePack bytes",
+        },
+        FormatError::InvalidMagic => SdkError::RepositoryMalformed {
+            reason: "snapshot object magic is invalid",
+        },
+        FormatError::InvalidChecksum => SdkError::RepositoryMalformed {
+            reason: "snapshot object integrity check failed",
+        },
+        FormatError::InvalidField
+        | FormatError::InvalidRootReference
+        | FormatError::MissingRequiredFeature
+        | FormatError::UnsupportedRequiredFeature
+        | FormatError::VersionMismatch
+        | FormatError::Serialization => SdkError::RepositoryMalformed {
+            reason: "snapshot object contains an invalid field",
+        },
     }
 }
 

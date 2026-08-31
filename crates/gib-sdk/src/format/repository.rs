@@ -1,9 +1,10 @@
 use crate::domain::{
     CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
-    CURRENT_REPOSITORY_FORMAT_VERSION, CURRENT_REPOSITORY_HEAD_VERSION, DomainError,
-    REPOSITORY_DESCRIPTOR_OBJECT_KEY, REPOSITORY_MAGIC, REQUIRED_REPOSITORY_FEATURE,
+    CURRENT_REPOSITORY_FORMAT_VERSION, CURRENT_REPOSITORY_HEAD_VERSION,
+    CURRENT_SNAPSHOT_HISTORY_VERSION, CURRENT_SNAPSHOT_SUMMARY_VERSION, CURRENT_SNAPSHOT_VERSION,
+    DomainError, REPOSITORY_DESCRIPTOR_OBJECT_KEY, REPOSITORY_MAGIC, REQUIRED_REPOSITORY_FEATURE,
     RepositoryDescriptor, RepositoryFeature, RepositoryHead, RepositoryIdentity, RepositoryKey,
-    RepositoryObject, RepositoryRoots, SnapshotReference,
+    RepositoryObject, RepositoryRoots, Snapshot, SnapshotId, SnapshotReference, SnapshotSummary,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -12,6 +13,8 @@ use std::io::Cursor;
 pub(crate) const MAX_BOOTSTRAP_BYTES: usize = 1_024;
 pub(crate) const MAX_DESCRIPTOR_BYTES: usize = 4_096;
 pub(crate) const MAX_HEAD_BYTES: usize = 1_024;
+pub(crate) const MAX_SNAPSHOT_BYTES: usize = 16 * 1_024;
+pub(crate) const MAX_HISTORY_RECORD_BYTES: usize = 16 * 1_024;
 
 const MAX_MESSAGEPACK_DEPTH: usize = 16;
 const MAX_MESSAGEPACK_COLLECTION_ITEMS: u32 = 32;
@@ -117,6 +120,124 @@ struct HeadWireOwned {
     generation: u64,
     snapshot: Option<String>,
     checksum: Vec<u8>,
+}
+
+#[derive(Serialize)]
+struct SnapshotUnsignedWire<'a> {
+    snapshot_version: u16,
+    magic: &'a str,
+    id: &'a str,
+    parent: Option<&'a str>,
+    created_at: u64,
+    message: &'a str,
+    author: Option<&'a str>,
+    root_tree: Option<&'a str>,
+    path_delta: Option<&'a str>,
+    file_count: u64,
+    directory_count: u64,
+    total_size: u64,
+}
+
+#[derive(Serialize)]
+struct SnapshotWire<'a> {
+    snapshot_version: u16,
+    magic: &'a str,
+    id: &'a str,
+    parent: Option<&'a str>,
+    created_at: u64,
+    message: &'a str,
+    author: Option<&'a str>,
+    root_tree: Option<&'a str>,
+    path_delta: Option<&'a str>,
+    file_count: u64,
+    directory_count: u64,
+    total_size: u64,
+    checksum: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotWireOwned {
+    snapshot_version: u16,
+    magic: String,
+    id: String,
+    parent: Option<String>,
+    created_at: u64,
+    message: String,
+    author: Option<String>,
+    root_tree: Option<String>,
+    path_delta: Option<String>,
+    file_count: u64,
+    directory_count: u64,
+    total_size: u64,
+    checksum: Vec<u8>,
+}
+
+#[derive(Serialize)]
+struct SummaryWire<'a> {
+    summary_version: u16,
+    id: &'a str,
+    reference: &'a str,
+    parent: Option<&'a str>,
+    message: &'a str,
+    author: Option<&'a str>,
+    timestamp: Option<u64>,
+    size: Option<u64>,
+    file_count: Option<u64>,
+    directory_count: Option<u64>,
+    total_size: Option<u64>,
+    root_tree: Option<&'a str>,
+    path_delta: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SummaryWireOwned {
+    summary_version: u16,
+    id: String,
+    reference: String,
+    parent: Option<String>,
+    message: String,
+    author: Option<String>,
+    timestamp: Option<u64>,
+    size: Option<u64>,
+    file_count: Option<u64>,
+    directory_count: Option<u64>,
+    total_size: Option<u64>,
+    root_tree: Option<String>,
+    path_delta: Option<String>,
+}
+
+#[derive(Serialize)]
+struct HistoryUnsignedWire<'a> {
+    history_version: u16,
+    magic: &'a str,
+    generation: u64,
+    summary: SummaryWire<'a>,
+}
+
+#[derive(Serialize)]
+struct HistoryWire<'a> {
+    history_version: u16,
+    magic: &'a str,
+    generation: u64,
+    summary: SummaryWire<'a>,
+    checksum: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryWireOwned {
+    history_version: u16,
+    magic: String,
+    generation: u64,
+    summary: SummaryWireOwned,
+    checksum: Vec<u8>,
+}
+
+pub(crate) struct HistoryRecord {
+    pub(crate) generation: u64,
+    pub(crate) summary: SnapshotSummary,
 }
 
 pub(crate) fn encode_bootstrap() -> Result<Vec<u8>, FormatError> {
@@ -271,6 +392,242 @@ pub(crate) fn decode_head(bytes: &[u8]) -> Result<RepositoryHead, FormatError> {
         .transpose()
         .map_err(map_domain_error)?;
     RepositoryHead::new(wire.generation, snapshot).map_err(map_domain_error)
+}
+
+pub(crate) fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>, FormatError> {
+    let parent = snapshot.parent().map(SnapshotId::as_str);
+    let author = snapshot.author();
+    let root_tree = snapshot.root_tree().map(RepositoryObject::as_str);
+    let path_delta = snapshot.path_delta().map(RepositoryObject::as_str);
+    let unsigned_wire = SnapshotUnsignedWire {
+        snapshot_version: CURRENT_SNAPSHOT_VERSION,
+        magic: REPOSITORY_MAGIC,
+        id: snapshot.id().as_str(),
+        parent,
+        created_at: snapshot.created_at(),
+        message: snapshot.message(),
+        author,
+        root_tree,
+        path_delta,
+        file_count: snapshot.file_count(),
+        directory_count: snapshot.directory_count(),
+        total_size: snapshot.total_size(),
+    };
+    let unsigned = encode_snapshot_unsigned(&unsigned_wire)?;
+    let checksum = Sha256::digest(&unsigned);
+    let bytes = rmp_serde::to_vec_named(&SnapshotWire {
+        snapshot_version: CURRENT_SNAPSHOT_VERSION,
+        magic: REPOSITORY_MAGIC,
+        id: snapshot.id().as_str(),
+        parent,
+        created_at: snapshot.created_at(),
+        message: snapshot.message(),
+        author,
+        root_tree,
+        path_delta,
+        file_count: snapshot.file_count(),
+        directory_count: snapshot.directory_count(),
+        total_size: snapshot.total_size(),
+        checksum: checksum.to_vec(),
+    })
+    .map_err(|_| FormatError::Serialization)?;
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return Err(FormatError::InputTooLarge);
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, FormatError> {
+    let wire: SnapshotWireOwned = decode_messagepack(bytes, MAX_SNAPSHOT_BYTES)?;
+    if wire.snapshot_version != CURRENT_SNAPSHOT_VERSION {
+        return Err(FormatError::UnsupportedVersion {
+            version: wire.snapshot_version,
+        });
+    }
+    if wire.magic != REPOSITORY_MAGIC {
+        return Err(FormatError::InvalidMagic);
+    }
+    if wire.checksum.len() != Sha256::output_size() {
+        return Err(FormatError::InvalidChecksum);
+    }
+    let unsigned_wire = SnapshotUnsignedWire {
+        snapshot_version: wire.snapshot_version,
+        magic: REPOSITORY_MAGIC,
+        id: &wire.id,
+        parent: wire.parent.as_deref(),
+        created_at: wire.created_at,
+        message: &wire.message,
+        author: wire.author.as_deref(),
+        root_tree: wire.root_tree.as_deref(),
+        path_delta: wire.path_delta.as_deref(),
+        file_count: wire.file_count,
+        directory_count: wire.directory_count,
+        total_size: wire.total_size,
+    };
+    let unsigned = encode_snapshot_unsigned(&unsigned_wire)?;
+    let checksum = Sha256::digest(&unsigned);
+    if wire.checksum.as_slice() != checksum.as_slice() {
+        return Err(FormatError::InvalidChecksum);
+    }
+
+    let id = SnapshotId::new(wire.id).map_err(map_domain_error)?;
+    let parent = wire
+        .parent
+        .map(SnapshotId::new)
+        .transpose()
+        .map_err(map_domain_error)?;
+    let mut snapshot =
+        Snapshot::new(id, wire.message, wire.created_at).map_err(map_domain_error)?;
+    if let Some(parent) = parent {
+        snapshot = snapshot.with_parent(Some(parent));
+    }
+    if let Some(author) = wire.author {
+        snapshot = snapshot.with_author(author).map_err(map_domain_error)?;
+    }
+    if let Some(root_tree) = wire.root_tree {
+        snapshot =
+            snapshot.with_root_tree(RepositoryObject::new(root_tree).map_err(map_domain_error)?);
+    }
+    if let Some(path_delta) = wire.path_delta {
+        snapshot =
+            snapshot.with_path_delta(RepositoryObject::new(path_delta).map_err(map_domain_error)?);
+    }
+    Ok(snapshot.with_statistics(wire.file_count, wire.directory_count, wire.total_size))
+}
+
+pub(crate) fn encode_history_record(
+    generation: u64,
+    summary: &SnapshotSummary,
+) -> Result<Vec<u8>, FormatError> {
+    if generation == 0 {
+        return Err(FormatError::InvalidField);
+    }
+    let unsigned = rmp_serde::to_vec_named(&HistoryUnsignedWire {
+        history_version: CURRENT_SNAPSHOT_HISTORY_VERSION,
+        magic: REPOSITORY_MAGIC,
+        generation,
+        summary: summary_wire(summary),
+    })
+    .map_err(|_| FormatError::Serialization)?;
+    let checksum = Sha256::digest(&unsigned);
+    let summary = summary_wire(summary);
+    let bytes = rmp_serde::to_vec_named(&HistoryWire {
+        history_version: CURRENT_SNAPSHOT_HISTORY_VERSION,
+        magic: REPOSITORY_MAGIC,
+        generation,
+        summary,
+        checksum: checksum.to_vec(),
+    })
+    .map_err(|_| FormatError::Serialization)?;
+    if bytes.len() > MAX_HISTORY_RECORD_BYTES {
+        return Err(FormatError::InputTooLarge);
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn decode_history_record(bytes: &[u8]) -> Result<HistoryRecord, FormatError> {
+    let wire: HistoryWireOwned = decode_messagepack(bytes, MAX_HISTORY_RECORD_BYTES)?;
+    if wire.history_version != CURRENT_SNAPSHOT_HISTORY_VERSION {
+        return Err(FormatError::UnsupportedVersion {
+            version: wire.history_version,
+        });
+    }
+    if wire.magic != REPOSITORY_MAGIC {
+        return Err(FormatError::InvalidMagic);
+    }
+    if wire.generation == 0 || wire.checksum.len() != Sha256::output_size() {
+        return Err(FormatError::InvalidChecksum);
+    }
+    let unsigned = rmp_serde::to_vec_named(&HistoryUnsignedWire {
+        history_version: wire.history_version,
+        magic: REPOSITORY_MAGIC,
+        generation: wire.generation,
+        summary: summary_wire_owned_as_borrowed(&wire.summary),
+    })
+    .map_err(|_| FormatError::Serialization)?;
+    let checksum = Sha256::digest(&unsigned);
+    if wire.checksum.as_slice() != checksum.as_slice() {
+        return Err(FormatError::InvalidChecksum);
+    }
+    let summary = summary_from_wire(wire.summary)?;
+    Ok(HistoryRecord {
+        generation: wire.generation,
+        summary: summary.with_publication_generation(wire.generation),
+    })
+}
+
+fn encode_snapshot_unsigned(wire: &SnapshotUnsignedWire<'_>) -> Result<Vec<u8>, FormatError> {
+    rmp_serde::to_vec_named(wire).map_err(|_| FormatError::Serialization)
+}
+
+fn summary_wire(summary: &SnapshotSummary) -> SummaryWire<'_> {
+    SummaryWire {
+        summary_version: CURRENT_SNAPSHOT_SUMMARY_VERSION,
+        id: summary.id().as_str(),
+        reference: summary.reference().as_str(),
+        parent: summary.parent().map(SnapshotId::as_str),
+        message: summary.message(),
+        author: summary.author(),
+        timestamp: summary.timestamp(),
+        size: summary.size(),
+        file_count: summary.file_count(),
+        directory_count: summary.directory_count(),
+        total_size: summary.total_size(),
+        root_tree: summary.root_tree().map(RepositoryObject::as_str),
+        path_delta: summary.path_delta().map(RepositoryObject::as_str),
+    }
+}
+
+fn summary_wire_owned_as_borrowed(wire: &SummaryWireOwned) -> SummaryWire<'_> {
+    SummaryWire {
+        summary_version: wire.summary_version,
+        id: wire.id.as_str(),
+        reference: wire.reference.as_str(),
+        parent: wire.parent.as_deref(),
+        message: wire.message.as_str(),
+        author: wire.author.as_deref(),
+        timestamp: wire.timestamp,
+        size: wire.size,
+        file_count: wire.file_count,
+        directory_count: wire.directory_count,
+        total_size: wire.total_size,
+        root_tree: wire.root_tree.as_deref(),
+        path_delta: wire.path_delta.as_deref(),
+    }
+}
+
+fn summary_from_wire(wire: SummaryWireOwned) -> Result<SnapshotSummary, FormatError> {
+    if wire.summary_version != CURRENT_SNAPSHOT_SUMMARY_VERSION {
+        return Err(FormatError::UnsupportedVersion {
+            version: wire.summary_version,
+        });
+    }
+    let reference = SnapshotReference::new(wire.reference).map_err(map_domain_error)?;
+    let reference_id = SnapshotId::from_reference(&reference).map_err(map_domain_error)?;
+    if SnapshotId::new(wire.id.clone()).map_err(map_domain_error)? != reference_id {
+        return Err(FormatError::InvalidField);
+    }
+    let parent = wire
+        .parent
+        .map(SnapshotId::new)
+        .transpose()
+        .map_err(map_domain_error)?;
+    let mut summary = SnapshotSummary::new(reference, wire.message, wire.timestamp, wire.size)
+        .map_err(map_domain_error)?
+        .with_parent(parent)
+        .with_statistics(wire.file_count, wire.directory_count, wire.total_size);
+    if let Some(author) = wire.author {
+        summary = summary.with_author(author).map_err(map_domain_error)?;
+    }
+    if let Some(root_tree) = wire.root_tree {
+        summary =
+            summary.with_root_tree(RepositoryObject::new(root_tree).map_err(map_domain_error)?);
+    }
+    if let Some(path_delta) = wire.path_delta {
+        summary =
+            summary.with_path_delta(RepositoryObject::new(path_delta).map_err(map_domain_error)?);
+    }
+    Ok(summary)
 }
 
 fn encode_head_unsigned(generation: u64, snapshot: Option<&str>) -> Result<Vec<u8>, FormatError> {
@@ -487,6 +844,9 @@ fn map_domain_error(error: DomainError) -> FormatError {
         | DomainError::InvalidRepositoryKey { .. }
         | DomainError::InvalidRepositoryObject { .. }
         | DomainError::InvalidSnapshotReference { .. }
+        | DomainError::InvalidSnapshotId { .. }
+        | DomainError::InvalidSnapshotSelector { .. }
+        | DomainError::InvalidSnapshotMetadata { .. }
         | DomainError::InvalidRepositoryHead { .. } => FormatError::InvalidField,
     }
 }

@@ -5,3 +5,6 @@ members = [
     "crates/gib-cli",
     "crates/gib-examples",
 ]
+
+[workspace.package]
+description = "⚡ Back up your files. Keep them in sync. Travel through their history."

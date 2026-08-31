@@ -28,20 +28,28 @@ mod format;
 mod infrastructure;
 
 pub use api::{
-    CancellationHandle, CancellationInfo, CancellationToken, Client, ClientBuilder,
-    DEFAULT_EVENT_BUFFER_CAPACITY, EVENT_SCHEMA_VERSION, ErrorCode, ErrorSummary, EventConsumer,
-    EventDelivery, EventDispatcher, EventEnvelope, EventKind, EventMessage, EventPayload,
-    EventPhase, EventSubscription, Head, HeadPublication, HeadRead, HeadState,
-    InitializeRepositoryRequest, LocalStorage, MemoryStorage, OpenRepositoryRequest,
+    BackupReference, CURRENT_SNAPSHOT_HISTORY_VERSION, CURRENT_SNAPSHOT_SUMMARY_VERSION,
+    CURRENT_SNAPSHOT_VERSION, CancellationHandle, CancellationInfo, CancellationToken, Client,
+    ClientBuilder, DEFAULT_EVENT_BUFFER_CAPACITY, DEFAULT_SNAPSHOT_PAGE_SIZE, EVENT_SCHEMA_VERSION,
+    ErrorCode, ErrorSummary, EventConsumer, EventDelivery, EventDispatcher, EventEnvelope,
+    EventKind, EventMessage, EventPayload, EventPhase, EventSubscription, Head, HeadPublication,
+    HeadRead, HeadState, InitializeRepositoryRequest, LATEST_SNAPSHOT_ALIAS, LocalStorage,
+    MAX_SNAPSHOT_AUTHOR_LENGTH, MAX_SNAPSHOT_CURSOR_LENGTH, MAX_SNAPSHOT_ID_LENGTH,
+    MAX_SNAPSHOT_MESSAGE_LENGTH, MAX_SNAPSHOT_PAGE_SIZE, MemoryStorage, OpenRepositoryRequest,
     OperationHandle, OperationId, OperationKind, OperationRequest, OperationResult,
     OperationStatus, Progress, REPOSITORY_BOOTSTRAP_VERSION, REPOSITORY_DESCRIPTOR_VERSION,
     REPOSITORY_FORMAT_VERSION, RecoveryPoint, Repository, RepositoryDescriptor, RepositoryFeature,
     RepositoryHead, RepositoryHeadRead, RepositoryHeadState, RepositoryId, RepositoryIdentity,
     RepositoryInitRequest, RepositoryInitializationRequest, RepositoryKey, RepositoryObject,
-    RepositoryOpenRequest, RepositoryRoots, RepositoryStorage, Request, Result, SdkError,
-    SdkResult, SnapshotPublication, SnapshotPublicationRequest, SnapshotReference, StorageError,
-    StorageHandle, StorageResult, StorageVersion, StorageVersionToken, VersionToken, VersionedHead,
-    VersionedObject, VersionedStorageObject, initialize_repository, open_repository,
+    RepositoryOpenRequest, RepositoryRoots, RepositoryStorage, Request, Result,
+    SNAPSHOT_HISTORY_OBJECT_PREFIX, SNAPSHOT_OBJECT_PREFIX, SdkError, SdkResult, Snapshot,
+    SnapshotCursor, SnapshotHistoryPage, SnapshotHistoryRequest, SnapshotId, SnapshotListRequest,
+    SnapshotPage, SnapshotPublication, SnapshotPublicationRequest, SnapshotRef, SnapshotReference,
+    SnapshotReferenceInput, SnapshotReferenceSelector, SnapshotSelector, SnapshotSummary,
+    SnapshotSummaryListRequest, SnapshotSummaryPage, StorageError, StorageHandle, StorageResult,
+    StorageVersion, StorageVersionToken, VersionToken, VersionedHead, VersionedObject,
+    VersionedStorageObject, decode_snapshot_object, encode_snapshot_object, initialize_repository,
+    open_repository,
 };
 
 pub use api::{
