@@ -91,9 +91,14 @@ fn external_consumer_uses_only_the_public_sdk_surface() -> Result<(), Box<dyn Er
 fn s3_backend_is_exposed_through_provider_neutral_sdk_types() -> Result<(), Box<dyn Error>> {
     let config =
         gib::S3StorageConfig::new("us-east-1", "gib-public-api", "access-key", "secret-key")?
-            .with_endpoint("http://127.0.0.1:9000");
+            .with_endpoint("http://127.0.0.1:9000")
+            .without_capability_cache();
     let storage = gib::S3Storage::new(config)?;
     let handle: gib::StorageHandle = (&storage).into();
+    assert_eq!(
+        storage.conditional_write_capabilities().create_if_absent(),
+        gib::S3ConditionalWriteStatus::Inconclusive
+    );
     assert!(
         handle
             .as_storage()

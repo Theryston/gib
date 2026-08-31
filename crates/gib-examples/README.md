@@ -64,11 +64,18 @@ export GIB_S3_BUCKET=gib-qa
 export GIB_S3_ACCESS_KEY=minioadmin
 export GIB_S3_SECRET_KEY=minioadmin
 export GIB_S3_ENDPOINT=http://127.0.0.1:9000
+export GIB_S3_CAPABILITY_CACHE_PATH=/tmp/gib-s3-capabilities.msgpack
 cargo run -p gib-examples --features s3 --example s3_storage_qa -- all
 ```
 
-The commands `smoke`, `multipart`, `paginate`, and `cancel` run each check
-individually. `GIB_S3_SESSION_TOKEN`, `GIB_S3_MULTIPART_THRESHOLD`,
+The commands `capabilities`, `reprobe`, `atomic`, `smoke`, `multipart`,
+`paginate`, and `cancel` run checks individually. `capabilities` probes both
+conditional-write forms on a cache miss and reports when a persisted result was
+loaded. Run it again as a new process to verify the cache hit. `reprobe`
+invalidates the configured endpoint/bucket entry and probes again. `atomic`
+attempts a conditional publication and reports a safe refusal when the
+endpoint does not support it. `GIB_S3_SESSION_TOKEN`,
+`GIB_S3_CAPABILITY_CACHE_PATH`, `GIB_S3_MULTIPART_THRESHOLD`,
 `GIB_S3_MULTIPART_PART_SIZE`, and `GIB_S3_MAX_CONCURRENCY` are optional. The
 cancel command verifies that no usable object remains; use the provider CLI to
 inspect multipart uploads and confirm that the abort request removed any
@@ -86,3 +93,9 @@ namespace. Set `GIB_S3_TEST_REGION`, `GIB_S3_TEST_BUCKET`,
 ```text
 cargo test -p gib-sdk --features s3 --test storage_contract --no-fail-fast
 ```
+
+For the capability-detection manual QA, run `capabilities` twice as separate
+processes, remove or corrupt `GIB_S3_CAPABILITY_CACHE_PATH`, run
+`capabilities` again, and then run `atomic` against an endpoint known not to
+support native preconditions. A refusal must report
+`conditional writes are unsupported`; it must not publish the object.

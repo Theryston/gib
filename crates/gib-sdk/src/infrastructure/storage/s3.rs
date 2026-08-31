@@ -9,14 +9,19 @@ use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
+use std::fs::{self, File, OpenOptions};
 use std::future::Future;
-use std::io::{self, Read};
+use std::io::{self, Cursor, Read, Write};
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Builder as RuntimeBuilder, Handle};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Semaphore, mpsc::Sender as TokioSender};
@@ -47,6 +52,119 @@ pub const MAX_S3_MULTIPART_UPLOAD_PARTS: u32 = 10_000;
 /// The default number of concurrent multipart part requests.
 pub const DEFAULT_S3_MAX_CONCURRENCY: usize = 4;
 
+/// The name used by the default S3 conditional-write capability cache.
+pub const DEFAULT_S3_CAPABILITY_CACHE_FILE_NAME: &str = "s3-capabilities.msgpack";
+
+/// The number of seconds for which a positive or negative capability result is
+/// trusted before the endpoint is probed again.
+pub const DEFAULT_S3_CAPABILITY_CACHE_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+/// The result of one S3 conditional-write capability probe.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum S3ConditionalWriteStatus {
+    /// The provider enforced the requested native precondition.
+    Supported,
+    /// The provider explicitly rejected or ignored the requested precondition.
+    Unsupported,
+    /// The probe could not establish a result, commonly because of access or
+    /// transient network failure.
+    Inconclusive,
+}
+
+impl fmt::Display for S3ConditionalWriteStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+            Self::Inconclusive => "inconclusive",
+        };
+        formatter.write_str(value)
+    }
+}
+
+/// Independently detected native conditional-write capabilities for one S3
+/// endpoint and bucket.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct S3ConditionalWriteCapabilities {
+    create_if_absent: S3ConditionalWriteStatus,
+    replace_if_version: S3ConditionalWriteStatus,
+}
+
+impl S3ConditionalWriteCapabilities {
+    /// Returns the status of native create-if-absent writes.
+    pub const fn create_if_absent(self) -> S3ConditionalWriteStatus {
+        self.create_if_absent
+    }
+
+    /// Returns the status of native replace-if-version writes.
+    pub const fn replace_if_version(self) -> S3ConditionalWriteStatus {
+        self.replace_if_version
+    }
+
+    /// Returns whether native create-if-absent writes are available.
+    pub const fn supports_create_if_absent(self) -> bool {
+        matches!(self.create_if_absent, S3ConditionalWriteStatus::Supported)
+    }
+
+    /// Returns whether native replace-if-version writes are available.
+    pub const fn supports_replace_if_version(self) -> bool {
+        matches!(self.replace_if_version, S3ConditionalWriteStatus::Supported)
+    }
+
+    /// Returns whether both native conditional-write forms are available.
+    pub const fn supports_conditional_writes(self) -> bool {
+        self.supports_create_if_absent() && self.supports_replace_if_version()
+    }
+
+    const fn inconclusive() -> Self {
+        Self {
+            create_if_absent: S3ConditionalWriteStatus::Inconclusive,
+            replace_if_version: S3ConditionalWriteStatus::Inconclusive,
+        }
+    }
+
+    const fn is_complete(self) -> bool {
+        !matches!(
+            self.create_if_absent,
+            S3ConditionalWriteStatus::Inconclusive
+        ) && !matches!(
+            self.replace_if_version,
+            S3ConditionalWriteStatus::Inconclusive
+        )
+    }
+
+    const fn has_definitive_result(self) -> bool {
+        !matches!(
+            self.create_if_absent,
+            S3ConditionalWriteStatus::Inconclusive
+        ) || !matches!(
+            self.replace_if_version,
+            S3ConditionalWriteStatus::Inconclusive
+        )
+    }
+
+    const fn with_create_if_absent(self, status: S3ConditionalWriteStatus) -> Self {
+        Self {
+            create_if_absent: status,
+            ..self
+        }
+    }
+
+    const fn with_replace_if_version(self, status: S3ConditionalWriteStatus) -> Self {
+        Self {
+            replace_if_version: status,
+            ..self
+        }
+    }
+}
+
+impl Default for S3ConditionalWriteCapabilities {
+    fn default() -> Self {
+        Self::inconclusive()
+    }
+}
+
 const MAX_S3_MAX_CONCURRENCY: usize = 64;
 const STREAM_CHANNEL_CAPACITY: usize = 2;
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -54,6 +172,15 @@ const MAX_REGION_LENGTH: usize = 128;
 const MAX_BUCKET_LENGTH: usize = 63;
 const MAX_CREDENTIAL_LENGTH: usize = 4096;
 const MAX_ENDPOINT_LENGTH: usize = 2048;
+const S3_CAPABILITY_CACHE_SCHEMA_VERSION: u16 = 1;
+const MAX_S3_CAPABILITY_CACHE_BYTES: u64 = 1024 * 1024;
+const MAX_S3_CAPABILITY_CACHE_ENTRIES: usize = 1_024;
+const S3_CAPABILITY_PROBE_PREFIX: &str = "gib-capability-probe";
+
+static NEXT_S3_CAPABILITY_PROBE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_S3_CAPABILITY_CACHE_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+static S3_CAPABILITY_CACHE_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> =
+    OnceLock::new();
 
 /// Validated, provider-neutral configuration for [`S3Storage`].
 ///
@@ -74,11 +201,17 @@ pub struct S3StorageConfig {
     multipart_threshold: u64,
     multipart_part_size: u64,
     max_concurrency: usize,
+    capability_cache_path: Option<PathBuf>,
 }
 
 impl S3StorageConfig {
     /// Creates a configuration using explicit long-lived or temporary
     /// credentials and the standard AWS S3 endpoint.
+    ///
+    /// When the host exposes a platform cache directory, conditional-write
+    /// results are persisted there by default. Use [`Self::with_capability_cache_path`]
+    /// to select an explicit file or [`Self::without_capability_cache`] for an
+    /// ephemeral adapter.
     ///
     /// The input is validated before it is returned. Builder methods may
     /// change optional values; [`S3Storage::new`] validates the complete
@@ -101,6 +234,7 @@ impl S3StorageConfig {
             multipart_threshold: DEFAULT_S3_MULTIPART_THRESHOLD,
             multipart_part_size: DEFAULT_S3_MULTIPART_PART_SIZE,
             max_concurrency: DEFAULT_S3_MAX_CONCURRENCY,
+            capability_cache_path: default_s3_capability_cache_path(),
         };
         config.validate()?;
         Ok(config)
@@ -150,6 +284,22 @@ impl S3StorageConfig {
         self
     }
 
+    /// Stores capability results in the supplied local cache file.
+    ///
+    /// The file contains only the endpoint, region, bucket, capability
+    /// statuses, and cache timestamps. Credentials are never persisted.
+    pub fn with_capability_cache_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.capability_cache_path = Some(path.into());
+        self
+    }
+
+    /// Disables persistence of capability results while retaining in-process
+    /// caching. This is useful for ephemeral applications and tests.
+    pub fn without_capability_cache(mut self) -> Self {
+        self.capability_cache_path = None;
+        self
+    }
+
     /// Returns the configured AWS region.
     pub fn region(&self) -> &str {
         &self.region
@@ -181,6 +331,11 @@ impl S3StorageConfig {
         self.max_concurrency
     }
 
+    /// Returns the configured capability-cache file, if persistence is enabled.
+    pub fn capability_cache_path(&self) -> Option<&Path> {
+        self.capability_cache_path.as_deref()
+    }
+
     fn validate(&self) -> StorageResult<()> {
         validate_text(&self.region, MAX_REGION_LENGTH, true)?;
         validate_bucket(&self.bucket)?;
@@ -203,6 +358,13 @@ impl S3StorageConfig {
         if !(1..=MAX_S3_MAX_CONCURRENCY).contains(&self.max_concurrency) {
             return Err(StorageError::InvalidRequest);
         }
+        if self
+            .capability_cache_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty() || path.file_name().is_none())
+        {
+            return Err(StorageError::InvalidRequest);
+        }
         Ok(())
     }
 }
@@ -222,7 +384,457 @@ impl fmt::Debug for S3StorageConfig {
             .field("multipart_threshold", &self.multipart_threshold)
             .field("multipart_part_size", &self.multipart_part_size)
             .field("max_concurrency", &self.max_concurrency)
+            .field(
+                "capability_cache_path",
+                &self.capability_cache_path.as_ref().map(|_| "<configured>"),
+            )
             .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct S3CapabilityCacheKey {
+    endpoint: Option<String>,
+    region: String,
+    bucket: String,
+}
+
+impl S3CapabilityCacheKey {
+    fn from_config(config: &S3StorageConfig) -> Self {
+        Self {
+            endpoint: config.endpoint.clone(),
+            region: config.region.clone(),
+            bucket: config.bucket.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct S3CapabilityCacheFile {
+    version: u16,
+    entries: Vec<S3CapabilityCacheEntry>,
+}
+
+impl S3CapabilityCacheFile {
+    fn empty() -> Self {
+        Self {
+            version: S3_CAPABILITY_CACHE_SCHEMA_VERSION,
+            entries: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct S3CapabilityCacheEntry {
+    endpoint: Option<String>,
+    region: String,
+    bucket: String,
+    observed_at_unix_seconds: u64,
+    create_if_absent: Option<bool>,
+    replace_if_version: Option<bool>,
+}
+
+impl S3CapabilityCacheEntry {
+    fn for_capabilities(
+        key: &S3CapabilityCacheKey,
+        capabilities: S3ConditionalWriteCapabilities,
+    ) -> Self {
+        Self {
+            endpoint: key.endpoint.clone(),
+            region: key.region.clone(),
+            bucket: key.bucket.clone(),
+            observed_at_unix_seconds: current_unix_seconds(),
+            create_if_absent: status_as_cache_value(capabilities.create_if_absent()),
+            replace_if_version: status_as_cache_value(capabilities.replace_if_version()),
+        }
+    }
+
+    fn matches(&self, key: &S3CapabilityCacheKey) -> bool {
+        self.endpoint.as_deref() == key.endpoint.as_deref()
+            && self.region == key.region
+            && self.bucket == key.bucket
+    }
+
+    fn capabilities_if_fresh(
+        &self,
+        key: &S3CapabilityCacheKey,
+        now: u64,
+    ) -> Option<S3ConditionalWriteCapabilities> {
+        if !self.matches(key)
+            || now < self.observed_at_unix_seconds
+            || now - self.observed_at_unix_seconds > DEFAULT_S3_CAPABILITY_CACHE_TTL_SECONDS
+        {
+            return None;
+        }
+        Some(S3ConditionalWriteCapabilities {
+            create_if_absent: cache_value_as_status(self.create_if_absent),
+            replace_if_version: cache_value_as_status(self.replace_if_version),
+        })
+    }
+}
+
+struct S3CapabilityState {
+    key: S3CapabilityCacheKey,
+    cache_path: Option<PathBuf>,
+    capabilities: Mutex<S3ConditionalWriteCapabilities>,
+    probe_lock: Mutex<()>,
+}
+
+impl S3CapabilityState {
+    fn new(config: &S3StorageConfig) -> Self {
+        let key = S3CapabilityCacheKey::from_config(config);
+        let capabilities = config
+            .capability_cache_path
+            .as_deref()
+            .and_then(|path| load_cached_capabilities(path, &key))
+            .unwrap_or_default();
+        Self {
+            key,
+            cache_path: config.capability_cache_path.clone(),
+            capabilities: Mutex::new(capabilities),
+            probe_lock: Mutex::new(()),
+        }
+    }
+
+    fn snapshot(&self) -> S3ConditionalWriteCapabilities {
+        self.capabilities
+            .lock()
+            .map(|capabilities| *capabilities)
+            .unwrap_or_default()
+    }
+
+    fn set(&self, capabilities: S3ConditionalWriteCapabilities) -> StorageResult<()> {
+        let mut current = self
+            .capabilities
+            .lock()
+            .map_err(|_| StorageError::Unavailable)?;
+        *current = capabilities;
+        Ok(())
+    }
+
+    fn cache_result(&self, capabilities: S3ConditionalWriteCapabilities) {
+        if !capabilities.has_definitive_result() {
+            return;
+        }
+        let Some(path) = self.cache_path.as_deref() else {
+            return;
+        };
+        let _ = persist_cached_capabilities(path, &self.key, capabilities);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeOutcome {
+    Supported,
+    Unsupported,
+    Inconclusive(StorageError),
+}
+
+fn status_as_cache_value(status: S3ConditionalWriteStatus) -> Option<bool> {
+    match status {
+        S3ConditionalWriteStatus::Supported => Some(true),
+        S3ConditionalWriteStatus::Unsupported => Some(false),
+        S3ConditionalWriteStatus::Inconclusive => None,
+    }
+}
+
+fn cache_value_as_status(value: Option<bool>) -> S3ConditionalWriteStatus {
+    match value {
+        Some(true) => S3ConditionalWriteStatus::Supported,
+        Some(false) => S3ConditionalWriteStatus::Unsupported,
+        None => S3ConditionalWriteStatus::Inconclusive,
+    }
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn load_cached_capabilities(
+    path: &Path,
+    key: &S3CapabilityCacheKey,
+) -> Option<S3ConditionalWriteCapabilities> {
+    let metadata = fs::metadata(path).ok()?;
+    if metadata.len() == 0 || metadata.len() > MAX_S3_CAPABILITY_CACHE_BYTES {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let cache = decode_capability_cache(&bytes)?;
+    if cache.version != S3_CAPABILITY_CACHE_SCHEMA_VERSION
+        || cache.entries.len() > MAX_S3_CAPABILITY_CACHE_ENTRIES
+    {
+        return None;
+    }
+    let now = current_unix_seconds();
+    cache
+        .entries
+        .iter()
+        .find_map(|entry| entry.capabilities_if_fresh(key, now))
+}
+
+fn read_capability_cache(path: &Path) -> S3CapabilityCacheFile {
+    let Ok(metadata) = fs::metadata(path) else {
+        return S3CapabilityCacheFile::empty();
+    };
+    if metadata.len() == 0 || metadata.len() > MAX_S3_CAPABILITY_CACHE_BYTES {
+        return S3CapabilityCacheFile::empty();
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return S3CapabilityCacheFile::empty();
+    };
+    match decode_capability_cache(&bytes) {
+        Some(cache)
+            if cache.version == S3_CAPABILITY_CACHE_SCHEMA_VERSION
+                && cache.entries.len() <= MAX_S3_CAPABILITY_CACHE_ENTRIES =>
+        {
+            cache
+        }
+        _ => S3CapabilityCacheFile::empty(),
+    }
+}
+
+fn decode_capability_cache(bytes: &[u8]) -> Option<S3CapabilityCacheFile> {
+    let mut decoder = rmp_serde::Deserializer::new(Cursor::new(bytes));
+    let cache = S3CapabilityCacheFile::deserialize(&mut decoder).ok()?;
+    if decoder.position() != bytes.len() as u64 {
+        return None;
+    }
+    Some(cache)
+}
+
+fn cache_lock(path: &Path) -> StorageResult<Arc<Mutex<()>>> {
+    let locks = S3_CAPABILITY_CACHE_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut locks = locks.lock().map_err(|_| StorageError::Unavailable)?;
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_owned(), Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+fn with_capability_cache_lock<T>(
+    path: &Path,
+    operation: impl FnOnce() -> StorageResult<T>,
+) -> StorageResult<T> {
+    let process_lock = cache_lock(path)?;
+    let _process_guard = process_lock.lock().map_err(|_| StorageError::Unavailable)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| StorageError::from_io_error(&error))?;
+    let file_name = path
+        .file_name()
+        .ok_or(StorageError::InvalidRequest)?
+        .to_string_lossy();
+    let lock_path = parent.join(format!(".{file_name}.lock"));
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|error| StorageError::from_io_error(&error))?;
+    lock_file
+        .lock()
+        .map_err(|error| StorageError::from_io_error(&error))?;
+    operation()
+}
+
+fn persist_cached_capabilities(
+    path: &Path,
+    key: &S3CapabilityCacheKey,
+    capabilities: S3ConditionalWriteCapabilities,
+) -> StorageResult<()> {
+    with_capability_cache_lock(path, || {
+        let mut cache = read_capability_cache(path);
+        cache.entries.retain(|entry| !entry.matches(key));
+        if cache.entries.len() >= MAX_S3_CAPABILITY_CACHE_ENTRIES {
+            cache
+                .entries
+                .sort_unstable_by_key(|entry| entry.observed_at_unix_seconds);
+            let remove_count = cache.entries.len() - MAX_S3_CAPABILITY_CACHE_ENTRIES + 1;
+            cache.entries.drain(..remove_count);
+        }
+        cache
+            .entries
+            .push(S3CapabilityCacheEntry::for_capabilities(key, capabilities));
+        write_capability_cache(path, &cache)
+    })
+}
+
+fn invalidate_cached_capabilities(path: &Path, key: &S3CapabilityCacheKey) -> StorageResult<()> {
+    with_capability_cache_lock(path, || {
+        match fs::metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(StorageError::from_io_error(&error)),
+        }
+        let mut cache = read_capability_cache(path);
+        cache.entries.retain(|entry| !entry.matches(key));
+        write_capability_cache(path, &cache)
+    })
+}
+
+fn write_capability_cache(path: &Path, cache: &S3CapabilityCacheFile) -> StorageResult<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| StorageError::from_io_error(&error))?;
+    let contents = rmp_serde::to_vec_named(cache).map_err(|_| StorageError::Io)?;
+    let (temporary_path, mut file) = create_cache_temp_file(path)?;
+    if let Err(error) = file
+        .write_all(&contents)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(&temporary_path);
+        return Err(StorageError::from_io_error(&error));
+    }
+    drop(file);
+    if let Err(error) = replace_cache_file(&temporary_path, path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(StorageError::from_io_error(&error));
+    }
+    sync_cache_parent(parent)
+}
+
+fn create_cache_temp_file(path: &Path) -> StorageResult<(PathBuf, File)> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or(StorageError::InvalidRequest)?
+        .to_string_lossy();
+    for _ in 0..8 {
+        let id = NEXT_S3_CAPABILITY_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temporary_path = parent.join(format!(".{file_name}.tmp-{}-{id}", std::process::id()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.mode(0o600);
+        }
+        match options.open(&temporary_path) {
+            Ok(file) => return Ok((temporary_path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(StorageError::from_io_error(&error)),
+        }
+    }
+    Err(StorageError::Unavailable)
+}
+
+#[cfg(not(windows))]
+fn replace_cache_file(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn replace_cache_file(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let from = from
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let to = to
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both vectors are NUL-terminated UTF-16 paths that remain alive
+    // for this synchronous call. MoveFileExW does not retain either pointer.
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+
+#[cfg(windows)]
+const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
+}
+
+fn sync_cache_parent(parent: &Path) -> StorageResult<()> {
+    #[cfg(unix)]
+    {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| StorageError::from_io_error(&error))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
+    Ok(())
+}
+
+fn default_s3_capability_cache_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))?;
+        Some(
+            PathBuf::from(base)
+                .join("gib")
+                .join(DEFAULT_S3_CAPABILITY_CACHE_FILE_NAME),
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let base = std::env::var_os("HOME").filter(|value| !value.is_empty())?;
+        Some(
+            PathBuf::from(base)
+                .join("Library")
+                .join("Caches")
+                .join("gib")
+                .join(DEFAULT_S3_CAPABILITY_CACHE_FILE_NAME),
+        )
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let base = match std::env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
+            Some(base) => PathBuf::from(base),
+            None => PathBuf::from(
+                std::env::var_os("HOME")
+                    .filter(|value| !value.is_empty())?
+                    .as_os_str(),
+            )
+            .join(".cache"),
+        };
+        Some(base.join("gib").join(DEFAULT_S3_CAPABILITY_CACHE_FILE_NAME))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
     }
 }
 
@@ -237,12 +849,14 @@ impl fmt::Debug for S3StorageConfig {
 pub struct S3Storage {
     config: Arc<S3StorageConfig>,
     runtime: Arc<S3Runtime>,
+    capability_state: Arc<S3CapabilityState>,
 }
 
 impl S3Storage {
     /// Constructs an S3 adapter from a fully validated configuration.
     pub fn new(config: S3StorageConfig) -> StorageResult<Self> {
         config.validate()?;
+        let capability_state = Arc::new(S3CapabilityState::new(&config));
         let credentials = Credentials::new(
             config.access_key.clone(),
             config.secret_key.clone(),
@@ -263,12 +877,224 @@ impl S3Storage {
         Ok(Self {
             config: Arc::new(config),
             runtime,
+            capability_state,
         })
     }
 
     /// Returns a redacted view of the adapter configuration.
     pub fn config(&self) -> &S3StorageConfig {
         &self.config
+    }
+
+    /// Returns the cached conditional-write status without contacting the
+    /// provider.
+    pub fn conditional_write_capabilities(&self) -> S3ConditionalWriteCapabilities {
+        self.capability_state.snapshot()
+    }
+
+    /// Probes and caches create-if-absent and replace-if-version independently.
+    ///
+    /// A provider or network failure leaves the affected status inconclusive
+    /// and is returned as a typed storage error. Definitive results from the
+    /// other probe are retained and persisted when possible.
+    pub fn probe_conditional_write_capabilities(
+        &self,
+    ) -> StorageResult<S3ConditionalWriteCapabilities> {
+        let _probe_guard = self
+            .capability_state
+            .probe_lock
+            .lock()
+            .map_err(|_| StorageError::Unavailable)?;
+        let mut capabilities = self.capability_state.snapshot();
+        if capabilities.is_complete() {
+            return Ok(capabilities);
+        }
+
+        let mut first_error = None;
+        if matches!(
+            capabilities.create_if_absent(),
+            S3ConditionalWriteStatus::Inconclusive
+        ) {
+            match self.probe_create_if_absent() {
+                ProbeOutcome::Supported => {
+                    capabilities =
+                        capabilities.with_create_if_absent(S3ConditionalWriteStatus::Supported);
+                }
+                ProbeOutcome::Unsupported => {
+                    capabilities =
+                        capabilities.with_create_if_absent(S3ConditionalWriteStatus::Unsupported);
+                }
+                ProbeOutcome::Inconclusive(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if matches!(
+            capabilities.replace_if_version(),
+            S3ConditionalWriteStatus::Inconclusive
+        ) {
+            match self.probe_replace_if_version() {
+                ProbeOutcome::Supported => {
+                    capabilities =
+                        capabilities.with_replace_if_version(S3ConditionalWriteStatus::Supported);
+                }
+                ProbeOutcome::Unsupported => {
+                    capabilities =
+                        capabilities.with_replace_if_version(S3ConditionalWriteStatus::Unsupported);
+                }
+                ProbeOutcome::Inconclusive(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        self.capability_state.set(capabilities)?;
+        self.capability_state.cache_result(capabilities);
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(capabilities),
+        }
+    }
+
+    /// Clears the cached result for this endpoint, region, and bucket.
+    ///
+    /// The next conditional operation or explicit probe will test the
+    /// provider again. Cache invalidation is local-file-only and never sends a
+    /// request to the bucket.
+    pub fn invalidate_conditional_write_cache(&self) -> StorageResult<()> {
+        let _probe_guard = self
+            .capability_state
+            .probe_lock
+            .lock()
+            .map_err(|_| StorageError::Unavailable)?;
+        self.capability_state
+            .set(S3ConditionalWriteCapabilities::default())?;
+        if let Some(path) = self.capability_state.cache_path.as_deref() {
+            invalidate_cached_capabilities(path, &self.capability_state.key)?;
+        }
+        Ok(())
+    }
+
+    /// Invalidates the cached result and immediately probes the provider again.
+    pub fn reprobe_conditional_write_capabilities(
+        &self,
+    ) -> StorageResult<S3ConditionalWriteCapabilities> {
+        self.invalidate_conditional_write_cache()?;
+        self.probe_conditional_write_capabilities()
+    }
+
+    fn ensure_conditional_write_capability(
+        &self,
+        condition: &WriteConditionHeader,
+    ) -> StorageResult<()> {
+        let status = match condition {
+            WriteConditionHeader::Any => return Ok(()),
+            WriteConditionHeader::IfAbsent => self.capability_state.snapshot().create_if_absent(),
+            WriteConditionHeader::IfVersion(_) => {
+                self.capability_state.snapshot().replace_if_version()
+            }
+        };
+        match status {
+            S3ConditionalWriteStatus::Supported => Ok(()),
+            S3ConditionalWriteStatus::Unsupported => Err(StorageError::UnsupportedCapability),
+            S3ConditionalWriteStatus::Inconclusive => {
+                let probe_result = self.probe_conditional_write_capabilities();
+                let capabilities = self.capability_state.snapshot();
+                let status = match condition {
+                    WriteConditionHeader::IfAbsent => capabilities.create_if_absent(),
+                    WriteConditionHeader::IfVersion(_) => capabilities.replace_if_version(),
+                    WriteConditionHeader::Any => S3ConditionalWriteStatus::Supported,
+                };
+                match status {
+                    S3ConditionalWriteStatus::Supported => Ok(()),
+                    S3ConditionalWriteStatus::Unsupported => {
+                        Err(StorageError::UnsupportedCapability)
+                    }
+                    S3ConditionalWriteStatus::Inconclusive => match probe_result {
+                        Err(error) => Err(error),
+                        Ok(_) => Err(StorageError::Unavailable),
+                    },
+                }
+            }
+        }
+    }
+
+    fn probe_create_if_absent(&self) -> ProbeOutcome {
+        let key = match capability_probe_key("create") {
+            Ok(key) => key,
+            Err(error) => return ProbeOutcome::Inconclusive(error),
+        };
+        let outcome = match self.put_small(
+            &key,
+            b"gib-create-probe-one".to_vec(),
+            WriteConditionHeader::IfAbsent,
+        ) {
+            Ok(_) => match self.put_small(
+                &key,
+                b"gib-create-probe-two".to_vec(),
+                WriteConditionHeader::IfAbsent,
+            ) {
+                Ok(_) => ProbeOutcome::Unsupported,
+                Err(error) if error.is_conflict() => ProbeOutcome::Supported,
+                Err(error) => classify_probe_error(error),
+            },
+            Err(StorageError::AlreadyExists) => {
+                ProbeOutcome::Inconclusive(StorageError::AlreadyExists)
+            }
+            Err(error) => classify_probe_error(error),
+        };
+        self.finish_probe(&key, outcome)
+    }
+
+    fn probe_replace_if_version(&self) -> ProbeOutcome {
+        let key = match capability_probe_key("replace") {
+            Ok(key) => key,
+            Err(error) => return ProbeOutcome::Inconclusive(error),
+        };
+        let outcome = match self.put_small(
+            &key,
+            b"gib-replace-probe-one".to_vec(),
+            WriteConditionHeader::Any,
+        ) {
+            Ok(metadata) => {
+                let Some(version) = metadata.version().cloned() else {
+                    return self.finish_probe(
+                        &key,
+                        ProbeOutcome::Inconclusive(StorageError::InvalidVersion),
+                    );
+                };
+                let version = match version_as_etag(&version) {
+                    Ok(version) => version,
+                    Err(error) => {
+                        return self.finish_probe(&key, ProbeOutcome::Inconclusive(error));
+                    }
+                };
+                match self.put_small(
+                    &key,
+                    b"gib-replace-probe-two".to_vec(),
+                    WriteConditionHeader::IfVersion(version.clone()),
+                ) {
+                    Ok(_) => match self.put_small(
+                        &key,
+                        b"gib-replace-probe-three".to_vec(),
+                        WriteConditionHeader::IfVersion(version),
+                    ) {
+                        Ok(_) => ProbeOutcome::Unsupported,
+                        Err(error) if error.is_conflict() => ProbeOutcome::Supported,
+                        Err(error) => classify_probe_error(error),
+                    },
+                    Err(error) => classify_probe_error(error),
+                }
+            }
+            Err(error) => classify_probe_error(error),
+        };
+        self.finish_probe(&key, outcome)
+    }
+
+    fn finish_probe(&self, key: &ObjectKey, outcome: ProbeOutcome) -> ProbeOutcome {
+        match self.delete_unconditionally(key) {
+            Ok(()) | Err(StorageError::NotFound) => outcome,
+            Err(error) => ProbeOutcome::Inconclusive(error),
+        }
     }
 
     /// Writes an object while observing a cooperative cancellation request.
@@ -298,7 +1124,25 @@ impl S3Storage {
     ) -> StorageResult<ObjectMetadata> {
         check_cancelled(cancellation)?;
         let condition = WriteConditionHeader::from_storage_condition(options.condition())?;
-        let expected_size = options.expected_size();
+        self.ensure_conditional_write_capability(&condition)?;
+        self.write_stream_unchecked(
+            object_key,
+            source,
+            options.expected_size(),
+            condition,
+            cancellation,
+        )
+    }
+
+    fn write_stream_unchecked(
+        &self,
+        object_key: &ObjectKey,
+        source: &mut dyn Read,
+        expected_size: Option<u64>,
+        condition: WriteConditionHeader,
+        cancellation: Option<&CancellationToken>,
+    ) -> StorageResult<ObjectMetadata> {
+        check_cancelled(cancellation)?;
         let threshold = self.config.multipart_threshold;
 
         if let Some(expected_size) = expected_size {
@@ -593,6 +1437,22 @@ impl S3Storage {
             })
     }
 
+    fn delete_unconditionally(&self, object_key: &ObjectKey) -> StorageResult<()> {
+        let bucket = self.config.bucket.clone();
+        let key = object_key.as_str().to_owned();
+        self.runtime
+            .run_without_cancellation(move |client| async move {
+                client
+                    .delete_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .map_err(map_sdk_error)
+                    .map(|_| ())
+            })
+    }
+
     fn open_stream(
         &self,
         object_key: &ObjectKey,
@@ -639,7 +1499,16 @@ impl fmt::Debug for S3Storage {
 
 impl RepositoryStorage for S3Storage {
     fn capabilities(&self) -> StorageCapabilities {
-        StorageCapabilities::ALL
+        let capabilities = self.capability_state.snapshot();
+        // Inconclusive results stay advertised for compatibility; the guarded
+        // conditional-write path probes before it can publish anything.
+        if capabilities.create_if_absent() == S3ConditionalWriteStatus::Unsupported
+            || capabilities.replace_if_version() == S3ConditionalWriteStatus::Unsupported
+        {
+            StorageCapabilities::ALL & !StorageCapabilities::CONDITIONAL_WRITE
+        } else {
+            StorageCapabilities::ALL
+        }
     }
 
     fn read_stream(&self, object_key: &ObjectKey) -> StorageResult<ObjectRead> {
@@ -1420,15 +2289,23 @@ impl WriteConditionHeader {
 }
 
 fn map_condition_error(error: StorageError, condition: &WriteConditionHeader) -> StorageError {
-    if matches!(condition, WriteConditionHeader::IfAbsent)
-        && matches!(
-            error,
-            StorageError::AlreadyExists | StorageError::Conflict | StorageError::ConditionNotMet
-        )
-    {
-        StorageError::AlreadyExists
-    } else {
-        error
+    match condition {
+        WriteConditionHeader::IfAbsent
+            if matches!(
+                error,
+                StorageError::AlreadyExists
+                    | StorageError::Conflict
+                    | StorageError::ConditionNotMet
+            ) =>
+        {
+            StorageError::AlreadyExists
+        }
+        WriteConditionHeader::IfAbsent | WriteConditionHeader::IfVersion(_)
+            if error == StorageError::InvalidRequest =>
+        {
+            StorageError::UnsupportedCapability
+        }
+        _ => error,
     }
 }
 
@@ -1454,6 +2331,25 @@ fn matches_object_prefix(key: &str, prefix: &str) -> bool {
         || key
             .strip_prefix(prefix)
             .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn capability_probe_key(purpose: &str) -> StorageResult<ObjectKey> {
+    let sequence = NEXT_S3_CAPABILITY_PROBE_ID.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    ObjectKey::new(format!(
+        "{S3_CAPABILITY_PROBE_PREFIX}/{}-{timestamp}-{sequence}/{purpose}",
+        std::process::id(),
+    ))
+}
+
+fn classify_probe_error(error: StorageError) -> ProbeOutcome {
+    if error == StorageError::UnsupportedCapability {
+        ProbeOutcome::Unsupported
+    } else {
+        ProbeOutcome::Inconclusive(error)
+    }
 }
 
 fn map_sdk_error<E>(error: SdkError<E>) -> StorageError
@@ -1514,6 +2410,216 @@ fn map_provider_code(code: &str) -> Option<StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::ports::StorageCapability;
+
+    struct TestCacheDirectory {
+        path: PathBuf,
+    }
+
+    impl TestCacheDirectory {
+        fn new() -> StorageResult<Self> {
+            for _ in 0..8 {
+                let id = NEXT_S3_CAPABILITY_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "gib-s3-capability-cache-test-{}-{id}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Ok(Self { path }),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(StorageError::from_io_error(&error)),
+                }
+            }
+            Err(StorageError::Unavailable)
+        }
+
+        fn file(&self) -> PathBuf {
+            self.path.join(DEFAULT_S3_CAPABILITY_CACHE_FILE_NAME)
+        }
+    }
+
+    impl Drop for TestCacheDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn test_cache_key(sequence: u16) -> S3CapabilityCacheKey {
+        S3CapabilityCacheKey {
+            endpoint: Some(format!("http://127.0.0.1:{sequence}")),
+            region: "us-east-1".to_owned(),
+            bucket: format!("gib-cache-{sequence}"),
+        }
+    }
+
+    #[test]
+    fn capability_cache_round_trips_without_credentials() -> StorageResult<()> {
+        let directory = TestCacheDirectory::new()?;
+        let path = directory.file();
+        let config = S3StorageConfig::new(
+            "us-east-1",
+            "gib-cache-9001",
+            "ACCESS-SECRET",
+            "SECRET-VALUE",
+        )?
+        .with_endpoint("http://127.0.0.1:9000");
+        let key = S3CapabilityCacheKey::from_config(&config);
+        let capabilities = S3ConditionalWriteCapabilities {
+            create_if_absent: S3ConditionalWriteStatus::Supported,
+            replace_if_version: S3ConditionalWriteStatus::Unsupported,
+        };
+        persist_cached_capabilities(&path, &key, capabilities)?;
+        assert_eq!(load_cached_capabilities(&path, &key), Some(capabilities));
+        assert_eq!(
+            load_cached_capabilities(&path, &test_cache_key(9_002)),
+            None
+        );
+        let mut different_region = key.clone();
+        different_region.region = "eu-west-1".to_owned();
+        assert_eq!(load_cached_capabilities(&path, &different_region), None);
+        let mut different_bucket = key.clone();
+        different_bucket.bucket = "gib-cache-other".to_owned();
+        assert_eq!(load_cached_capabilities(&path, &different_bucket), None);
+        let bytes = fs::read(&path).map_err(|error| StorageError::from_io_error(&error))?;
+        assert!(
+            !bytes
+                .windows(b"ACCESS-SECRET".len())
+                .any(|window| window == b"ACCESS-SECRET")
+        );
+        assert!(
+            !bytes
+                .windows(b"SECRET-VALUE".len())
+                .any(|window| window == b"SECRET-VALUE")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_and_corrupt_capability_cache_entries_are_ignored() -> StorageResult<()> {
+        let directory = TestCacheDirectory::new()?;
+        let path = directory.file();
+        let key = test_cache_key(9_003);
+        let stale = S3CapabilityCacheFile {
+            version: S3_CAPABILITY_CACHE_SCHEMA_VERSION,
+            entries: vec![S3CapabilityCacheEntry {
+                endpoint: key.endpoint.clone(),
+                region: key.region.clone(),
+                bucket: key.bucket.clone(),
+                observed_at_unix_seconds: u64::MAX,
+                create_if_absent: Some(true),
+                replace_if_version: Some(true),
+            }],
+        };
+        let stale_bytes = rmp_serde::to_vec_named(&stale).map_err(|_| StorageError::Io)?;
+        fs::write(&path, stale_bytes).map_err(|error| StorageError::from_io_error(&error))?;
+        assert_eq!(load_cached_capabilities(&path, &key), None);
+
+        let future = S3CapabilityCacheFile {
+            version: S3_CAPABILITY_CACHE_SCHEMA_VERSION + 1,
+            entries: Vec::new(),
+        };
+        let future_bytes = rmp_serde::to_vec_named(&future).map_err(|_| StorageError::Io)?;
+        fs::write(&path, future_bytes).map_err(|error| StorageError::from_io_error(&error))?;
+        assert_eq!(load_cached_capabilities(&path, &key), None);
+
+        fs::write(&path, [0_u8, 1, 2, 3]).map_err(|error| StorageError::from_io_error(&error))?;
+        assert_eq!(load_cached_capabilities(&path, &key), None);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_capability_cache_writers_keep_all_entries_valid() -> StorageResult<()> {
+        let directory = TestCacheDirectory::new()?;
+        let path = Arc::new(directory.file());
+        let mut workers = Vec::new();
+        for sequence in 0..8_u16 {
+            let path = path.clone();
+            workers.push(thread::spawn(move || {
+                let key = test_cache_key(9_100 + sequence);
+                let capabilities = S3ConditionalWriteCapabilities {
+                    create_if_absent: S3ConditionalWriteStatus::Supported,
+                    replace_if_version: if sequence % 2 == 0 {
+                        S3ConditionalWriteStatus::Supported
+                    } else {
+                        S3ConditionalWriteStatus::Unsupported
+                    },
+                };
+                persist_cached_capabilities(&path, &key, capabilities)
+            }));
+        }
+        for worker in workers {
+            worker.join().map_err(|_| StorageError::Unavailable)??;
+        }
+        let cache = read_capability_cache(&path);
+        assert_eq!(cache.entries.len(), 8);
+        assert_eq!(cache.version, S3_CAPABILITY_CACHE_SCHEMA_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn storage_loads_scoped_capabilities_and_invalidates_them() -> StorageResult<()> {
+        let directory = TestCacheDirectory::new()?;
+        let path = directory.file();
+        let config =
+            S3StorageConfig::new("us-east-1", "gib-cache-9004", "access-key", "secret-key")?
+                .with_endpoint("http://127.0.0.1:9000")
+                .with_capability_cache_path(&path);
+        let key = S3CapabilityCacheKey::from_config(&config);
+        let capabilities = S3ConditionalWriteCapabilities {
+            create_if_absent: S3ConditionalWriteStatus::Supported,
+            replace_if_version: S3ConditionalWriteStatus::Unsupported,
+        };
+        persist_cached_capabilities(&path, &key, capabilities)?;
+
+        let storage = S3Storage::new(config)?;
+        assert_eq!(storage.conditional_write_capabilities(), capabilities);
+        assert!(
+            !storage
+                .capabilities()
+                .supports(StorageCapability::ConditionalWrite)
+        );
+        storage.invalidate_conditional_write_cache()?;
+        assert_eq!(
+            storage.conditional_write_capabilities(),
+            S3ConditionalWriteCapabilities::default()
+        );
+        assert_eq!(load_cached_capabilities(&path, &key), None);
+        Ok(())
+    }
+
+    #[test]
+    fn probe_failures_remain_inconclusive() {
+        assert_eq!(
+            classify_probe_error(StorageError::PermissionDenied),
+            ProbeOutcome::Inconclusive(StorageError::PermissionDenied)
+        );
+        assert_eq!(
+            classify_probe_error(StorageError::Transient),
+            ProbeOutcome::Inconclusive(StorageError::Transient)
+        );
+        assert_eq!(
+            classify_probe_error(StorageError::UnsupportedCapability),
+            ProbeOutcome::Unsupported
+        );
+    }
+
+    #[test]
+    fn invalid_conditional_requests_are_classified_as_unsupported() {
+        assert_eq!(
+            map_condition_error(
+                StorageError::InvalidRequest,
+                &WriteConditionHeader::IfAbsent
+            ),
+            StorageError::UnsupportedCapability
+        );
+        assert_eq!(
+            map_condition_error(
+                StorageError::InvalidRequest,
+                &WriteConditionHeader::IfVersion("etag".to_owned())
+            ),
+            StorageError::UnsupportedCapability
+        );
+    }
 
     #[test]
     fn configuration_debug_redacts_secrets_and_endpoint() -> StorageResult<()> {

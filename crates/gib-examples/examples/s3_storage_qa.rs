@@ -16,17 +16,21 @@ mod qa {
         let storage = configured_storage()?;
         match command.as_str() {
             "all" => {
+                capabilities(&storage)?;
                 smoke(&storage)?;
                 multipart(&storage)?;
                 paginate(&storage)?;
                 cancel(&storage)
             }
+            "capabilities" => capabilities(&storage),
+            "reprobe" => reprobe(&storage),
+            "atomic" => atomic(&storage),
             "smoke" => smoke(&storage),
             "multipart" => multipart(&storage),
             "paginate" => paginate(&storage),
             "cancel" => cancel(&storage),
             _ => Err(format!(
-                "unknown command {command}; use all, smoke, multipart, paginate, or cancel"
+                "unknown command {command}; use all, capabilities, reprobe, atomic, smoke, multipart, paginate, or cancel"
             )
             .into()),
         }
@@ -44,6 +48,9 @@ mod qa {
         if let Ok(session_token) = std::env::var("GIB_S3_SESSION_TOKEN") {
             config = config.with_session_token(session_token);
         }
+        if let Ok(path) = std::env::var("GIB_S3_CAPABILITY_CACHE_PATH") {
+            config = config.with_capability_cache_path(path);
+        }
         let threshold =
             optional_environment("GIB_S3_MULTIPART_THRESHOLD", DEFAULT_S3_MULTIPART_THRESHOLD)?;
         let part_size =
@@ -55,6 +62,62 @@ mod qa {
                 .with_multipart_part_size(part_size)
                 .with_max_concurrency(concurrency),
         )?)
+    }
+
+    fn capabilities(storage: &S3Storage) -> Result<(), Box<dyn Error>> {
+        if let Some(path) = storage.config().capability_cache_path() {
+            println!("capability cache: {}", path.display());
+        }
+        let initial = storage.conditional_write_capabilities();
+        let loaded_from_cache = !matches!(
+            initial.create_if_absent(),
+            gib::S3ConditionalWriteStatus::Inconclusive
+        ) && !matches!(
+            initial.replace_if_version(),
+            gib::S3ConditionalWriteStatus::Inconclusive
+        );
+        let first = storage.probe_conditional_write_capabilities()?;
+        println!(
+            "conditional capabilities: create_if_absent={}, replace_if_version={}",
+            first.create_if_absent(),
+            first.replace_if_version()
+        );
+        if loaded_from_cache {
+            println!("loaded the capability result from the persistent cache");
+        } else {
+            println!("performed a provider capability probe and populated the cache");
+        }
+        Ok(())
+    }
+
+    fn reprobe(storage: &S3Storage) -> Result<(), Box<dyn Error>> {
+        let capabilities = storage.reprobe_conditional_write_capabilities()?;
+        println!(
+            "re-probed capabilities: create_if_absent={}, replace_if_version={}",
+            capabilities.create_if_absent(),
+            capabilities.replace_if_version()
+        );
+        Ok(())
+    }
+
+    fn atomic(storage: &S3Storage) -> Result<(), Box<dyn Error>> {
+        let key = ObjectKey::new(format!("manual/s3-atomic-{}", std::process::id()))?;
+        let mut source = Cursor::new(b"atomic capability QA".to_vec());
+        match storage.write_stream(&key, &mut source, ObjectWriteOptions::if_absent()) {
+            Ok(metadata) => {
+                println!(
+                    "atomic publication accepted; endpoint supports create-if-absent ({})",
+                    metadata.key()
+                );
+                storage.delete(&key)?;
+                Ok(())
+            }
+            Err(StorageError::UnsupportedCapability) => {
+                println!("atomic publication refused: conditional writes are unsupported");
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn required_environment(name: &str) -> Result<String, Box<dyn Error>> {

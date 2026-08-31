@@ -283,6 +283,7 @@ fn s3_storage_runs_the_shared_contract_suite_when_configured() -> Result<(), Box
         eprintln!("skipping S3 contract: GIB_S3_TEST_* environment is not configured");
         return Ok(());
     };
+    storage.probe_conditional_write_capabilities()?;
     run_storage_contract(storage)
 }
 
@@ -293,6 +294,7 @@ fn s3_storage_supports_multipart_boundary_ranges_and_cancellation() -> Result<()
         eprintln!("skipping S3 multipart test: GIB_S3_TEST_* environment is not configured");
         return Ok(());
     };
+    storage.probe_conditional_write_capabilities()?;
     let namespace = unique_storage_namespace("s3-contract");
     let multipart_key = namespaced_key(&namespace, "multipart")?;
     match storage.delete(&multipart_key) {
@@ -392,7 +394,8 @@ fn s3_storage_from_environment() -> Result<Option<S3Storage>, Box<dyn Error>> {
     Ok(Some(S3Storage::new(
         config
             .with_multipart_threshold(MIN_S3_MULTIPART_PART_SIZE)
-            .with_multipart_part_size(DEFAULT_S3_MULTIPART_PART_SIZE),
+            .with_multipart_part_size(DEFAULT_S3_MULTIPART_PART_SIZE)
+            .without_capability_cache(),
     )?))
 }
 
