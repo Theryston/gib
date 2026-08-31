@@ -1,5 +1,6 @@
 mod configuration;
 mod storage;
+mod storage_configuration;
 
 pub use configuration::{
     ConfigurationError, ConfigurationFileMetadata, ConfigurationFileSystem, ConfigurationResult,
@@ -13,6 +14,16 @@ pub use storage::{
     StorageListPage, StorageListRequest, StorageMetadata, StoragePrefix, StorageRange,
     StorageReader, StorageResult, StorageVersion, StorageVersionToken, StorageWriteCondition,
     StorageWriteOptions, VersionToken, VersionedObject, VersionedStorageObject, WriteCondition,
+};
+pub use storage_configuration::{
+    CURRENT_STORAGE_BACKEND_VERSION, CURRENT_STORAGE_CONFIGURATION_VERSION, CredentialReference,
+    CredentialStore, CredentialStoreError, CredentialStoreOperation, CredentialStoreResult,
+    LocalStorageSettings, MAX_STORAGE_CONFIGURATION_BYTES, MAX_STORAGE_CREDENTIAL_LENGTH,
+    MAX_STORAGE_NAME_LENGTH, MAX_STORAGE_SETTING_LENGTH, S3StorageCredentials, S3StorageSettings,
+    STORAGE_CONFIGURATION_FILE_SUFFIX, StorageBackend, StorageBackendKind, StorageConfiguration,
+    StorageConfigurationError, StorageConfigurationOperation, StorageConfigurationResult,
+    StorageCredentialKind, StorageCredentials, StorageName, WebDavStorageCredentials,
+    WebDavStorageSettings,
 };
 
 pub(crate) use storage::{copy_stream, read_stream_to_vec};

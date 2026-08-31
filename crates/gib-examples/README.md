@@ -144,3 +144,26 @@ traversal, cross-origin hrefs, root validation, and credential redaction:
 ```text
 cargo test -p gib-sdk --features webdav webdav --lib --no-fail-fast
 ```
+
+The secure storage-configuration QA example uses an in-memory credential-store
+double and recognizable fake values. It verifies that the MessagePack record
+contains only non-secret settings and an opaque reference, forces an update
+failure, and removes both record and credential in one process:
+
+```text
+cargo run -p gib-examples --example storage_configuration_qa -- /tmp/gib-storage-configuration-qa all
+```
+
+To inspect each phase separately, keep the same directory and run:
+
+```text
+cargo run -p gib-examples --example storage_configuration_qa -- /tmp/gib-storage-configuration-qa add
+rg -a -n 'manual-recognizable-(access-key|secret-key|session-token)' /tmp/gib-storage-configuration-qa
+cargo run -p gib-examples --example storage_configuration_qa -- /tmp/gib-storage-configuration-qa inspect
+cargo run -p gib-examples --example storage_configuration_qa -- /tmp/gib-storage-configuration-qa fail-update
+cargo run -p gib-examples --example storage_configuration_qa -- /tmp/gib-storage-configuration-qa remove
+```
+
+The separate-process commands intentionally use the in-memory double only for
+file-safety checks; a real application must inject its approved encrypted
+credential-store adapter to reload credentials across processes.

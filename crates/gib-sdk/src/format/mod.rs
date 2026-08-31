@@ -1,6 +1,7 @@
 mod configuration;
 mod identity;
 mod repository;
+mod storage_configuration;
 
 pub(crate) use configuration::{
     ConfigurationDocumentError, ConfigurationDocumentErrorKind, MAX_CONFIGURATION_BYTES,
@@ -14,4 +15,8 @@ pub(crate) use repository::{
     FormatError, decode_bootstrap, decode_descriptor, decode_head, decode_history_record,
     decode_snapshot, encode_bootstrap, encode_descriptor, encode_head, encode_history_record,
     encode_snapshot,
+};
+pub(crate) use storage_configuration::{
+    DecodedStorageConfiguration, PersistedStorageBackend, decode_storage_configuration,
+    encode_storage_configuration,
 };

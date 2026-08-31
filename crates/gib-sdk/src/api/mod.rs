@@ -6,6 +6,7 @@ mod event;
 mod identity;
 mod operation;
 mod repository;
+mod storage_configuration;
 
 pub use builder::{ClientBuilder, DEFAULT_EVENT_BUFFER_CAPACITY};
 pub use client::Client;
@@ -93,3 +94,4 @@ pub use repository::{
     DEFAULT_WEBDAV_TRANSFER_BUFFER_SIZE, MAX_WEBDAV_MAX_CONCURRENCY, WebDavStorage,
     WebDavStorageConfig,
 };
+pub use storage_configuration::*;
