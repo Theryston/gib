@@ -9,6 +9,8 @@ use gib::{
     RepositoryStorage, STORAGE_TRANSFER_BUFFER_SIZE, StorageCapabilities, StorageCapability,
     StorageError, StorageResult,
 };
+#[cfg(feature = "webdav")]
+use gib::{WebDavStorage, WebDavStorageConfig};
 use std::error::Error;
 use std::io::{self, Cursor, Read};
 use std::path::PathBuf;
@@ -284,7 +286,8 @@ fn s3_storage_runs_the_shared_contract_suite_when_configured() -> Result<(), Box
         return Ok(());
     };
     storage.probe_conditional_write_capabilities()?;
-    run_storage_contract(storage)
+    let namespace = unique_storage_namespace("s3-contract");
+    run_storage_contract_in_namespace(storage, &namespace)
 }
 
 #[cfg(feature = "s3")]
@@ -365,6 +368,43 @@ fn s3_storage_supports_multipart_boundary_ranges_and_cancellation() -> Result<()
     );
     storage.delete(&multipart_key)?;
     Ok(())
+}
+
+#[cfg(feature = "webdav")]
+#[test]
+fn webdav_storage_runs_the_shared_contract_suite_when_configured() -> Result<(), Box<dyn Error>> {
+    let Some(storage) = webdav_storage_from_environment()? else {
+        eprintln!(
+            "skipping WebDAV contract: GIB_WEBDAV_TEST_URL, GIB_WEBDAV_TEST_USERNAME, and \
+             GIB_WEBDAV_TEST_PASSWORD are not configured"
+        );
+        return Ok(());
+    };
+    let namespace = unique_storage_namespace("webdav-contract");
+    run_storage_contract_in_namespace(storage, &namespace)
+}
+
+#[cfg(feature = "webdav")]
+fn webdav_storage_from_environment() -> Result<Option<WebDavStorage>, Box<dyn Error>> {
+    let names = [
+        "GIB_WEBDAV_TEST_URL",
+        "GIB_WEBDAV_TEST_USERNAME",
+        "GIB_WEBDAV_TEST_PASSWORD",
+    ];
+    let [Some(url), Some(username), Some(password)] = names.map(|name| std::env::var(name).ok())
+    else {
+        return Ok(None);
+    };
+    let mut config = WebDavStorageConfig::new(url, username, password)?;
+    if std::env::var("GIB_WEBDAV_TEST_ALLOW_HTTP")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        config = config.with_allow_insecure_http(true);
+    }
+    if let Ok(value) = std::env::var("GIB_WEBDAV_TEST_MAX_CONCURRENCY") {
+        config = config.with_max_concurrency(value.parse()?);
+    }
+    Ok(Some(WebDavStorage::new(config)?))
 }
 
 #[cfg(feature = "s3")]

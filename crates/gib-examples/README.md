@@ -99,3 +99,48 @@ processes, remove or corrupt `GIB_S3_CAPABILITY_CACHE_PATH`, run
 `capabilities` again, and then run `atomic` against an endpoint known not to
 support native preconditions. A refusal must report
 `conditional writes are unsupported`; it must not publish the object.
+
+The WebDAV storage QA example requires the `webdav` feature, an existing
+dedicated WebDAV collection, and Basic-auth credentials. HTTPS is required by
+default; set `GIB_WEBDAV_ALLOW_HTTP=true` only for an intentionally insecure
+local test server:
+
+```text
+docker run --rm --name gib-webdav-qa \
+  -e AUTH_TYPE=Basic -e USERNAME=gib-qa -e PASSWORD=test-password \
+  -e LOCATION=/dav --publish 8080:80 --detach bytemark/webdav
+
+export GIB_WEBDAV_URL=http://127.0.0.1:8080/dav/
+export GIB_WEBDAV_USERNAME=gib-qa
+export GIB_WEBDAV_PASSWORD='test-password'
+export GIB_WEBDAV_ALLOW_HTTP=true
+cargo run -p gib-examples --features webdav --example webdav_storage_qa -- all
+```
+
+The container command is a local-only QA setup; use HTTPS for real data. The
+image's `LOCATION`, Basic-auth, and persistent-volume options are documented by
+[the image maintainer](https://github.com/BytemarkHosting/docker-webdav).
+
+The commands `smoke`, `unicode`, `ranges`, `paginate`, `cancel`, `redaction`,
+and `auth` run the WebDAV checks individually. `smoke` covers CRUD and a byte
+range, `unicode` covers encoded nested names, `ranges` checks a large range
+crossing a transfer-buffer boundary, `paginate` checks continuation cursors,
+`cancel` interrupts a large staged upload, and `auth` checks the typed error for
+bad credentials. The WebDAV contract integration test uses the same settings
+with `GIB_WEBDAV_TEST_URL`, `GIB_WEBDAV_TEST_USERNAME`, and
+`GIB_WEBDAV_TEST_PASSWORD`:
+
+```text
+export GIB_WEBDAV_TEST_URL="$GIB_WEBDAV_URL"
+export GIB_WEBDAV_TEST_USERNAME="$GIB_WEBDAV_USERNAME"
+export GIB_WEBDAV_TEST_PASSWORD="$GIB_WEBDAV_PASSWORD"
+export GIB_WEBDAV_TEST_ALLOW_HTTP="${GIB_WEBDAV_ALLOW_HTTP:-}"
+cargo test -p gib-sdk --features webdav --test storage_contract --no-fail-fast
+```
+
+The SDK also has focused adversarial tests for malformed DAV XML, encoded
+traversal, cross-origin hrefs, root validation, and credential redaction:
+
+```text
+cargo test -p gib-sdk --features webdav webdav --lib --no-fail-fast
+```

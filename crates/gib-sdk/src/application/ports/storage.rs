@@ -1,4 +1,3 @@
-use crate::domain::validate_repository_object;
 use std::fmt;
 use std::io::{self, Cursor, Read, Write};
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
@@ -144,9 +143,9 @@ pub type StorageResult<T> = std::result::Result<T, StorageError>;
 
 /// A validated, provider-neutral logical object key.
 ///
-/// Keys are relative slash-separated names. They are deliberately narrower
-/// than the set accepted by some providers so that a repository can move
-/// between Local, S3, WebDAV, and future adapters without changing identity.
+/// Keys are relative slash-separated UTF-8 names. They reject traversal and
+/// platform-ambiguous path syntax while allowing spaces and Unicode names so
+/// that WebDAV resources can round-trip without lossy renaming.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ObjectKey(String);
 
@@ -1213,5 +1212,47 @@ pub(crate) fn copy_stream(
 }
 
 fn validate_key(value: &str) -> StorageResult<()> {
-    validate_repository_object(value).map_err(|_| StorageError::InvalidObjectKey)
+    if value.is_empty() || value.len() > ObjectKey::MAX_LENGTH {
+        return Err(StorageError::InvalidObjectKey);
+    }
+    if value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains("//")
+        || value.contains('\\')
+        || value.contains(':')
+        || value.contains('\0')
+    {
+        return Err(StorageError::InvalidObjectKey);
+    }
+    for component in value.split('/') {
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || component
+                .as_bytes()
+                .last()
+                .is_some_and(|byte| matches!(byte, b'.' | b' '))
+            || is_windows_reserved_component(component)
+        {
+            return Err(StorageError::InvalidObjectKey);
+        }
+        if component.chars().any(|character| {
+            character.is_control() || matches!(character, '*' | '?' | '"' | '<' | '>' | '|')
+        }) {
+            return Err(StorageError::InvalidObjectKey);
+        }
+    }
+    Ok(())
+}
+
+fn is_windows_reserved_component(component: &str) -> bool {
+    let stem = component
+        .split_once('.')
+        .map_or(component, |(stem, _)| stem)
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0')
 }

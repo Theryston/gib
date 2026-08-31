@@ -87,3 +87,9 @@ pub use repository::{
     MIN_S3_MULTIPART_PART_SIZE, S3ConditionalWriteCapabilities, S3ConditionalWriteStatus,
     S3Storage, S3StorageConfig,
 };
+#[cfg(feature = "webdav")]
+pub use repository::{
+    DEFAULT_WEBDAV_MAX_CONCURRENCY, DEFAULT_WEBDAV_REQUEST_TIMEOUT,
+    DEFAULT_WEBDAV_TRANSFER_BUFFER_SIZE, MAX_WEBDAV_MAX_CONCURRENCY, WebDavStorage,
+    WebDavStorageConfig,
+};

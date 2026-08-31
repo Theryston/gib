@@ -7,6 +7,14 @@ description.workspace = true
 [features]
 default = []
 s3 = ["dep:aws-sdk-s3", "dep:tokio", "dep:url"]
+webdav = [
+    "dep:futures-util",
+    "dep:percent-encoding",
+    "dep:quick-xml",
+    "dep:reqwest",
+    "dep:tokio",
+    "dep:url",
+]
 
 [lib]
 name = "gib"
@@ -20,5 +28,9 @@ rmp-serde = "1.3.1"
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.10.9"
 toml = "0.8.23"
-tokio = { version = "1.49.0", optional = true, features = ["macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1.49.0", optional = true, features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
 url = { version = "2.5.7", optional = true }
+futures-util = { version = "0.3.31", optional = true, default-features = false, features = ["alloc", "async-await", "std"] }
+percent-encoding = { version = "2.3.1", optional = true }
+quick-xml = { version = "0.37.5", optional = true }
+reqwest = { version = "0.12.28", optional = true, default-features = false, features = ["rustls-tls", "stream"] }

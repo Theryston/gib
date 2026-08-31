@@ -53,6 +53,12 @@ pub use crate::infrastructure::storage::{
     MIN_S3_MULTIPART_PART_SIZE, S3ConditionalWriteCapabilities, S3ConditionalWriteStatus,
     S3Storage, S3StorageConfig,
 };
+#[cfg(feature = "webdav")]
+pub use crate::infrastructure::storage::{
+    DEFAULT_WEBDAV_MAX_CONCURRENCY, DEFAULT_WEBDAV_REQUEST_TIMEOUT,
+    DEFAULT_WEBDAV_TRANSFER_BUFFER_SIZE, MAX_WEBDAV_MAX_CONCURRENCY, WebDavStorage,
+    WebDavStorageConfig,
+};
 pub use crate::infrastructure::storage::{
     LocalStorage, LocalStorageOperation, MemoryStorage, MemoryStorageOperation,
 };
@@ -109,6 +115,13 @@ impl From<&LocalStorage> for StorageHandle {
 #[cfg(feature = "s3")]
 impl From<&S3Storage> for StorageHandle {
     fn from(storage: &S3Storage) -> Self {
+        Self::new(storage.clone())
+    }
+}
+
+#[cfg(feature = "webdav")]
+impl From<&WebDavStorage> for StorageHandle {
+    fn from(storage: &WebDavStorage) -> Self {
         Self::new(storage.clone())
     }
 }
