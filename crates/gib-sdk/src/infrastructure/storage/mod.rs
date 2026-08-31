@@ -2,4 +2,4 @@ mod local;
 mod memory;
 
 pub use local::LocalStorage;
-pub use memory::MemoryStorage;
+pub use memory::{MemoryStorage, MemoryStorageOperation};

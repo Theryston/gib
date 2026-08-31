@@ -1,5 +1,8 @@
 use crate::input::OutputMode;
-use gib::{AuthorIdentity, SnapshotReference, SnapshotSummaryPage};
+use gib::{
+    AuthorIdentity, ConfigurationSource, ResolvedConfiguration, SnapshotReference,
+    SnapshotSummaryPage,
+};
 use serde::Serialize;
 
 const CLI_OUTPUT_SCHEMA_VERSION: u16 = 1;
@@ -32,6 +35,41 @@ struct HistorySummaryOutput {
     author: Option<String>,
     timestamp: Option<u64>,
     size: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ConfigurationEventOutput {
+    loaded: bool,
+    source: &'static str,
+    path: Option<String>,
+}
+
+pub fn render_configuration_source(configuration: &ResolvedConfiguration, mode: OutputMode) {
+    let source = configuration.source();
+    let source_name = match source {
+        ConfigurationSource::Defaults => "defaults",
+        ConfigurationSource::Discovered(_) => "discovered",
+        ConfigurationSource::Explicit(_) => "explicit",
+        ConfigurationSource::Disabled => "disabled",
+        _ => "unknown",
+    };
+    let event = ConfigurationEventOutput {
+        loaded: source.is_loaded(),
+        source: source_name,
+        path: source.path().map(|path| path.display().to_string()),
+    };
+
+    match mode {
+        OutputMode::Interactive => match source {
+            ConfigurationSource::Discovered(path) | ConfigurationSource::Explicit(path) => {
+                println!("Loaded local config {}", path.display());
+            }
+            ConfigurationSource::Disabled => println!("Local config disabled."),
+            ConfigurationSource::Defaults => {}
+            _ => {}
+        },
+        OutputMode::Json => render_json("config", event, false),
+    }
 }
 
 pub fn render_identity(identity: &AuthorIdentity, mode: OutputMode, action: &str) {

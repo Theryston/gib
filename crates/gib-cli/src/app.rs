@@ -6,8 +6,35 @@ use std::process::ExitCode;
 pub fn run() -> ExitCode {
     let cli = input::parse();
     let mode = cli.mode;
-    let Some(command) = cli.command else {
+    if cli.command.is_none() {
         input::print_help();
+        return ExitCode::SUCCESS;
+    }
+
+    let current_directory = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(_) => {
+            let error = CommandError::Sdk(gib::SdkError::InvalidRequest {
+                field: "starting_directory",
+                reason: "could not determine the current directory",
+            });
+            output::render_error(&error, error.code(), mode);
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let configuration =
+        match commands::resolve_configuration(cli.configuration_request(current_directory)) {
+            Ok(configuration) => configuration,
+            Err(error) => {
+                output::render_error(&error, error.code(), mode);
+                return ExitCode::from(error.exit_code());
+            }
+        };
+    if !configuration.source().is_default() {
+        output::render_configuration_source(&configuration, mode);
+    }
+
+    let Some(command) = cli.command else {
         return ExitCode::SUCCESS;
     };
 
@@ -57,6 +84,7 @@ impl CommandError {
                 | gib::SdkError::InvalidRequest { .. } => 2,
                 _ => 1,
             },
+            Self::Configuration(_) => 2,
         }
     }
 }

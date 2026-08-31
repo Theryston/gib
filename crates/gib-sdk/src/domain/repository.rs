@@ -306,37 +306,7 @@ impl RepositoryObject {
     /// Creates a safe relative object reference.
     pub fn new(value: impl Into<String>) -> Result<Self, DomainError> {
         let value = value.into();
-        if value.is_empty() || value.len() > Self::MAX_LENGTH {
-            return Err(DomainError::InvalidRepositoryObject {
-                reason: "must contain 1 to 512 ASCII path bytes",
-            });
-        }
-        if value.starts_with('/')
-            || value.ends_with('/')
-            || value.contains("//")
-            || value.contains('\\')
-            || value.contains(':')
-            || value.contains('\0')
-        {
-            return Err(DomainError::InvalidRepositoryObject {
-                reason: "must be a relative slash-separated object key",
-            });
-        }
-        for component in value.split('/') {
-            if component.is_empty() || component == "." || component == ".." {
-                return Err(DomainError::InvalidRepositoryObject {
-                    reason: "must not contain empty, dot, or parent path components",
-                });
-            }
-            if !component
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-            {
-                return Err(DomainError::InvalidRepositoryObject {
-                    reason: "components must contain only ASCII letters, digits, dot, underscore, or hyphen",
-                });
-            }
-        }
+        validate_repository_object(&value)?;
         Ok(Self(value))
     }
 
@@ -344,6 +314,41 @@ impl RepositoryObject {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+pub(crate) fn validate_repository_object(value: &str) -> Result<(), DomainError> {
+    if value.is_empty() || value.len() > RepositoryObject::MAX_LENGTH {
+        return Err(DomainError::InvalidRepositoryObject {
+            reason: "must contain 1 to 512 ASCII path bytes",
+        });
+    }
+    if value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains("//")
+        || value.contains('\\')
+        || value.contains(':')
+        || value.contains('\0')
+    {
+        return Err(DomainError::InvalidRepositoryObject {
+            reason: "must be a relative slash-separated object key",
+        });
+    }
+    for component in value.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(DomainError::InvalidRepositoryObject {
+                reason: "must not contain empty, dot, or parent path components",
+            });
+        }
+        if !component
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(DomainError::InvalidRepositoryObject {
+                reason: "components must contain only ASCII letters, digits, dot, underscore, or hyphen",
+            });
+        }
+    }
+    Ok(())
 }
 
 impl fmt::Display for RepositoryObject {

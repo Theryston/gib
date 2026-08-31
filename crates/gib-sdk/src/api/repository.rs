@@ -15,8 +15,13 @@ use std::fmt;
 use std::sync::Arc;
 
 pub use crate::application::ports::{
-    RepositoryStorage, StorageError, StorageResult, StorageVersion, StorageVersionToken,
-    VersionToken, VersionedObject, VersionedStorageObject,
+    ByteRange, DEFAULT_OBJECT_LIST_PAGE_SIZE, ListCursor, MAX_OBJECT_LIST_PAGE_SIZE, ObjectCursor,
+    ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata, ObjectPrefix, ObjectRange,
+    ObjectRead, ObjectReader, ObjectStorage, ObjectWriteOptions, RepositoryStorage,
+    STORAGE_TRANSFER_BUFFER_SIZE, StorageCapabilities, StorageCapability, StorageError, StorageKey,
+    StorageListPage, StorageListRequest, StorageMetadata, StoragePrefix, StorageRange,
+    StorageReader, StorageResult, StorageVersion, StorageVersionToken, StorageWriteCondition,
+    StorageWriteOptions, VersionToken, VersionedObject, VersionedStorageObject, WriteCondition,
 };
 pub use crate::domain::{
     BackupReference, CURRENT_SNAPSHOT_HISTORY_VERSION, CURRENT_SNAPSHOT_SUMMARY_VERSION,
@@ -40,7 +45,7 @@ pub use crate::domain::{
     RepositoryIdentity, RepositoryKey, RepositoryObject, RepositoryRoots, SnapshotPublication,
     SnapshotPublicationRequest, SnapshotReference,
 };
-pub use crate::infrastructure::storage::{LocalStorage, MemoryStorage};
+pub use crate::infrastructure::storage::{LocalStorage, MemoryStorage, MemoryStorageOperation};
 
 /// A cloneable type-erased handle for a repository storage backend.
 #[derive(Clone)]

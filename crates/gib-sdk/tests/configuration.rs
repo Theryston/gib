@@ -1,6 +1,8 @@
 use gib::{
-    CURRENT_CONFIGURATION_VERSION, Configuration, MAX_CONFIGURATION_BYTES,
-    ProjectConfigurationErrorKind,
+    CURRENT_CONFIGURATION_VERSION, Configuration, ConfigurationFileMetadata,
+    ConfigurationFileSystem, ConfigurationOverrides, ConfigurationResolutionRequest,
+    ConfigurationResolver, ConfigurationSource, LocalConfigurationFileSystem,
+    MAX_CONFIGURATION_BYTES, ProjectConfigurationErrorKind,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -227,6 +229,246 @@ fn oversized_documents_are_rejected_before_toml_allocation() {
         .expect_err("oversized configuration should fail");
     assert_eq!(error.kind(), ProjectConfigurationErrorKind::InputTooLarge);
     assert!(error.field().is_none());
+}
+
+#[test]
+fn nearest_ancestor_configuration_wins_and_reports_its_canonical_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TestDirectory::new();
+    let project = directory.path().join("project");
+    let nested = project.join("src").join("module");
+    fs::create_dir_all(&nested)?;
+    fs::write(
+        directory.path().join("gib.toml"),
+        "version = 1\n[backup]\nmessage = \"root\"\n",
+    )?;
+    let project_config = project.join("gib.toml");
+    fs::write(
+        &project_config,
+        "version = 1\n[backup]\nmessage = \"nearest\"\n",
+    )?;
+
+    let resolved =
+        ConfigurationResolver::default().resolve(ConfigurationResolutionRequest::new(&nested))?;
+
+    assert_eq!(resolved.configuration().backup().message(), Some("nearest"));
+    assert_eq!(
+        resolved.source(),
+        &ConfigurationSource::Discovered(fs::canonicalize(project_config)?)
+    );
+    let event = resolved.source_event();
+    assert!(event.loaded());
+    assert_eq!(event.path(), resolved.path());
+    Ok(())
+}
+
+#[test]
+fn discovery_terminates_at_the_filesystem_root_without_a_configuration_file()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TestDirectory::new();
+    let nested = directory.path().join("one").join("two");
+    fs::create_dir_all(&nested)?;
+
+    let discovered = ConfigurationResolver::default().discover(&nested)?;
+
+    assert!(discovered.is_none());
+    Ok(())
+}
+
+#[test]
+fn explicit_paths_are_canonicalized_and_invalid_targets_are_rejected()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TestDirectory::new();
+    let project = directory.path().join("project");
+    let nested = project.join("src");
+    fs::create_dir_all(&nested)?;
+    let config_path = project.join("gib.toml");
+    fs::write(
+        &config_path,
+        "version = 1\n[repository]\nstorage = \"explicit\"\n",
+    )?;
+
+    let resolved = ConfigurationResolver::default()
+        .resolve(ConfigurationResolutionRequest::new(&nested).with_config_path("../gib.toml"))?;
+    assert_eq!(
+        resolved.source(),
+        &ConfigurationSource::Explicit(fs::canonicalize(config_path)?)
+    );
+    assert_eq!(
+        resolved.configuration().repository().storage(),
+        Some("explicit")
+    );
+
+    let missing = ConfigurationResolver::default()
+        .resolve(ConfigurationResolutionRequest::new(&nested).with_config_path("missing.toml"))
+        .expect_err("missing explicit paths should fail");
+    assert_eq!(missing.kind(), ProjectConfigurationErrorKind::InvalidPath);
+
+    let directory_target = ConfigurationResolver::default()
+        .resolve(ConfigurationResolutionRequest::new(&nested).with_config_path("."))
+        .expect_err("directory explicit paths should fail");
+    assert_eq!(
+        directory_target.kind(),
+        ProjectConfigurationErrorKind::InvalidPath
+    );
+    Ok(())
+}
+
+#[test]
+fn disabled_discovery_uses_defaults_without_reading_an_invalid_file()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TestDirectory::new();
+    let nested = directory.path().join("child");
+    fs::create_dir(&nested)?;
+    fs::write(
+        directory.path().join("gib.toml"),
+        "this is not valid configuration",
+    )?;
+
+    let resolved = ConfigurationResolver::default()
+        .resolve(ConfigurationResolutionRequest::new(&nested).without_config())?;
+
+    assert_eq!(resolved.source(), &ConfigurationSource::Disabled);
+    assert!(resolved.configuration().backup().message().is_none());
+    assert!(resolved.source_event().path().is_none());
+    Ok(())
+}
+
+#[test]
+fn cli_overrides_win_for_every_field_without_discarding_file_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TestDirectory::new();
+    let invocation = directory.path().join("invocation");
+    fs::create_dir(&invocation)?;
+    let config_path = directory.path().join("gib.toml");
+    fs::write(
+        &config_path,
+        r#"version = 1
+
+[repository]
+storage = "file-storage"
+key = "file-key"
+
+[backup]
+root_path = "file-source"
+message = "file-backup"
+compress = 3
+chunk_size = "4096 B"
+concurrency = 2
+ignore = ["z-file", "shared"]
+
+[live]
+message = "file-live"
+debounce_ms = 100
+poll_ms = 200
+
+[restore]
+target_path = "file-restore"
+"#,
+    )?;
+    let overrides = ConfigurationOverrides::new()
+        .with_repository_storage("cli-storage")
+        .with_repository_key("cli-key")
+        .with_backup_root_path("cli-source")
+        .with_backup_message("cli-backup")
+        .with_backup_compress(22)
+        .with_backup_chunk_size("8192 B")
+        .with_backup_concurrency(8)
+        .with_ignore_rules(["cli", "shared"])
+        .with_live_message("cli-live")
+        .with_live_debounce_ms(300)
+        .with_live_poll_ms(400)
+        .with_restore_target_path("cli-restore");
+
+    let resolved = ConfigurationResolver::default().resolve(
+        ConfigurationResolutionRequest::new(&invocation)
+            .with_config_path(&config_path)
+            .with_overrides(overrides),
+    )?;
+    let configuration = resolved.configuration();
+
+    assert_eq!(configuration.repository().storage(), Some("cli-storage"));
+    assert_eq!(configuration.repository().key(), Some("cli-key"));
+    assert_eq!(
+        configuration.backup().root_path(),
+        Some(invocation.join("cli-source").as_path())
+    );
+    assert_eq!(configuration.backup().message(), Some("cli-backup"));
+    assert_eq!(configuration.backup().compress(), Some(22));
+    assert_eq!(
+        configuration.backup().chunk_size().map(|size| size.bytes()),
+        Some(8192)
+    );
+    assert_eq!(configuration.backup().concurrency(), Some(8));
+    assert_eq!(
+        configuration.backup().ignore(),
+        [
+            String::from("cli"),
+            String::from("shared"),
+            String::from("z-file")
+        ]
+        .as_slice()
+    );
+    assert_eq!(configuration.live().message(), Some("cli-live"));
+    assert_eq!(configuration.live().debounce_ms(), Some(300));
+    assert_eq!(configuration.live().poll_ms(), Some(400));
+    assert_eq!(
+        configuration.restore().target_path(),
+        Some(invocation.join("cli-restore").as_path())
+    );
+    Ok(())
+}
+
+#[test]
+fn ignore_rules_are_sorted_and_deduplicated_across_sources() {
+    let merged = gib::merge_ignore_rules(
+        &[String::from("node_modules"), String::from(".git")],
+        &[
+            String::from("coverage"),
+            String::from(".git"),
+            String::from("node_modules"),
+        ],
+    );
+    assert_eq!(merged, [".git", "coverage", "node_modules"]);
+}
+
+#[test]
+fn discovery_uses_the_injected_filesystem_adapter() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = TestDirectory::new();
+    let nested = directory.path().join("nested");
+    fs::create_dir(&nested)?;
+    let config_path = directory.path().join("gib.toml");
+    fs::write(&config_path, "version = 1\n")?;
+    let adapter = RecordingFileSystem {
+        calls: Mutex::new(Vec::new()),
+    };
+
+    let discovered = ConfigurationResolver::new(adapter).discover(&nested)?;
+
+    assert_eq!(discovered, Some(fs::canonicalize(config_path)?));
+    Ok(())
+}
+
+struct RecordingFileSystem {
+    calls: Mutex<Vec<PathBuf>>,
+}
+
+impl ConfigurationFileSystem for RecordingFileSystem {
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+        self.calls
+            .lock()
+            .expect("recording lock should not be poisoned")
+            .push(path.to_path_buf());
+        LocalConfigurationFileSystem.canonicalize(path)
+    }
+
+    fn metadata(&self, path: &Path) -> std::io::Result<ConfigurationFileMetadata> {
+        LocalConfigurationFileSystem.metadata(path)
+    }
+
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        LocalConfigurationFileSystem.read(path)
+    }
 }
 
 fn entries(path: &Path) -> Vec<PathBuf> {

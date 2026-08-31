@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// A failure returned by a global configuration storage adapter.
@@ -33,6 +34,84 @@ impl std::error::Error for ConfigurationError {}
 
 /// Result type returned by global configuration storage adapters.
 pub type ConfigurationResult<T> = std::result::Result<T, ConfigurationError>;
+
+/// Metadata needed to select and safely bound a project configuration file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfigurationFileMetadata {
+    is_file: bool,
+    length: u64,
+}
+
+impl ConfigurationFileMetadata {
+    /// Creates metadata for an inspected filesystem entry.
+    pub const fn new(is_file: bool, length: u64) -> Self {
+        Self { is_file, length }
+    }
+
+    /// Returns whether the inspected entry is a regular file.
+    pub const fn is_file(self) -> bool {
+        self.is_file
+    }
+
+    /// Returns the entry length in bytes.
+    pub const fn length(self) -> u64 {
+        self.length
+    }
+}
+
+/// Filesystem operations required for project configuration discovery.
+///
+/// The resolver receives this capability explicitly, so SDK callers can use a
+/// virtual filesystem or a deterministic test adapter instead of ambient
+/// process state. Implementations should return [`std::io::ErrorKind::NotFound`]
+/// for absent paths so automatic discovery can continue at the next ancestor.
+pub trait ConfigurationFileSystem: Send + Sync {
+    /// Canonicalizes a path without changing the filesystem.
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf>;
+
+    /// Inspects one filesystem entry without reading its contents.
+    fn metadata(&self, path: &Path) -> std::io::Result<ConfigurationFileMetadata>;
+
+    /// Reads one configuration file into memory.
+    ///
+    /// Implementations should bound the returned allocation to the SDK's
+    /// configuration input limit plus one byte.
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>>;
+}
+
+impl<T> ConfigurationFileSystem for Arc<T>
+where
+    T: ConfigurationFileSystem + ?Sized,
+{
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+        self.as_ref().canonicalize(path)
+    }
+
+    fn metadata(&self, path: &Path) -> std::io::Result<ConfigurationFileMetadata> {
+        self.as_ref().metadata(path)
+    }
+
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        self.as_ref().read(path)
+    }
+}
+
+impl<T> ConfigurationFileSystem for &T
+where
+    T: ConfigurationFileSystem + ?Sized,
+{
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+        (*self).canonicalize(path)
+    }
+
+    fn metadata(&self, path: &Path) -> std::io::Result<ConfigurationFileMetadata> {
+        (*self).metadata(path)
+    }
+
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        (*self).read(path)
+    }
+}
 
 /// Storage capability for one bounded, atomically replaced configuration file.
 ///

@@ -1,15 +1,29 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::domain::ValidatedConfiguration;
+pub use crate::application::ports::{ConfigurationFileMetadata, ConfigurationFileSystem};
+use crate::domain::{
+    BackupConfigurationInput, ConfigurationInput, LiveConfigurationInput,
+    RepositoryConfigurationInput, RestoreConfigurationInput, ValidatedConfiguration,
+    validate_configuration,
+};
 use crate::format::{
     ConfigurationDocumentError, ConfigurationDocumentErrorKind,
     MAX_CONFIGURATION_BYTES as MAX_CONFIGURATION_DOCUMENT_BYTES,
 };
 use crate::infrastructure::project_configuration::{
-    ProjectConfigurationLoadError, parse_project_configuration,
+    ProjectConfigurationLoadError, load_project_configuration_with_file_system,
+    parse_project_configuration,
 };
+
+pub use crate::application::ports::{
+    ConfigurationFileMetadata as ProjectConfigurationFileMetadata,
+    ConfigurationFileSystem as ProjectConfigurationFileSystem,
+};
+pub use crate::infrastructure::project_configuration::LocalConfigurationFileSystem;
+pub use crate::infrastructure::project_configuration::LocalConfigurationFileSystem as OsConfigurationFileSystem;
 
 /// The current `gib.toml` schema version supported by this SDK.
 pub const CURRENT_CONFIGURATION_VERSION: u32 = crate::domain::CURRENT_CONFIGURATION_VERSION;
@@ -46,6 +60,678 @@ pub const MAX_BACKUP_CONCURRENCY: usize = crate::domain::MAX_BACKUP_CONCURRENCY;
 
 /// The largest accepted Live interval in milliseconds.
 pub const MAX_LIVE_INTERVAL_MS: u64 = crate::domain::MAX_LIVE_INTERVAL_MS;
+
+/// Selects how a project configuration file is chosen for one invocation.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfigurationSelection {
+    /// Search the supplied starting directory and its ancestors.
+    Discover,
+    /// Load the supplied file after resolving and canonicalizing its path.
+    Explicit(PathBuf),
+    /// Do not inspect or load any project configuration file.
+    Disabled,
+}
+
+impl ConfigurationSelection {
+    /// Selects nearest-file discovery.
+    pub const fn discover() -> Self {
+        Self::Discover
+    }
+
+    /// Selects one explicit configuration path.
+    pub fn explicit(path: impl AsRef<Path>) -> Self {
+        Self::Explicit(path.as_ref().to_path_buf())
+    }
+
+    /// Disables project configuration discovery and loading.
+    pub const fn disabled() -> Self {
+        Self::Disabled
+    }
+
+    /// Returns the explicit path, when this selection uses one.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Explicit(path) => Some(path),
+            Self::Discover | Self::Disabled => None,
+        }
+    }
+
+    /// Returns whether nearest-file discovery is selected.
+    pub const fn is_discovery(&self) -> bool {
+        matches!(self, Self::Discover)
+    }
+
+    /// Returns whether an explicit file is selected.
+    pub const fn is_explicit(&self) -> bool {
+        matches!(self, Self::Explicit(_))
+    }
+
+    /// Returns whether project configuration is disabled.
+    pub const fn is_disabled(&self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+}
+
+/// Identifies the project configuration source used for one resolution.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfigurationSource {
+    /// No file was found and SDK defaults were used.
+    Defaults,
+    /// A file found by nearest-ancestor discovery was used.
+    Discovered(PathBuf),
+    /// A caller-selected file was used.
+    Explicit(PathBuf),
+    /// File loading was disabled for this resolution.
+    Disabled,
+}
+
+impl ConfigurationSource {
+    /// Returns the selected file path, when a file was loaded.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Discovered(path) | Self::Explicit(path) => Some(path),
+            Self::Defaults | Self::Disabled => None,
+        }
+    }
+
+    /// Returns whether a project configuration file was loaded.
+    pub const fn is_loaded(&self) -> bool {
+        matches!(self, Self::Discovered(_) | Self::Explicit(_))
+    }
+
+    /// Returns whether SDK defaults were used because no file was found.
+    pub const fn is_default(&self) -> bool {
+        matches!(self, Self::Defaults)
+    }
+
+    /// Returns whether file loading was explicitly disabled.
+    pub const fn is_disabled(&self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+}
+
+impl fmt::Display for ConfigurationSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Defaults => formatter.write_str("defaults"),
+            Self::Discovered(path) => write!(formatter, "discovered file '{}'", path.display()),
+            Self::Explicit(path) => write!(formatter, "explicit file '{}'", path.display()),
+            Self::Disabled => formatter.write_str("disabled"),
+        }
+    }
+}
+
+/// Structured diagnostic event describing the selected project configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigurationSourceEvent {
+    loaded: bool,
+    path: Option<PathBuf>,
+    source: ConfigurationSource,
+}
+
+impl ConfigurationSourceEvent {
+    fn from_source(source: &ConfigurationSource) -> Self {
+        Self {
+            loaded: source.is_loaded(),
+            path: source.path().map(Path::to_path_buf),
+            source: source.clone(),
+        }
+    }
+
+    /// Returns whether a project configuration file was loaded.
+    pub const fn loaded(&self) -> bool {
+        self.loaded
+    }
+
+    /// Returns the loaded configuration path, when present.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Returns the source classification.
+    pub const fn source(&self) -> &ConfigurationSource {
+        &self.source
+    }
+}
+
+/// Values supplied by a command-line invocation.
+///
+/// The type stores overrides only. It does not read files, consult the current
+/// directory, or apply defaults; [`ConfigurationResolver`] performs that work
+/// after receiving an explicit resolution request.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ConfigurationOverrides {
+    repository_storage: Option<String>,
+    repository_key: Option<String>,
+    backup_root_path: Option<String>,
+    backup_message: Option<String>,
+    backup_compress: Option<i32>,
+    backup_chunk_size: Option<String>,
+    backup_concurrency: Option<usize>,
+    backup_ignore: Vec<String>,
+    live_message: Option<String>,
+    live_debounce_ms: Option<u64>,
+    live_poll_ms: Option<u64>,
+    restore_target_path: Option<String>,
+}
+
+impl ConfigurationOverrides {
+    /// Creates an empty set of command-line overrides.
+    pub const fn new() -> Self {
+        Self {
+            repository_storage: None,
+            repository_key: None,
+            backup_root_path: None,
+            backup_message: None,
+            backup_compress: None,
+            backup_chunk_size: None,
+            backup_concurrency: None,
+            backup_ignore: Vec::new(),
+            live_message: None,
+            live_debounce_ms: None,
+            live_poll_ms: None,
+            restore_target_path: None,
+        }
+    }
+
+    /// Overrides `repository.storage`.
+    pub fn with_repository_storage(mut self, value: impl Into<String>) -> Self {
+        self.repository_storage = Some(value.into());
+        self
+    }
+
+    /// Alias for [`Self::with_repository_storage`].
+    pub fn with_storage(self, value: impl Into<String>) -> Self {
+        self.with_repository_storage(value)
+    }
+
+    /// Overrides `repository.key`.
+    pub fn with_repository_key(mut self, value: impl Into<String>) -> Self {
+        self.repository_key = Some(value.into());
+        self
+    }
+
+    /// Alias for [`Self::with_repository_key`].
+    pub fn with_key(self, value: impl Into<String>) -> Self {
+        self.with_repository_key(value)
+    }
+
+    /// Overrides `backup.root_path`.
+    pub fn with_backup_root_path(mut self, value: impl AsRef<Path>) -> Self {
+        self.backup_root_path = Some(value.as_ref().to_string_lossy().into_owned());
+        self
+    }
+
+    /// Alias for [`Self::with_backup_root_path`].
+    pub fn with_root_path(self, value: impl AsRef<Path>) -> Self {
+        self.with_backup_root_path(value)
+    }
+
+    /// Overrides `backup.message`.
+    pub fn with_backup_message(mut self, value: impl Into<String>) -> Self {
+        self.backup_message = Some(value.into());
+        self
+    }
+
+    /// Alias for [`Self::with_backup_message`].
+    pub fn with_message(self, value: impl Into<String>) -> Self {
+        self.with_backup_message(value)
+    }
+
+    /// Overrides `backup.compress`.
+    pub const fn with_backup_compress(mut self, value: i32) -> Self {
+        self.backup_compress = Some(value);
+        self
+    }
+
+    /// Alias for [`Self::with_backup_compress`].
+    pub const fn with_compress(self, value: i32) -> Self {
+        self.with_backup_compress(value)
+    }
+
+    /// Overrides `backup.chunk_size` with its configuration string.
+    pub fn with_backup_chunk_size(mut self, value: impl Into<String>) -> Self {
+        self.backup_chunk_size = Some(value.into());
+        self
+    }
+
+    /// Alias for [`Self::with_backup_chunk_size`].
+    pub fn with_chunk_size(self, value: impl Into<String>) -> Self {
+        self.with_backup_chunk_size(value)
+    }
+
+    /// Overrides `backup.concurrency`.
+    pub const fn with_backup_concurrency(mut self, value: usize) -> Self {
+        self.backup_concurrency = Some(value);
+        self
+    }
+
+    /// Alias for [`Self::with_backup_concurrency`].
+    pub const fn with_concurrency(self, value: usize) -> Self {
+        self.with_backup_concurrency(value)
+    }
+
+    /// Adds one command-line ignore rule.
+    pub fn with_ignore_rule(mut self, value: impl Into<String>) -> Self {
+        self.backup_ignore.push(value.into());
+        self
+    }
+
+    /// Adds repeated command-line ignore rules.
+    pub fn with_ignore_rules<I, T>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        self.backup_ignore
+            .extend(values.into_iter().map(Into::into));
+        self
+    }
+
+    /// Alias for [`Self::with_ignore_rules`].
+    pub fn with_backup_ignore_rules<I, T>(self, values: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        self.with_ignore_rules(values)
+    }
+
+    /// Overrides `live.message`.
+    pub fn with_live_message(mut self, value: impl Into<String>) -> Self {
+        self.live_message = Some(value.into());
+        self
+    }
+
+    /// Overrides `live.debounce_ms`.
+    pub const fn with_live_debounce_ms(mut self, value: u64) -> Self {
+        self.live_debounce_ms = Some(value);
+        self
+    }
+
+    /// Overrides `live.poll_ms`.
+    pub const fn with_live_poll_ms(mut self, value: u64) -> Self {
+        self.live_poll_ms = Some(value);
+        self
+    }
+
+    /// Overrides `restore.target_path`.
+    pub fn with_restore_target_path(mut self, value: impl AsRef<Path>) -> Self {
+        self.restore_target_path = Some(value.as_ref().to_string_lossy().into_owned());
+        self
+    }
+
+    /// Alias for [`Self::with_restore_target_path`].
+    pub fn with_target_path(self, value: impl AsRef<Path>) -> Self {
+        self.with_restore_target_path(value)
+    }
+
+    /// Returns the `repository.storage` override, when present.
+    pub fn repository_storage(&self) -> Option<&str> {
+        self.repository_storage.as_deref()
+    }
+
+    /// Returns the `repository.key` override, when present.
+    pub fn repository_key(&self) -> Option<&str> {
+        self.repository_key.as_deref()
+    }
+
+    /// Returns the `backup.root_path` override, when present.
+    pub fn backup_root_path(&self) -> Option<&Path> {
+        self.backup_root_path.as_deref().map(Path::new)
+    }
+
+    /// Returns the `backup.message` override, when present.
+    pub fn backup_message(&self) -> Option<&str> {
+        self.backup_message.as_deref()
+    }
+
+    /// Returns the `backup.compress` override, when present.
+    pub const fn backup_compress(&self) -> Option<i32> {
+        self.backup_compress
+    }
+
+    /// Returns the `backup.chunk_size` override, when present.
+    pub fn backup_chunk_size(&self) -> Option<&str> {
+        self.backup_chunk_size.as_deref()
+    }
+
+    /// Returns the `backup.concurrency` override, when present.
+    pub const fn backup_concurrency(&self) -> Option<usize> {
+        self.backup_concurrency
+    }
+
+    /// Returns repeated `backup.ignore` overrides in supplied order.
+    pub fn backup_ignore_rules(&self) -> &[String] {
+        &self.backup_ignore
+    }
+
+    /// Returns the `live.message` override, when present.
+    pub fn live_message(&self) -> Option<&str> {
+        self.live_message.as_deref()
+    }
+
+    /// Returns the `live.debounce_ms` override, when present.
+    pub const fn live_debounce_ms(&self) -> Option<u64> {
+        self.live_debounce_ms
+    }
+
+    /// Returns the `live.poll_ms` override, when present.
+    pub const fn live_poll_ms(&self) -> Option<u64> {
+        self.live_poll_ms
+    }
+
+    /// Returns the `restore.target_path` override, when present.
+    pub fn restore_target_path(&self) -> Option<&Path> {
+        self.restore_target_path.as_deref().map(Path::new)
+    }
+
+    /// Returns whether no override has been supplied.
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Inputs used to resolve one command's effective configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigurationResolutionRequest {
+    starting_directory: PathBuf,
+    selection: ConfigurationSelection,
+    overrides: ConfigurationOverrides,
+}
+
+impl ConfigurationResolutionRequest {
+    /// Creates a request using nearest-file discovery and no CLI overrides.
+    pub fn new(starting_directory: impl AsRef<Path>) -> Self {
+        Self {
+            starting_directory: starting_directory.as_ref().to_path_buf(),
+            selection: ConfigurationSelection::Discover,
+            overrides: ConfigurationOverrides::default(),
+        }
+    }
+
+    /// Returns the directory from which discovery and relative CLI paths start.
+    pub fn starting_directory(&self) -> &Path {
+        &self.starting_directory
+    }
+
+    /// Returns the file-selection policy.
+    pub const fn selection(&self) -> &ConfigurationSelection {
+        &self.selection
+    }
+
+    /// Returns the command-line overrides.
+    pub const fn overrides(&self) -> &ConfigurationOverrides {
+        &self.overrides
+    }
+
+    /// Selects an explicit configuration file.
+    pub fn with_config_path(mut self, path: impl AsRef<Path>) -> Self {
+        self.selection = ConfigurationSelection::explicit(path);
+        self
+    }
+
+    /// Alias for [`Self::with_config_path`].
+    pub fn with_explicit_path(self, path: impl AsRef<Path>) -> Self {
+        self.with_config_path(path)
+    }
+
+    /// Disables project configuration loading.
+    pub fn without_config(mut self) -> Self {
+        self.selection = ConfigurationSelection::Disabled;
+        self
+    }
+
+    /// Alias for [`Self::without_config`].
+    pub fn no_config(self) -> Self {
+        self.without_config()
+    }
+
+    /// Replaces the file-selection policy.
+    pub fn with_selection(mut self, selection: ConfigurationSelection) -> Self {
+        self.selection = selection;
+        self
+    }
+
+    /// Replaces the command-line override set.
+    pub fn with_overrides(mut self, overrides: ConfigurationOverrides) -> Self {
+        self.overrides = overrides;
+        self
+    }
+}
+
+/// Effective project configuration and the source selected to produce it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedConfiguration {
+    configuration: ProjectConfiguration,
+    source: ConfigurationSource,
+}
+
+impl ResolvedConfiguration {
+    fn new(configuration: ProjectConfiguration, source: ConfigurationSource) -> Self {
+        Self {
+            configuration,
+            source,
+        }
+    }
+
+    /// Returns the effective configuration after defaults, file values, and
+    /// command-line overrides have been applied.
+    pub const fn configuration(&self) -> &ProjectConfiguration {
+        &self.configuration
+    }
+
+    /// Alias for [`Self::configuration`].
+    pub const fn config(&self) -> &ProjectConfiguration {
+        self.configuration()
+    }
+
+    /// Returns the selected configuration source.
+    pub const fn source(&self) -> &ConfigurationSource {
+        &self.source
+    }
+
+    /// Returns the selected configuration file path, when a file was loaded.
+    pub fn path(&self) -> Option<&Path> {
+        self.source.path()
+    }
+
+    /// Creates the structured diagnostic event for this resolution.
+    pub fn source_event(&self) -> ConfigurationSourceEvent {
+        ConfigurationSourceEvent::from_source(&self.source)
+    }
+}
+
+/// Alias for [`ResolvedConfiguration`].
+pub type ConfigurationResolution = ResolvedConfiguration;
+
+/// Resolves project configuration through an injected filesystem adapter.
+pub struct ConfigurationResolver<F = LocalConfigurationFileSystem> {
+    file_system: F,
+}
+
+impl<F> ConfigurationResolver<F>
+where
+    F: ConfigurationFileSystem,
+{
+    /// Creates a resolver using the supplied filesystem capability.
+    pub const fn new(file_system: F) -> Self {
+        Self { file_system }
+    }
+
+    /// Finds the nearest canonical `gib.toml` at or above `start_directory`.
+    pub fn discover(
+        &self,
+        start_directory: impl AsRef<Path>,
+    ) -> Result<Option<PathBuf>, ProjectConfigurationError> {
+        discover_with_file_system(&self.file_system, start_directory.as_ref())
+    }
+
+    /// Applies selection, file loading, defaults, and CLI overrides.
+    pub fn resolve(
+        &self,
+        request: ConfigurationResolutionRequest,
+    ) -> Result<ResolvedConfiguration, ProjectConfigurationError> {
+        let (configuration, source) = match &request.selection {
+            ConfigurationSelection::Disabled => (
+                ProjectConfiguration::default(),
+                ConfigurationSource::Disabled,
+            ),
+            ConfigurationSelection::Discover => match self.discover(&request.starting_directory)? {
+                Some(path) => (self.load(&path)?, ConfigurationSource::Discovered(path)),
+                None => (
+                    ProjectConfiguration::default(),
+                    ConfigurationSource::Defaults,
+                ),
+            },
+            ConfigurationSelection::Explicit(path) => {
+                let requested_path = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    request.starting_directory.join(path)
+                };
+                let canonical_path = self.canonicalize_explicit(&requested_path)?;
+                (
+                    self.load(&canonical_path)?,
+                    ConfigurationSource::Explicit(canonical_path),
+                )
+            }
+        };
+        let configuration =
+            configuration.with_overrides(&request.overrides, &request.starting_directory)?;
+        Ok(ResolvedConfiguration::new(configuration, source))
+    }
+
+    fn canonicalize_explicit(&self, path: &Path) -> Result<PathBuf, ProjectConfigurationError> {
+        let canonical_path = self.file_system.canonicalize(path).map_err(|_| {
+            ProjectConfigurationError::new(
+                ProjectConfigurationErrorKind::InvalidPath,
+                Some(path),
+                None,
+                "the path does not exist or could not be canonicalized",
+            )
+        })?;
+        let metadata = self.file_system.metadata(&canonical_path).map_err(|_| {
+            ProjectConfigurationError::new(
+                ProjectConfigurationErrorKind::InvalidPath,
+                Some(&canonical_path),
+                None,
+                "the path could not be inspected",
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(ProjectConfigurationError::new(
+                ProjectConfigurationErrorKind::InvalidPath,
+                Some(&canonical_path),
+                None,
+                "the path must identify a regular file",
+            ));
+        }
+        Ok(canonical_path)
+    }
+
+    fn load(&self, path: &Path) -> Result<ProjectConfiguration, ProjectConfigurationError> {
+        load_project_configuration_with_file_system(&self.file_system, path)
+            .map(ProjectConfiguration::from_validated)
+            .map_err(map_load_error)
+    }
+}
+
+impl Default for ConfigurationResolver<LocalConfigurationFileSystem> {
+    fn default() -> Self {
+        Self::new(LocalConfigurationFileSystem)
+    }
+}
+
+/// Finds the nearest canonical `gib.toml` using the host filesystem.
+pub fn discover_configuration(
+    start_directory: impl AsRef<Path>,
+) -> Result<Option<PathBuf>, ProjectConfigurationError> {
+    ConfigurationResolver::default().discover(start_directory)
+}
+
+/// Finds the nearest canonical `gib.toml` using an injected filesystem.
+pub fn discover_configuration_with_file_system<F>(
+    file_system: &F,
+    start_directory: impl AsRef<Path>,
+) -> Result<Option<PathBuf>, ProjectConfigurationError>
+where
+    F: ConfigurationFileSystem + ?Sized,
+{
+    discover_with_file_system(file_system, start_directory.as_ref())
+}
+
+/// Resolves configuration using the host filesystem.
+pub fn resolve_configuration(
+    request: ConfigurationResolutionRequest,
+) -> Result<ResolvedConfiguration, ProjectConfigurationError> {
+    ConfigurationResolver::default().resolve(request)
+}
+
+/// Resolves configuration using an injected filesystem.
+pub fn resolve_configuration_with_file_system<F>(
+    file_system: F,
+    request: ConfigurationResolutionRequest,
+) -> Result<ResolvedConfiguration, ProjectConfigurationError>
+where
+    F: ConfigurationFileSystem,
+{
+    ConfigurationResolver::new(file_system).resolve(request)
+}
+
+fn discover_with_file_system<F>(
+    file_system: &F,
+    start_directory: &Path,
+) -> Result<Option<PathBuf>, ProjectConfigurationError>
+where
+    F: ConfigurationFileSystem + ?Sized,
+{
+    let mut directory = file_system.canonicalize(start_directory).map_err(|error| {
+        ProjectConfigurationError::new(
+            ProjectConfigurationErrorKind::Io,
+            Some(start_directory),
+            None,
+            format!("could not canonicalize the starting directory: {error}"),
+        )
+    })?;
+
+    loop {
+        let candidate = directory.join(GIB_CONFIGURATION_FILE_NAME);
+        match file_system.metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() => {
+                let canonical_path = file_system.canonicalize(&candidate).map_err(|error| {
+                    ProjectConfigurationError::new(
+                        ProjectConfigurationErrorKind::Io,
+                        Some(&candidate),
+                        None,
+                        format!("could not canonicalize the discovered file: {error}"),
+                    )
+                })?;
+                return Ok(Some(canonical_path));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ProjectConfigurationError::new(
+                    ProjectConfigurationErrorKind::Io,
+                    Some(&candidate),
+                    None,
+                    format!("could not inspect the candidate file: {error}"),
+                ));
+            }
+        }
+
+        let Some(parent) = directory.parent() else {
+            return Ok(None);
+        };
+        if parent == directory {
+            return Ok(None);
+        }
+        directory = parent.to_path_buf();
+    }
+}
 
 /// Categories of failures returned while reading or validating `gib.toml`.
 #[non_exhaustive]
@@ -115,6 +801,23 @@ impl ProjectConfigurationError {
     /// Returns the stable error category.
     pub const fn kind(&self) -> ProjectConfigurationErrorKind {
         self.kind
+    }
+
+    /// Returns the stable machine-readable configuration error code.
+    pub const fn code(&self) -> &'static str {
+        match self.kind {
+            ProjectConfigurationErrorKind::Io => "configuration_io",
+            ProjectConfigurationErrorKind::InputTooLarge => "configuration_input_too_large",
+            ProjectConfigurationErrorKind::Parse => "configuration_parse",
+            ProjectConfigurationErrorKind::MissingField => "configuration_missing_field",
+            ProjectConfigurationErrorKind::UnknownField => "configuration_unknown_field",
+            ProjectConfigurationErrorKind::InvalidType => "configuration_invalid_type",
+            ProjectConfigurationErrorKind::InvalidValue => "configuration_invalid_value",
+            ProjectConfigurationErrorKind::UnsupportedVersion => {
+                "configuration_unsupported_version"
+            }
+            ProjectConfigurationErrorKind::InvalidPath => "configuration_invalid_path",
+        }
     }
 
     /// Returns the configuration file involved in the failure, when one was
@@ -316,6 +1019,72 @@ impl ProjectConfiguration {
         &self.restore
     }
 
+    /// Applies command-line overrides using the supplied invocation directory
+    /// for relative CLI paths.
+    pub fn with_overrides(
+        &self,
+        overrides: &ConfigurationOverrides,
+        invocation_directory: impl AsRef<Path>,
+    ) -> Result<Self, ProjectConfigurationError> {
+        let invocation_directory = invocation_directory.as_ref();
+        let mut input = input_from_configuration(self);
+
+        if let Some(value) = &overrides.repository_storage {
+            input.repository.storage = Some(value.clone());
+        }
+        if let Some(value) = &overrides.repository_key {
+            input.repository.key = Some(value.clone());
+        }
+        if let Some(value) = &overrides.backup_root_path {
+            input.backup.root_path = Some(resolve_cli_path(value, invocation_directory));
+        }
+        if let Some(value) = &overrides.backup_message {
+            input.backup.message = Some(value.clone());
+        }
+        if let Some(value) = overrides.backup_compress {
+            input.backup.compress = Some(value);
+        }
+        if let Some(value) = &overrides.backup_chunk_size {
+            input.backup.chunk_size = Some(value.clone());
+        }
+        if let Some(value) = overrides.backup_concurrency {
+            input.backup.concurrency = Some(value);
+        }
+        input.backup.ignore = merge_ignore_rules(&self.backup.ignore, &overrides.backup_ignore);
+        if let Some(value) = &overrides.live_message {
+            input.live.message = Some(value.clone());
+        }
+        if let Some(value) = overrides.live_debounce_ms {
+            input.live.debounce_ms = Some(value);
+        }
+        if let Some(value) = overrides.live_poll_ms {
+            input.live.poll_ms = Some(value);
+        }
+        if let Some(value) = &overrides.restore_target_path {
+            input.restore.target_path = Some(resolve_cli_path(value, invocation_directory));
+        }
+
+        validate_configuration(input, Path::new(""))
+            .map(Self::from_validated)
+            .map_err(|error| {
+                ProjectConfigurationError::new(
+                    ProjectConfigurationErrorKind::InvalidValue,
+                    None,
+                    Some(error.field().to_owned()),
+                    error.reason(),
+                )
+            })
+    }
+
+    /// Alias for [`Self::with_overrides`].
+    pub fn merge(
+        &self,
+        overrides: &ConfigurationOverrides,
+        invocation_directory: impl AsRef<Path>,
+    ) -> Result<Self, ProjectConfigurationError> {
+        self.with_overrides(overrides, invocation_directory)
+    }
+
     fn from_validated(configuration: ValidatedConfiguration) -> Self {
         Self {
             version: configuration.version,
@@ -353,6 +1122,81 @@ impl ProjectConfiguration {
             },
         }
     }
+}
+
+fn input_from_configuration(configuration: &ProjectConfiguration) -> ConfigurationInput {
+    ConfigurationInput {
+        version: configuration.version,
+        repository: RepositoryConfigurationInput {
+            storage: configuration.repository.storage.clone(),
+            key: configuration.repository.key.clone(),
+        },
+        backup: BackupConfigurationInput {
+            root_path: configuration
+                .backup
+                .root_path
+                .as_deref()
+                .map(path_to_string),
+            message: configuration.backup.message.clone(),
+            compress: configuration.backup.compress,
+            chunk_size: configuration
+                .backup
+                .chunk_size
+                .map(|value| format!("{} B", value.bytes())),
+            concurrency: configuration.backup.concurrency,
+            ignore: configuration.backup.ignore.clone(),
+        },
+        live: LiveConfigurationInput {
+            message: configuration.live.message.clone(),
+            debounce_ms: configuration
+                .live
+                .debounce
+                .map(|value| value.as_millis() as u64),
+            poll_ms: configuration
+                .live
+                .poll
+                .map(|value| value.as_millis() as u64),
+        },
+        restore: RestoreConfigurationInput {
+            target_path: configuration
+                .restore
+                .target_path
+                .as_deref()
+                .map(path_to_string),
+        },
+    }
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn resolve_cli_path(value: &str, invocation_directory: &Path) -> String {
+    if value.is_empty() {
+        return String::new();
+    }
+    let path = Path::new(value);
+    if path.is_absolute() {
+        path_to_string(path)
+    } else {
+        path_to_string(&invocation_directory.join(path))
+    }
+}
+
+/// Merges file and command-line ignore rules in deterministic sorted order.
+pub fn merge_ignore_rules(config_values: &[String], cli_values: &[String]) -> Vec<String> {
+    config_values
+        .iter()
+        .chain(cli_values)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Alias for [`merge_ignore_rules`].
+pub fn merge_ignore_patterns(config_values: &[String], cli_values: &[String]) -> Vec<String> {
+    merge_ignore_rules(config_values, cli_values)
 }
 
 impl Default for ProjectConfiguration {
@@ -618,6 +1462,26 @@ impl super::client::Client {
         config_directory: impl AsRef<Path>,
     ) -> Result<ProjectConfiguration, ProjectConfigurationError> {
         parse_configuration(contents, config_directory)
+    }
+
+    /// Resolves project configuration using the host filesystem.
+    pub fn resolve_configuration(
+        &self,
+        request: ConfigurationResolutionRequest,
+    ) -> Result<ResolvedConfiguration, ProjectConfigurationError> {
+        resolve_configuration(request)
+    }
+
+    /// Resolves project configuration through an injected filesystem adapter.
+    pub fn resolve_configuration_with_file_system<F>(
+        &self,
+        file_system: F,
+        request: ConfigurationResolutionRequest,
+    ) -> Result<ResolvedConfiguration, ProjectConfigurationError>
+    where
+        F: ConfigurationFileSystem,
+    {
+        resolve_configuration_with_file_system(file_system, request)
     }
 }
 

@@ -1,5 +1,8 @@
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
-use gib::{DEFAULT_SNAPSHOT_PAGE_SIZE, SnapshotCursor};
+use gib::{
+    ConfigurationOverrides, ConfigurationResolutionRequest, ConfigurationSelection,
+    DEFAULT_SNAPSHOT_PAGE_SIZE, SnapshotCursor,
+};
 #[cfg(test)]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -19,6 +22,115 @@ pub struct Cli {
         help = "Output mode: interactive or json."
     )]
     pub mode: OutputMode,
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        conflicts_with = "no_config",
+        help = "Use a specific local gib.toml file."
+    )]
+    pub config: Option<PathBuf>,
+    #[arg(
+        long = "no-config",
+        global = true,
+        action = clap::ArgAction::SetTrue,
+        conflicts_with = "config",
+        help = "Disable local gib.toml discovery."
+    )]
+    pub no_config: bool,
+    #[arg(
+        short = 's',
+        long,
+        global = true,
+        value_name = "NAME",
+        help = "Override repository.storage."
+    )]
+    pub storage: Option<String>,
+    #[arg(
+        short = 'k',
+        long,
+        global = true,
+        value_name = "KEY",
+        help = "Override repository.key."
+    )]
+    pub key: Option<String>,
+    #[arg(
+        short = 'r',
+        long = "root-path",
+        global = true,
+        value_name = "PATH",
+        help = "Override backup.root_path."
+    )]
+    pub root_path: Option<String>,
+    #[arg(
+        short = 'm',
+        long,
+        global = true,
+        value_name = "MESSAGE",
+        help = "Override backup.message."
+    )]
+    pub message: Option<String>,
+    #[arg(
+        short = 'c',
+        long = "compress",
+        visible_alias = "compression",
+        global = true,
+        value_name = "LEVEL",
+        help = "Override backup.compress."
+    )]
+    pub compress: Option<i32>,
+    #[arg(
+        short = 'z',
+        long = "chunk-size",
+        global = true,
+        value_name = "SIZE",
+        help = "Override backup.chunk_size."
+    )]
+    pub chunk_size: Option<String>,
+    #[arg(
+        short = 'i',
+        long,
+        global = true,
+        value_name = "N",
+        help = "Override backup.concurrency."
+    )]
+    pub concurrency: Option<usize>,
+    #[arg(
+        long,
+        global = true,
+        action = clap::ArgAction::Append,
+        value_name = "PATTERN",
+        help = "Add a backup.ignore rule; may be repeated."
+    )]
+    pub ignore: Vec<String>,
+    #[arg(
+        long = "live-message",
+        global = true,
+        value_name = "MESSAGE",
+        help = "Override live.message."
+    )]
+    pub live_message: Option<String>,
+    #[arg(
+        long = "debounce-ms",
+        global = true,
+        value_name = "MILLISECONDS",
+        help = "Override live.debounce_ms."
+    )]
+    pub debounce_ms: Option<u64>,
+    #[arg(
+        long = "poll-ms",
+        global = true,
+        value_name = "MILLISECONDS",
+        help = "Override live.poll_ms."
+    )]
+    pub poll_ms: Option<u64>,
+    #[arg(
+        long = "target-path",
+        global = true,
+        value_name = "PATH",
+        help = "Override restore.target_path."
+    )]
+    pub target_path: Option<String>,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -27,6 +139,61 @@ pub struct Cli {
 pub enum OutputMode {
     Interactive,
     Json,
+}
+
+impl Cli {
+    pub fn configuration_request(
+        &self,
+        starting_directory: impl AsRef<Path>,
+    ) -> ConfigurationResolutionRequest {
+        let selection = if self.no_config {
+            ConfigurationSelection::disabled()
+        } else if let Some(path) = &self.config {
+            ConfigurationSelection::explicit(path)
+        } else {
+            ConfigurationSelection::discover()
+        };
+
+        let mut overrides = ConfigurationOverrides::new();
+        if let Some(value) = &self.storage {
+            overrides = overrides.with_repository_storage(value.clone());
+        }
+        if let Some(value) = &self.key {
+            overrides = overrides.with_repository_key(value.clone());
+        }
+        if let Some(value) = &self.root_path {
+            overrides = overrides.with_backup_root_path(value);
+        }
+        if let Some(value) = &self.message {
+            overrides = overrides.with_backup_message(value.clone());
+        }
+        if let Some(value) = self.compress {
+            overrides = overrides.with_backup_compress(value);
+        }
+        if let Some(value) = &self.chunk_size {
+            overrides = overrides.with_backup_chunk_size(value.clone());
+        }
+        if let Some(value) = self.concurrency {
+            overrides = overrides.with_backup_concurrency(value);
+        }
+        overrides = overrides.with_ignore_rules(self.ignore.clone());
+        if let Some(value) = &self.live_message {
+            overrides = overrides.with_live_message(value.clone());
+        }
+        if let Some(value) = self.debounce_ms {
+            overrides = overrides.with_live_debounce_ms(value);
+        }
+        if let Some(value) = self.poll_ms {
+            overrides = overrides.with_live_poll_ms(value);
+        }
+        if let Some(value) = &self.target_path {
+            overrides = overrides.with_restore_target_path(value);
+        }
+
+        ConfigurationResolutionRequest::new(starting_directory)
+            .with_selection(selection)
+            .with_overrides(overrides)
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -254,5 +421,86 @@ mod tests {
             .expect("valid interactive whoami input");
         assert_eq!(cli.mode, OutputMode::Interactive);
         assert!(matches!(cli.command, Some(Command::Whoami(_))));
+    }
+
+    #[test]
+    fn parses_global_configuration_selection_and_all_override_values() {
+        let cli = parse_from(arguments(&[
+            "gib",
+            "--config",
+            "/tmp/project/gib.toml",
+            "--storage",
+            "cli-storage",
+            "--key",
+            "cli-key",
+            "--root-path",
+            "source",
+            "--message",
+            "backup",
+            "--compress",
+            "22",
+            "--chunk-size",
+            "8 KiB",
+            "--concurrency",
+            "8",
+            "--ignore",
+            ".git",
+            "--ignore",
+            "target",
+            "--live-message",
+            "live",
+            "--debounce-ms",
+            "100",
+            "--poll-ms",
+            "200",
+            "--target-path",
+            "restore",
+            "whoami",
+        ]))
+        .expect("valid configuration overrides");
+
+        let request = cli.configuration_request(Path::new("/tmp/project"));
+        assert!(request.selection().is_explicit());
+        assert_eq!(
+            request.selection().path(),
+            Some(Path::new("/tmp/project/gib.toml"))
+        );
+        assert_eq!(
+            request.overrides().repository_storage(),
+            Some("cli-storage")
+        );
+        assert_eq!(request.overrides().repository_key(), Some("cli-key"));
+        assert_eq!(
+            request.overrides().backup_root_path(),
+            Some(Path::new("source"))
+        );
+        assert_eq!(request.overrides().backup_message(), Some("backup"));
+        assert_eq!(request.overrides().backup_compress(), Some(22));
+        assert_eq!(request.overrides().backup_chunk_size(), Some("8 KiB"));
+        assert_eq!(request.overrides().backup_concurrency(), Some(8));
+        assert_eq!(
+            request.overrides().backup_ignore_rules(),
+            [String::from(".git"), String::from("target")].as_slice()
+        );
+        assert_eq!(request.overrides().live_message(), Some("live"));
+        assert_eq!(request.overrides().live_debounce_ms(), Some(100));
+        assert_eq!(request.overrides().live_poll_ms(), Some(200));
+        assert_eq!(
+            request.overrides().restore_target_path(),
+            Some(Path::new("restore"))
+        );
+    }
+
+    #[test]
+    fn clap_rejects_config_and_no_config_together() {
+        let error = parse_from(arguments(&[
+            "gib",
+            "--config",
+            "/tmp/project/gib.toml",
+            "--no-config",
+            "whoami",
+        ]))
+        .expect_err("configuration selection flags must conflict");
+        assert_eq!(error.exit_code(), 2);
     }
 }

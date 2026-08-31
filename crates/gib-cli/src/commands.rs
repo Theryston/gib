@@ -3,7 +3,10 @@ pub mod log;
 pub mod resolve;
 pub mod whoami;
 
-use gib::{LocalStorage, Repository, RepositoryOpenRequest, SdkError, StorageError};
+use gib::{
+    ConfigurationResolutionRequest, LocalStorage, ProjectConfigurationError, Repository,
+    RepositoryOpenRequest, ResolvedConfiguration, SdkError, StorageError,
+};
 use std::fmt;
 use std::path::Path;
 
@@ -11,6 +14,7 @@ use std::path::Path;
 pub enum CommandError {
     Storage(StorageError),
     Sdk(SdkError),
+    Configuration(ProjectConfigurationError),
 }
 
 impl CommandError {
@@ -18,6 +22,7 @@ impl CommandError {
         match self {
             Self::Storage(_) => "storage_failure",
             Self::Sdk(error) => error.code().as_str(),
+            Self::Configuration(error) => error.code(),
         }
     }
 }
@@ -27,11 +32,18 @@ impl fmt::Display for CommandError {
         match self {
             Self::Storage(error) => error.fmt(formatter),
             Self::Sdk(error) => error.fmt(formatter),
+            Self::Configuration(error) => error.fmt(formatter),
         }
     }
 }
 
 impl std::error::Error for CommandError {}
+
+pub fn resolve_configuration(
+    request: ConfigurationResolutionRequest,
+) -> Result<ResolvedConfiguration, CommandError> {
+    gib::resolve_configuration(request).map_err(CommandError::Configuration)
+}
 
 pub fn open_repository(path: &Path) -> Result<Repository, CommandError> {
     let storage = LocalStorage::new(path).map_err(CommandError::Storage)?;

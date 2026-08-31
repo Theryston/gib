@@ -127,6 +127,9 @@ fn validate_existing_head(storage: &dyn RepositoryStorage) -> Result<(), Reposit
         ) => Err(RepositoryError::Storage {
             operation: "read_head",
         }),
+        _ => Err(RepositoryError::Storage {
+            operation: "read_head",
+        }),
     }
 }
 
@@ -155,6 +158,9 @@ pub(crate) fn read_head(storage: &dyn RepositoryStorage) -> Result<HeadRead, Rep
             })
         }
         Err(StorageError::ConditionNotMet) => Err(RepositoryError::Storage {
+            operation: "read_head",
+        }),
+        _ => Err(RepositoryError::Storage {
             operation: "read_head",
         }),
     }
@@ -197,6 +203,11 @@ pub(crate) fn publish_head(
                 operation: "validate_snapshot",
             });
         }
+        _ => {
+            return Err(RepositoryError::Storage {
+                operation: "validate_snapshot",
+            });
+        }
     }
     for object in publication.required_objects() {
         if !seen.insert(object.as_str()) {
@@ -222,6 +233,11 @@ pub(crate) fn publish_head(
                     operation: "validate_publication",
                 });
             }
+            _ => {
+                return Err(RepositoryError::Storage {
+                    operation: "validate_publication",
+                });
+            }
         }
     }
 
@@ -235,7 +251,9 @@ pub(crate) fn publish_head(
     let version =
         match storage.conditional_write(HEAD_OBJECT_KEY, expected.version.as_ref(), &head_bytes) {
             Ok(version) => version,
-            Err(StorageError::ConditionNotMet) => return Err(RepositoryError::PublicationConflict),
+            Err(StorageError::ConditionNotMet | StorageError::Conflict) => {
+                return Err(RepositoryError::PublicationConflict);
+            }
             Err(StorageError::UnsupportedCapability) => {
                 return Err(RepositoryError::UnsupportedCapability);
             }
@@ -250,6 +268,11 @@ pub(crate) fn publish_head(
                 | StorageError::Io
                 | StorageError::Unavailable,
             ) => {
+                return Err(RepositoryError::Storage {
+                    operation: "publish_head",
+                });
+            }
+            _ => {
                 return Err(RepositoryError::Storage {
                     operation: "publish_head",
                 });
@@ -594,6 +617,7 @@ fn map_storage_error(error: StorageError, operation: &'static str) -> Repository
         | StorageError::Io
         | StorageError::Unavailable
         | StorageError::ConditionNotMet => RepositoryError::Storage { operation },
+        _ => RepositoryError::Storage { operation },
     }
 }
 
@@ -638,6 +662,9 @@ fn map_create_error(error: StorageError, _object: &'static str) -> RepositoryErr
         | StorageError::InvalidVersion => RepositoryError::Storage {
             operation: "create",
         },
+        _ => RepositoryError::Storage {
+            operation: "create",
+        },
     }
 }
 
@@ -653,6 +680,7 @@ fn map_read_error(error: StorageError, _object: &'static str) -> RepositoryError
         | StorageError::UnsupportedCapability
         | StorageError::ConditionNotMet
         | StorageError::InvalidVersion => RepositoryError::Storage { operation: "read" },
+        _ => RepositoryError::Storage { operation: "read" },
     }
 }
 
@@ -671,6 +699,7 @@ fn ensure_absent(
             | StorageError::ConditionNotMet
             | StorageError::InvalidVersion,
         ) => Err(RepositoryError::Storage { operation: "read" }),
+        _ => Err(RepositoryError::Storage { operation: "read" }),
     }
 }
 

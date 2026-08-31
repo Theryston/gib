@@ -107,11 +107,118 @@ fn json_whoami_reports_a_typed_not_configured_error() {
     assert!(!whoami.stderr.contains("config.msgpack"));
 }
 
+#[test]
+fn json_config_selection_reports_explicit_and_disabled_sources() {
+    let directory = TestDirectory::new();
+    let parent = directory.path().join("parent");
+    let child = parent.join("child");
+    fs::create_dir_all(&child).expect("test tree should be created");
+    let parent_config = parent.join("gib.toml");
+    fs::write(
+        &parent_config,
+        "version = 1\n[backup]\nmessage = \"parent\"\n",
+    )
+    .expect("parent config should be written");
+    fs::write(
+        child.join("gib.toml"),
+        "version = 1\n[backup]\nmessage = \"child\"\n",
+    )
+    .expect("child config should be written");
+
+    let explicit_arguments = vec![
+        String::from("--mode"),
+        String::from("json"),
+        String::from("--config"),
+        parent_config.display().to_string(),
+        String::from("config"),
+        String::from("--author"),
+        String::from("Jane Doe <jane@example.com>"),
+    ];
+    let explicit = run_in(child.as_path(), &explicit_arguments);
+    assert!(explicit.status.success(), "{explicit:?}");
+    let explicit_lines = parse_json_lines(&explicit.stdout);
+    assert_eq!(explicit_lines[0]["type"], "config");
+    assert_eq!(explicit_lines[0]["data"]["loaded"], true);
+    assert_eq!(explicit_lines[0]["data"]["source"], "explicit");
+    assert_eq!(
+        explicit_lines[0]["data"]["path"],
+        fs::canonicalize(&parent_config)
+            .expect("config path should canonicalize")
+            .display()
+            .to_string()
+    );
+    assert_eq!(explicit_lines[1]["type"], "output");
+
+    let disabled_arguments = vec![
+        String::from("--mode"),
+        String::from("json"),
+        String::from("--no-config"),
+        String::from("config"),
+        String::from("--author"),
+        String::from("Jane Doe <jane@example.com>"),
+    ];
+    let disabled = run_in(child.as_path(), &disabled_arguments);
+    assert!(disabled.status.success(), "{disabled:?}");
+    let disabled_lines = parse_json_lines(&disabled.stdout);
+    assert_eq!(disabled_lines[0]["type"], "config");
+    assert_eq!(disabled_lines[0]["data"]["loaded"], false);
+    assert_eq!(disabled_lines[0]["data"]["source"], "disabled");
+    assert!(disabled_lines[0]["data"]["path"].is_null());
+    assert_eq!(disabled_lines[1]["type"], "output");
+}
+
+#[test]
+fn json_discovery_reports_the_nearest_configuration_file() {
+    let directory = TestDirectory::new();
+    let parent = directory.path().join("parent");
+    let child = parent.join("child");
+    fs::create_dir_all(&child).expect("test tree should be created");
+    fs::write(
+        parent.join("gib.toml"),
+        "version = 1\n[backup]\nmessage = \"parent\"\n",
+    )
+    .expect("parent config should be written");
+    let child_config = child.join("gib.toml");
+    fs::write(
+        &child_config,
+        "version = 1\n[backup]\nmessage = \"child\"\n",
+    )
+    .expect("child config should be written");
+
+    let arguments = vec![
+        String::from("--mode"),
+        String::from("json"),
+        String::from("config"),
+        String::from("--author"),
+        String::from("Jane Doe <jane@example.com>"),
+    ];
+    let output = run_in(child.as_path(), &arguments);
+    assert!(output.status.success(), "{output:?}");
+    let lines = parse_json_lines(&output.stdout);
+    assert_eq!(lines[0]["type"], "config");
+    assert_eq!(
+        lines[0]["data"]["path"],
+        fs::canonicalize(child_config)
+            .expect("config path should canonicalize")
+            .display()
+            .to_string()
+    );
+}
+
 fn run(home: &Path, arguments: &[&str]) -> OutputText {
+    let arguments = arguments
+        .iter()
+        .map(|argument| (*argument).to_owned())
+        .collect::<Vec<_>>();
+    run_in(home, &arguments)
+}
+
+fn run_in(directory: &Path, arguments: &[String]) -> OutputText {
     let output = Command::new(env!("CARGO_BIN_EXE_gib"))
         .args(arguments)
-        .env("HOME", home)
-        .env("USERPROFILE", home)
+        .current_dir(directory)
+        .env("HOME", directory)
+        .env("USERPROFILE", directory)
         .output()
         .expect("gib binary should run");
     OutputText::from(output)
@@ -121,6 +228,13 @@ fn parse_single_json(value: &str) -> Value {
     let lines = value.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 1, "expected one JSON line, got {value:?}");
     serde_json::from_str(lines[0]).expect("output should be valid JSON")
+}
+
+fn parse_json_lines(value: &str) -> Vec<Value> {
+    value
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("output should be valid JSON"))
+        .collect()
 }
 
 struct OutputText {

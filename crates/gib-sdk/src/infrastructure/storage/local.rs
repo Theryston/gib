@@ -1,12 +1,15 @@
 use crate::application::ports::{
-    RepositoryStorage, StorageError, StorageResult, StorageVersion, VersionedObject,
+    ObjectCursor, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata, ObjectRange,
+    ObjectRead, ObjectWriteOptions, RepositoryStorage, STORAGE_TRANSFER_BUFFER_SIZE,
+    StorageCapabilities, StorageError, StorageResult, StorageVersion, StorageWriteCondition,
+    VersionedObject, copy_stream, read_stream_to_vec,
 };
 use crate::domain::RepositoryObject;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -40,9 +43,9 @@ impl LocalStorage {
         if root.as_os_str().is_empty() {
             return Err(StorageError::InvalidObjectKey);
         }
-        fs::create_dir_all(&root).map_err(|_| StorageError::Io)?;
+        fs::create_dir_all(&root).map_err(map_io_error)?;
         ensure_directory_is_safe(&root)?;
-        let lock_root = fs::canonicalize(&root).map_err(|_| StorageError::Io)?;
+        let lock_root = fs::canonicalize(&root).map_err(map_io_error)?;
         let cas_lock = lock_for_root(&lock_root)?;
         Ok(Self {
             state: Arc::new(LocalStorageState {
@@ -83,54 +86,10 @@ impl Eq for LocalStorage {}
 
 impl RepositoryStorage for LocalStorage {
     fn create_if_absent(&self, object_key: &str, contents: &[u8]) -> StorageResult<()> {
-        let _guard = self
-            .state
-            .cas_lock
-            .lock()
-            .map_err(|_| StorageError::Unavailable)?;
-        let path = self.object_path(object_key, true)?;
-        let filename = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .ok_or(StorageError::InvalidObjectKey)?;
-        let temporary_name = format!(
-            ".{filename}.gib-tmp-{}-{}",
-            std::process::id(),
-            NEXT_TEMP_OBJECT_ID.fetch_add(1, Ordering::Relaxed)
-        );
-        let temporary_path = path.with_file_name(temporary_name);
-        let mut file = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary_path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(StorageError::AlreadyExists);
-            }
-            Err(_) => return Err(StorageError::Io),
-        };
-
-        if file.write_all(contents).is_err() || file.sync_all().is_err() {
-            drop(file);
-            let _ = fs::remove_file(&temporary_path);
-            return Err(StorageError::Io);
-        }
-        drop(file);
-
-        let link_result = fs::hard_link(&temporary_path, &path);
-        let remove_result = fs::remove_file(&temporary_path);
-        if let Err(error) = link_result {
-            let _ = remove_result;
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                return Err(StorageError::AlreadyExists);
-            }
-            return Err(StorageError::Io);
-        }
-        if remove_result.is_err() {
-            return Err(StorageError::Io);
-        }
-        sync_parent(path.parent())
+        let key = ObjectKey::new(object_key)?;
+        let mut source = Cursor::new(contents);
+        self.write_stream(&key, &mut source, ObjectWriteOptions::if_absent())
+            .map(|_| ())
     }
 
     fn read(&self, object_key: &str) -> StorageResult<Vec<u8>> {
@@ -140,6 +99,127 @@ impl RepositoryStorage for LocalStorage {
             return Err(StorageError::InvalidObjectKey);
         }
         fs::read(path).map_err(map_io_error)
+    }
+
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities::ALL
+    }
+
+    fn read_stream(&self, object_key: &ObjectKey) -> StorageResult<ObjectRead> {
+        let mut file = self.open_object_file(object_key)?;
+        let size = file.metadata().map_err(map_io_error)?.len();
+        let version = version_for_file(&mut file)?;
+        file.seek(SeekFrom::Start(0)).map_err(map_io_error)?;
+        let metadata = ObjectMetadata::new(object_key.clone(), size, Some(version));
+        Ok(ObjectRead::new(metadata, file))
+    }
+
+    fn read_range(&self, object_key: &ObjectKey, range: ObjectRange) -> StorageResult<ObjectRead> {
+        let mut file = self.open_object_file(object_key)?;
+        let size = file.metadata().map_err(map_io_error)?.len();
+        if range.end() > size {
+            return Err(StorageError::InvalidRange);
+        }
+        let version = version_for_file(&mut file)?;
+        file.seek(SeekFrom::Start(range.start()))
+            .map_err(map_io_error)?;
+        let metadata = ObjectMetadata::new(object_key.clone(), size, Some(version));
+        let reader = LimitedFileReader {
+            file,
+            remaining: range.length(),
+        };
+        Ok(ObjectRead::new(metadata, reader))
+    }
+
+    fn metadata(&self, object_key: &ObjectKey) -> StorageResult<ObjectMetadata> {
+        let mut file = self.open_object_file(object_key)?;
+        let size = file.metadata().map_err(map_io_error)?.len();
+        let version = version_for_file(&mut file)?;
+        Ok(ObjectMetadata::new(object_key.clone(), size, Some(version)))
+    }
+
+    fn write_stream(
+        &self,
+        object_key: &ObjectKey,
+        source: &mut dyn Read,
+        options: ObjectWriteOptions,
+    ) -> StorageResult<ObjectMetadata> {
+        let _guard = self
+            .state
+            .cas_lock
+            .lock()
+            .map_err(|_| StorageError::Unavailable)?;
+        let _file_lock = acquire_cas_file_lock(&self.state.lock_root)?;
+        let path = self.object_path(object_key.as_str(), true)?;
+        let current_version = current_version_for_path(&path)?;
+        match options.condition() {
+            StorageWriteCondition::Any => {}
+            StorageWriteCondition::IfAbsent if current_version.is_some() => {
+                return Err(StorageError::AlreadyExists);
+            }
+            StorageWriteCondition::IfAbsent => {}
+            StorageWriteCondition::IfVersion(expected)
+                if current_version.as_ref() == Some(expected) => {}
+            StorageWriteCondition::IfVersion(_) => return Err(StorageError::Conflict),
+        }
+
+        let temporary_path = write_temporary_stream(&path, source, options.expected_size())?;
+        let version = match version_for_path(&temporary_path) {
+            Ok(version) => version,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary_path);
+                return Err(error);
+            }
+        };
+        let size = match fs::metadata(&temporary_path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                let _ = fs::remove_file(&temporary_path);
+                return Err(map_io_error(error));
+            }
+        };
+
+        let publish_result = match options.condition() {
+            StorageWriteCondition::IfAbsent => fs::hard_link(&temporary_path, &path),
+            StorageWriteCondition::Any | StorageWriteCondition::IfVersion(_) => {
+                replace_file(&temporary_path, &path)
+            }
+        };
+        if let Err(error) = publish_result {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(match (options.condition(), error.kind()) {
+                (StorageWriteCondition::IfAbsent, std::io::ErrorKind::AlreadyExists) => {
+                    StorageError::AlreadyExists
+                }
+                (StorageWriteCondition::IfVersion(_), std::io::ErrorKind::AlreadyExists) => {
+                    StorageError::Conflict
+                }
+                (_, _) => map_io_error(error),
+            });
+        }
+        if matches!(options.condition(), StorageWriteCondition::IfAbsent)
+            && fs::remove_file(&temporary_path).is_err()
+        {
+            return Err(StorageError::Io);
+        }
+        sync_parent(path.parent())?;
+        Ok(ObjectMetadata::new(object_key.clone(), size, Some(version)))
+    }
+
+    fn delete(&self, object_key: &ObjectKey) -> StorageResult<()> {
+        let _guard = self
+            .state
+            .cas_lock
+            .lock()
+            .map_err(|_| StorageError::Unavailable)?;
+        let _file_lock = acquire_cas_file_lock(&self.state.lock_root)?;
+        let path = self.object_path(object_key.as_str(), false)?;
+        let metadata = fs::symlink_metadata(&path).map_err(map_io_error)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StorageError::InvalidObjectKey);
+        }
+        fs::remove_file(&path).map_err(map_io_error)?;
+        sync_parent(path.parent())
     }
 
     fn list_objects(&self, prefix: &str) -> StorageResult<Vec<String>> {
@@ -152,9 +232,47 @@ impl RepositoryStorage for LocalStorage {
         Ok(object_keys)
     }
 
+    fn list_page(&self, request: &ObjectListRequest) -> StorageResult<ObjectListPage> {
+        request.validate()?;
+        let mut object_keys = Vec::new();
+        collect_object_keys(
+            &self.state.root,
+            &self.state.root,
+            request.prefix().as_str(),
+            &mut object_keys,
+        )?;
+        object_keys.sort();
+        let cursor = request.cursor().map(|value| value.as_str());
+        let mut objects: Vec<ObjectMetadata> = Vec::with_capacity(request.limit());
+        let mut next_cursor = None;
+        for object_key in object_keys {
+            if cursor.is_some_and(|value| object_key.as_str() <= value) {
+                continue;
+            }
+            if objects.len() == request.limit() {
+                let last_key = objects
+                    .last()
+                    .map(|object| object.key().as_str().to_owned())
+                    .ok_or(StorageError::Unavailable)?;
+                next_cursor = Some(ObjectCursor::new(last_key)?);
+                break;
+            }
+            let key = ObjectKey::new(object_key)?;
+            objects.push(self.metadata(&key)?);
+        }
+        Ok(ObjectListPage::new(objects, next_cursor))
+    }
+
     fn read_with_version(&self, object_key: &str) -> StorageResult<VersionedObject> {
-        let contents = self.read(object_key)?;
-        let version = version_for_contents(&contents)?;
+        let key = ObjectKey::new(object_key)?;
+        let mut object = self.read_stream(&key)?;
+        let version = object
+            .metadata()
+            .version()
+            .cloned()
+            .ok_or(StorageError::InvalidVersion)?;
+        let size = object.metadata().size();
+        let contents = read_stream_to_vec(object.reader(), Some(size))?;
         Ok(VersionedObject::new(contents, version))
     }
 
@@ -164,46 +282,22 @@ impl RepositoryStorage for LocalStorage {
         expected: Option<&StorageVersion>,
         contents: &[u8],
     ) -> StorageResult<StorageVersion> {
-        let _guard = self
-            .state
-            .cas_lock
-            .lock()
-            .map_err(|_| StorageError::Unavailable)?;
-        let _file_lock = acquire_cas_file_lock(&self.state.lock_root)?;
-        let path = self.object_path(object_key, true)?;
-        let current = match fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
-                    return Err(StorageError::InvalidObjectKey);
-                }
-                Some(fs::read(&path).map_err(map_io_error)?)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(map_io_error(error)),
+        let key = ObjectKey::new(object_key)?;
+        let mut source = Cursor::new(contents);
+        let options = match expected {
+            Some(version) => ObjectWriteOptions::if_version(version.clone()),
+            None => ObjectWriteOptions::if_absent(),
         };
-        let current_version = current.as_deref().map(version_for_contents).transpose()?;
-        if current_version.as_ref() != expected {
-            return Err(StorageError::ConditionNotMet);
-        }
-
-        let temporary_path = write_temporary_file(&path, contents)?;
-        let write_result = if expected.is_none() {
-            fs::hard_link(&temporary_path, &path)
-        } else {
-            replace_file(&temporary_path, &path)
-        };
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&temporary_path);
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                return Err(StorageError::ConditionNotMet);
+        match self.write_stream(&key, &mut source, options) {
+            Ok(metadata) => metadata
+                .version()
+                .cloned()
+                .ok_or(StorageError::InvalidVersion),
+            Err(StorageError::AlreadyExists | StorageError::Conflict) => {
+                Err(StorageError::ConditionNotMet)
             }
-            return Err(StorageError::Io);
+            Err(error) => Err(error),
         }
-        if expected.is_none() && fs::remove_file(&temporary_path).is_err() {
-            return Err(StorageError::Io);
-        }
-        sync_parent(path.parent())?;
-        version_for_contents(contents)
     }
 }
 
@@ -267,14 +361,14 @@ fn ensure_directory_is_safe(path: &Path) -> StorageResult<()> {
 }
 
 fn map_io_error(error: std::io::Error) -> StorageError {
-    match error.kind() {
-        std::io::ErrorKind::NotFound => StorageError::NotFound,
-        std::io::ErrorKind::AlreadyExists => StorageError::AlreadyExists,
-        _ => StorageError::Io,
-    }
+    StorageError::from_io_error(&error)
 }
 
-fn write_temporary_file(path: &Path, contents: &[u8]) -> StorageResult<PathBuf> {
+fn write_temporary_stream(
+    path: &Path,
+    source: &mut dyn Read,
+    expected_size: Option<u64>,
+) -> StorageResult<PathBuf> {
     let filename = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -290,18 +384,100 @@ fn write_temporary_file(path: &Path, contents: &[u8]) -> StorageResult<PathBuf> 
         .create_new(true)
         .open(&temporary_path)
         .map_err(map_io_error)?;
-    if file.write_all(contents).is_err() || file.sync_all().is_err() {
+    if let Err(error) = copy_stream(source, &mut file, expected_size) {
         drop(file);
         let _ = fs::remove_file(&temporary_path);
-        return Err(StorageError::Io);
+        return Err(error);
+    }
+    if let Err(error) = file.sync_all() {
+        drop(file);
+        let _ = fs::remove_file(&temporary_path);
+        return Err(map_io_error(error));
     }
     drop(file);
     Ok(temporary_path)
 }
 
-fn version_for_contents(contents: &[u8]) -> StorageResult<StorageVersion> {
-    let digest = Sha256::digest(contents);
-    StorageVersion::from_bytes(digest.to_vec())
+fn version_for_file(file: &mut File) -> StorageResult<StorageVersion> {
+    file.seek(SeekFrom::Start(0)).map_err(map_io_error)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; STORAGE_TRANSFER_BUFFER_SIZE];
+    loop {
+        let read = file.read(&mut buffer).map_err(map_io_error)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    file.seek(SeekFrom::Start(0)).map_err(map_io_error)?;
+    StorageVersion::from_bytes(digest.finalize().to_vec())
+}
+
+fn version_for_path(path: &Path) -> StorageResult<StorageVersion> {
+    let mut file = open_file_at_path(path)?;
+    version_for_file(&mut file)
+}
+
+fn current_version_for_path(path: &Path) -> StorageResult<Option<StorageVersion>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(StorageError::InvalidObjectKey);
+            }
+            version_for_path(path).map(Some)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(map_io_error(error)),
+    }
+}
+
+impl LocalStorage {
+    fn open_object_file(&self, object_key: &ObjectKey) -> StorageResult<File> {
+        let path = self.object_path(object_key.as_str(), false)?;
+        open_file_at_path(&path)
+    }
+}
+
+fn open_file_at_path(path: &Path) -> StorageResult<File> {
+    let metadata = fs::symlink_metadata(path).map_err(map_io_error)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(StorageError::InvalidObjectKey);
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(map_io_error)?;
+    let metadata = file.metadata().map_err(map_io_error)?;
+    if !metadata.is_file() {
+        return Err(StorageError::InvalidObjectKey);
+    }
+    Ok(file)
+}
+
+struct LimitedFileReader {
+    file: File,
+    remaining: u64,
+}
+
+impl Read for LimitedFileReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 || buffer.is_empty() {
+            return Ok(0);
+        }
+        let amount = self
+            .remaining
+            .min(u64::try_from(buffer.len()).unwrap_or(u64::MAX));
+        let amount = usize::try_from(amount).unwrap_or(buffer.len());
+        let read = self.file.read(&mut buffer[..amount])?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "storage object changed during range read",
+            ));
+        }
+        self.remaining = self.remaining.saturating_sub(read as u64);
+        Ok(read)
+    }
 }
 
 fn collect_object_keys(
@@ -335,7 +511,7 @@ fn collect_object_keys(
         if path
             .file_name()
             .and_then(|value| value.to_str())
-            .is_some_and(|value| value.contains(".gib-tmp-"))
+            .is_some_and(|value| value.contains(".gib-tmp-") || value == ".gib-head-cas.lock")
         {
             continue;
         }
@@ -344,7 +520,10 @@ fn collect_object_keys(
             continue;
         }
         let prefix_with_separator = format!("{prefix}/");
-        if object_key == prefix || object_key.starts_with(&prefix_with_separator) {
+        if prefix.is_empty()
+            || object_key == prefix
+            || object_key.starts_with(&prefix_with_separator)
+        {
             object_keys.push(object_key);
         }
     }

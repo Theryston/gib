@@ -11,6 +11,7 @@ pub(crate) use configuration::{
     RepositoryConfigurationInput, RestoreConfigurationInput, ValidatedConfiguration,
     validate_configuration,
 };
+pub(crate) use repository::validate_repository_object;
 pub use repository::{
     CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
     CURRENT_REPOSITORY_FORMAT_VERSION, CURRENT_REPOSITORY_HEAD_VERSION, DomainError,
