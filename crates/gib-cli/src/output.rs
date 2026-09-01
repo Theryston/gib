@@ -550,37 +550,28 @@ pub fn render_storage_list(result: &StorageListResult, mode: OutputMode) {
                 interactive::info("No storages configured yet.");
                 return;
             }
-            println!(
-                "  {}  {}  {}  {}  {}",
-                dialoguer::console::style("NAME").black().bright(),
-                dialoguer::console::style("BACKEND").black().bright(),
-                dialoguer::console::style("LOCATION").black().bright(),
-                dialoguer::console::style("HEALTH").black().bright(),
-                dialoguer::console::style("CREDENTIALS").black().bright()
+            let rows = storages
+                .iter()
+                .map(|storage| {
+                    let location = storage_location(storage);
+                    let health = if storage.health == "healthy" {
+                        "● healthy".to_owned()
+                    } else {
+                        "not checked".to_owned()
+                    };
+                    vec![
+                        shorten(&storage.name, 18),
+                        storage.backend.clone(),
+                        shorten(&location, 34),
+                        health,
+                        storage_credentials_label(storage).to_owned(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            interactive::table(
+                &["NAME", "BACKEND", "LOCATION", "HEALTH", "CREDENTIALS"],
+                &rows,
             );
-            println!(
-                "  {}",
-                dialoguer::console::style(
-                    "────────────────────────────────────────────────────────"
-                )
-                .cyan()
-            );
-            for storage in &storages {
-                let location = storage_location(storage);
-                let health = if storage.health == "healthy" {
-                    dialoguer::console::style("● healthy").green().to_string()
-                } else {
-                    "– not checked".to_owned()
-                };
-                println!(
-                    "  {:<18} {:<8} {:<34} {:<14} {}",
-                    shorten(&storage.name, 18),
-                    storage.backend,
-                    shorten(&location, 34),
-                    health,
-                    storage_credentials_label(storage)
-                );
-            }
             interactive::success(
                 &format!(
                     "{} storage{} configured",
@@ -710,7 +701,7 @@ fn storage_card_fields(storage: &StorageOutput) -> Vec<(&'static str, String)> {
 fn storage_health_label(storage: &StorageOutput) -> String {
     match storage.health.as_str() {
         "healthy" => "● healthy".to_owned(),
-        _ => "– not checked".to_owned(),
+        _ => "not checked".to_owned(),
     }
 }
 

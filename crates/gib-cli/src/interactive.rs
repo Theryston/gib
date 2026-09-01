@@ -306,6 +306,79 @@ pub fn steps(title: &str, items: &[&str]) {
     }
 }
 
+pub fn table(headers: &[&str], rows: &[Vec<String>]) {
+    if headers.is_empty() {
+        return;
+    }
+    let headers = headers
+        .iter()
+        .map(|header| single_line(header))
+        .collect::<Vec<_>>();
+    let rows = rows
+        .iter()
+        .map(|row| row.iter().map(|cell| single_line(cell)).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let widths = table_column_widths(&headers, &rows);
+
+    println!("  {}", format_table_row(&headers, &widths, true));
+    println!(
+        "  {}",
+        dialoguer::console::style(format_table_separator(&widths)).cyan()
+    );
+    for row in &rows {
+        println!("  {}", format_table_row(row, &widths, false));
+    }
+}
+
+fn table_column_widths(headers: &[String], rows: &[Vec<String>]) -> Vec<usize> {
+    let mut widths = headers
+        .iter()
+        .map(|header| text_width(header))
+        .collect::<Vec<_>>();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate().take(widths.len()) {
+            widths[index] = widths[index].max(text_width(cell));
+        }
+    }
+    widths
+}
+
+fn format_table_row(values: &[String], widths: &[usize], header: bool) -> String {
+    let mut row = String::new();
+    for (index, width) in widths.iter().enumerate() {
+        if index > 0 {
+            row.push_str("  ");
+        }
+        let value = values.get(index).map_or("", String::as_str);
+        let value = pad_to_width(value, *width);
+        let styled = if header {
+            dialoguer::console::style(value)
+                .black()
+                .bright()
+                .to_string()
+        } else {
+            dialoguer::console::style(value).white().to_string()
+        };
+        row.push_str(&styled);
+    }
+    row
+}
+
+fn format_table_separator(widths: &[usize]) -> String {
+    widths
+        .iter()
+        .map(|width| "─".repeat(*width))
+        .collect::<Vec<_>>()
+        .join("──")
+}
+
+fn pad_to_width(value: &str, width: usize) -> String {
+    format!(
+        "{value}{}",
+        " ".repeat(width.saturating_sub(text_width(value)))
+    )
+}
+
 fn print_box_top(title: &str, total_width: usize) {
     let title_width = text_width(title);
     let dash_count = total_width.saturating_sub(title_width + 5).max(1);

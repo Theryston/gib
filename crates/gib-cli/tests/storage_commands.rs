@@ -95,6 +95,35 @@ fn local_storage_can_be_added_interactively_with_prompts() {
     assert!(stdout.contains("Review before saving"));
     assert!(stdout.contains("Added storage 'interactive' (local)"));
     assert!(output.stderr.is_empty());
+
+    let listed = run(directory.path(), &["storage", "list"]);
+    assert!(listed.status.success(), "{listed:?}");
+    let listed_stdout = String::from_utf8_lossy(&listed.stdout);
+    let header = listed_stdout
+        .lines()
+        .find(|line| line.contains("NAME") && line.contains("CREDENTIALS"))
+        .expect("storage table header should be rendered");
+    let row = listed_stdout
+        .lines()
+        .find(|line| line.contains("interactive") && line.contains("not checked"))
+        .expect("storage table row should be rendered");
+    for (header_value, row_value) in [
+        ("NAME", "interactive"),
+        ("BACKEND", "local"),
+        ("HEALTH", "not checked"),
+        ("CREDENTIALS", "not required"),
+    ] {
+        assert_eq!(
+            visual_position(header, header_value),
+            visual_position(row, row_value),
+            "column {header_value} should align"
+        );
+    }
+}
+
+fn visual_position(line: &str, value: &str) -> Option<usize> {
+    let start = line.find(value)?;
+    Some(dialoguer::console::measure_text_width(&line[..start]))
 }
 
 #[test]
