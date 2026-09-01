@@ -44,6 +44,10 @@ pub fn text(prompt: &str) -> Result<String, SdkError> {
     text_with_default(prompt, None, false)
 }
 
+pub fn newline() {
+    println!();
+}
+
 pub fn text_with_default(
     prompt: &str,
     default: Option<&str>,
@@ -260,6 +264,46 @@ pub fn card(title: &str, fields: &[(&str, String)]) {
         );
     }
     print_box_bottom(total_width);
+}
+
+pub fn code_block(title: &str, lines: &[&str]) {
+    let title = single_line(title);
+    let lines = lines
+        .iter()
+        .map(|line| single_line(line))
+        .collect::<Vec<_>>();
+    let content_width = lines
+        .iter()
+        .map(|line| text_width(line))
+        .max()
+        .unwrap_or(0)
+        .max(text_width(&title) + 2)
+        .max(24);
+    let total_width = content_width + 4;
+
+    print_box_top(&title, total_width);
+    for line in &lines {
+        let padding = " ".repeat(content_width.saturating_sub(text_width(line)));
+        println!(
+            "{} {}{} {}",
+            dialoguer::console::style("│").cyan(),
+            dialoguer::console::style(line).yellow(),
+            padding,
+            dialoguer::console::style("│").cyan()
+        );
+    }
+    print_box_bottom(total_width);
+}
+
+pub fn steps(title: &str, items: &[&str]) {
+    section(title, None);
+    for item in items {
+        println!(
+            "  {} {}",
+            dialoguer::console::style("→").cyan().bold(),
+            single_line(item)
+        );
+    }
 }
 
 fn print_box_top(title: &str, total_width: usize) {

@@ -257,7 +257,10 @@ pub fn render_error(
 ) {
     match mode {
         OutputMode::Interactive => {
-            interactive::error("Command failed", &error.to_string(), code, field)
+            interactive::error("Command failed", &error.to_string(), code, field);
+            if code == "storage_credential_store_failure" {
+                render_credential_store_guidance();
+            }
         }
         OutputMode::Json => {
             render_json(
@@ -270,6 +273,77 @@ pub fn render_error(
                 true,
             );
         }
+    }
+}
+
+struct CredentialStoreGuidance {
+    summary: &'static str,
+    commands: Option<&'static [&'static str]>,
+    steps: &'static [&'static str],
+}
+
+fn render_credential_store_guidance() {
+    let Some(guidance) = platform_credential_store_guidance() else {
+        return;
+    };
+    interactive::warning(guidance.summary);
+    interactive::newline();
+    if let Some(commands) = guidance.commands {
+        interactive::code_block("Install it with:", commands);
+    }
+    interactive::steps("Next steps", guidance.steps);
+    interactive::newline();
+    interactive::warning("Plaintext credential files are intentionally unsupported.");
+}
+
+fn platform_credential_store_guidance() -> Option<CredentialStoreGuidance> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(CredentialStoreGuidance {
+            summary: "Gib could not access the Linux secure credential store: the `secret-tool` command is required.",
+            commands: Some(&[
+                "sudo apt update",
+                "sudo apt install libsecret-tools gnome-keyring",
+            ]),
+            steps: &[
+                "Ensure GNOME Keyring or another Secret Service is running.",
+                "Retry `gib storage add`.",
+            ],
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(CredentialStoreGuidance {
+            summary: "Gib could not access the macOS Keychain.",
+            commands: None,
+            steps: &[
+                "Open Keychain Access from Applications → Utilities.",
+                "Select the login keychain and unlock it.",
+                "Retry `gib storage add` and allow Gib to access the keychain.",
+            ],
+        })
+    }
+    #[cfg(windows)]
+    {
+        Some(CredentialStoreGuidance {
+            summary: "Gib could not access Windows Credential Manager.",
+            commands: None,
+            steps: &[
+                "Open Start → Credential Manager.",
+                "Open Windows Credentials and verify that the credential service is available.",
+                "Retry `gib storage add` and approve any security prompt.",
+            ],
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        Some(CredentialStoreGuidance {
+            summary: "This operating system has no supported secure credential-store integration.",
+            commands: None,
+            steps: &[
+                "Run Gib on Linux, macOS, or Windows with its secure credential store available.",
+            ],
+        })
     }
 }
 
@@ -697,4 +771,25 @@ fn one_line(value: &str, max_chars: usize) -> String {
         })
         .take(max_chars)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::platform_credential_store_guidance;
+
+    #[test]
+    fn credential_store_failure_has_platform_guidance() {
+        let guidance = platform_credential_store_guidance();
+        assert!(guidance.is_some());
+
+        #[cfg(target_os = "linux")]
+        assert!(guidance.is_some_and(|guidance| {
+            guidance.summary.contains("secret-tool")
+                && guidance.commands.is_some_and(|commands| {
+                    commands
+                        .iter()
+                        .any(|command| command.contains("libsecret-tools"))
+                })
+        }));
+    }
 }
