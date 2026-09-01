@@ -738,6 +738,17 @@ pub enum StorageBackendKind {
     WebDav,
 }
 
+impl fmt::Display for StorageBackendKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Local => "local",
+            Self::S3 => "s3",
+            Self::WebDav => "webdav",
+        };
+        formatter.write_str(value)
+    }
+}
+
 impl fmt::Debug for StorageBackend {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -868,12 +879,469 @@ impl fmt::Debug for StorageConfiguration {
     }
 }
 
+/// The result of a storage connectivity check.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum StorageHealth {
+    /// The configured backend accepted a read-only validation request.
+    Healthy,
+    /// Connectivity was not requested for this result.
+    NotChecked,
+}
+
+impl StorageHealth {
+    /// Returns whether the backend was checked successfully.
+    pub const fn is_healthy(self) -> bool {
+        matches!(self, Self::Healthy)
+    }
+}
+
+impl fmt::Display for StorageHealth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Healthy => "healthy",
+            Self::NotChecked => "not_checked",
+        })
+    }
+}
+
+/// A validated request to add or explicitly replace a named storage.
+#[derive(Clone, Eq, PartialEq)]
+pub struct StorageAddRequest {
+    name: StorageName,
+    configuration: StorageConfiguration,
+    replace_existing: bool,
+}
+
+impl StorageAddRequest {
+    /// Creates a request from a validated name and configuration.
+    pub fn new(
+        name: impl Into<String>,
+        configuration: StorageConfiguration,
+    ) -> StorageConfigurationResult<Self> {
+        Ok(Self {
+            name: StorageName::new(name)?,
+            configuration,
+            replace_existing: false,
+        })
+    }
+
+    /// Creates a validated local-storage request.
+    pub fn local(
+        name: impl Into<String>,
+        root: impl AsRef<Path>,
+    ) -> StorageConfigurationResult<Self> {
+        Self::new(name, StorageConfiguration::local(root)?)
+    }
+
+    /// Creates a validated S3-storage request.
+    pub fn s3(
+        name: impl Into<String>,
+        settings: S3StorageSettings,
+        credentials: S3StorageCredentials,
+    ) -> StorageConfigurationResult<Self> {
+        Self::new(name, StorageConfiguration::s3(settings, credentials)?)
+    }
+
+    /// Creates a validated WebDAV-storage request.
+    pub fn webdav(
+        name: impl Into<String>,
+        settings: WebDavStorageSettings,
+        credentials: WebDavStorageCredentials,
+    ) -> StorageConfigurationResult<Self> {
+        Self::new(name, StorageConfiguration::webdav(settings, credentials)?)
+    }
+
+    /// Creates a request using the explicit `for_*` naming convention.
+    pub fn for_local(
+        name: impl Into<String>,
+        root: impl AsRef<Path>,
+    ) -> StorageConfigurationResult<Self> {
+        Self::local(name, root)
+    }
+
+    /// Creates a request using the explicit `for_*` naming convention.
+    pub fn for_s3(
+        name: impl Into<String>,
+        settings: S3StorageSettings,
+        credentials: S3StorageCredentials,
+    ) -> StorageConfigurationResult<Self> {
+        Self::s3(name, settings, credentials)
+    }
+
+    /// Creates a request using the explicit `for_*` naming convention.
+    pub fn for_webdav(
+        name: impl Into<String>,
+        settings: WebDavStorageSettings,
+        credentials: WebDavStorageCredentials,
+    ) -> StorageConfigurationResult<Self> {
+        Self::webdav(name, settings, credentials)
+    }
+
+    /// Requires an existing name to be replaced instead of rejected.
+    pub const fn with_replacement(mut self, replace_existing: bool) -> Self {
+        self.replace_existing = replace_existing;
+        self
+    }
+
+    /// Marks this request as an explicit replacement.
+    pub const fn replace_existing(mut self) -> Self {
+        self.replace_existing = true;
+        self
+    }
+
+    /// Returns the validated storage name.
+    pub const fn name(&self) -> &StorageName {
+        &self.name
+    }
+
+    /// Returns the validated backend configuration.
+    pub const fn configuration(&self) -> &StorageConfiguration {
+        &self.configuration
+    }
+
+    /// Returns whether an existing name may be replaced.
+    pub const fn replaces_existing(&self) -> bool {
+        self.replace_existing
+    }
+
+    /// Consumes the request into its validated parts.
+    pub fn into_parts(self) -> (StorageName, StorageConfiguration, bool) {
+        (self.name, self.configuration, self.replace_existing)
+    }
+}
+
+impl fmt::Debug for StorageAddRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StorageAddRequest")
+            .field("name", &self.name)
+            .field("configuration", &self.configuration)
+            .field("replace_existing", &self.replace_existing)
+            .finish()
+    }
+}
+
+/// Options for listing named storage configurations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StorageConfigurationListRequest {
+    check_health: bool,
+}
+
+impl StorageConfigurationListRequest {
+    /// Creates a metadata-only list request.
+    pub const fn new() -> Self {
+        Self {
+            check_health: false,
+        }
+    }
+
+    /// Requests a read-only connectivity check for every listed storage.
+    pub const fn with_health_check(mut self, check_health: bool) -> Self {
+        self.check_health = check_health;
+        self
+    }
+
+    /// Requests a read-only connectivity check for every listed storage.
+    pub const fn check_health(self) -> Self {
+        self.with_health_check(true)
+    }
+
+    /// Returns whether health checks were requested.
+    pub const fn checks_health(self) -> bool {
+        self.check_health
+    }
+}
+
+/// A validated request to remove one named storage configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageRemoveRequest {
+    name: StorageName,
+}
+
+impl StorageRemoveRequest {
+    /// Creates a request from a storage name.
+    pub fn new(name: impl Into<String>) -> StorageConfigurationResult<Self> {
+        Ok(Self {
+            name: StorageName::new(name)?,
+        })
+    }
+
+    /// Returns the validated storage name.
+    pub const fn name(&self) -> &StorageName {
+        &self.name
+    }
+
+    /// Consumes the request and returns its name.
+    pub fn into_name(self) -> StorageName {
+        self.name
+    }
+}
+
+/// Non-secret metadata for one configured storage.
+#[derive(Clone, Eq, PartialEq)]
+pub struct StorageConfigurationMetadata {
+    name: StorageName,
+    backend: StorageBackend,
+    credentials_configured: bool,
+    health: StorageHealth,
+}
+
+impl StorageConfigurationMetadata {
+    pub(crate) fn new(
+        name: StorageName,
+        backend: StorageBackend,
+        credentials_configured: bool,
+        health: StorageHealth,
+    ) -> Self {
+        Self {
+            name,
+            backend,
+            credentials_configured,
+            health,
+        }
+    }
+
+    /// Returns the storage name.
+    pub const fn name(&self) -> &StorageName {
+        &self.name
+    }
+
+    /// Returns the non-secret backend settings.
+    pub const fn backend(&self) -> &StorageBackend {
+        &self.backend
+    }
+
+    /// Returns whether credentials are configured without exposing them.
+    pub const fn credentials_configured(&self) -> bool {
+        self.credentials_configured
+    }
+
+    /// Returns the health state represented by this metadata.
+    pub const fn health(&self) -> StorageHealth {
+        self.health
+    }
+
+    pub(crate) fn with_health(mut self, health: StorageHealth) -> Self {
+        self.health = health;
+        self
+    }
+}
+
+impl fmt::Debug for StorageConfigurationMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StorageConfigurationMetadata")
+            .field("name", &self.name)
+            .field("backend", &self.backend)
+            .field("credentials_configured", &self.credentials_configured)
+            .field("health", &self.health)
+            .finish()
+    }
+}
+
+/// Result returned after adding or replacing a storage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageAddResult {
+    metadata: StorageConfigurationMetadata,
+    replaced_existing: bool,
+}
+
+impl StorageAddResult {
+    pub(crate) fn new(metadata: StorageConfigurationMetadata, replaced_existing: bool) -> Self {
+        Self {
+            metadata,
+            replaced_existing,
+        }
+    }
+
+    /// Returns the safe metadata for the stored configuration.
+    pub const fn metadata(&self) -> &StorageConfigurationMetadata {
+        &self.metadata
+    }
+
+    /// Returns whether the operation replaced a previous configuration.
+    pub const fn replaced_existing(&self) -> bool {
+        self.replaced_existing
+    }
+
+    /// Returns the storage name.
+    pub const fn name(&self) -> &StorageName {
+        self.metadata.name()
+    }
+
+    /// Returns the connectivity result used before publication.
+    pub const fn health(&self) -> StorageHealth {
+        self.metadata.health()
+    }
+}
+
+/// Result returned by a named-storage list operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageListResult {
+    storages: Vec<StorageConfigurationMetadata>,
+}
+
+impl StorageListResult {
+    pub(crate) const fn new(storages: Vec<StorageConfigurationMetadata>) -> Self {
+        Self { storages }
+    }
+
+    /// Returns storages in deterministic name order.
+    pub fn storages(&self) -> &[StorageConfigurationMetadata] {
+        &self.storages
+    }
+
+    /// Returns whether no named storages were found.
+    pub fn is_empty(&self) -> bool {
+        self.storages.is_empty()
+    }
+
+    /// Consumes the result and returns the safe metadata entries.
+    pub fn into_storages(self) -> Vec<StorageConfigurationMetadata> {
+        self.storages
+    }
+}
+
+/// Result returned after removing a named storage configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageRemoveResult {
+    name: StorageName,
+    backend: StorageBackendKind,
+    credentials_removed: bool,
+}
+
+impl StorageRemoveResult {
+    pub(crate) const fn new(
+        name: StorageName,
+        backend: StorageBackendKind,
+        credentials_removed: bool,
+    ) -> Self {
+        Self {
+            name,
+            backend,
+            credentials_removed,
+        }
+    }
+
+    /// Returns the removed storage name.
+    pub const fn name(&self) -> &StorageName {
+        &self.name
+    }
+
+    /// Returns the removed backend kind.
+    pub const fn backend(&self) -> StorageBackendKind {
+        self.backend
+    }
+
+    /// Returns whether the referenced credential entry was removed.
+    pub const fn credentials_removed(&self) -> bool {
+        self.credentials_removed
+    }
+
+    /// Always returns `true`; this operation never removes repository data.
+    pub const fn repository_data_preserved(&self) -> bool {
+        true
+    }
+}
+
+/// Compatibility name for [`StorageConfigurationMetadata`].
+pub type StorageInfo = StorageConfigurationMetadata;
+
+/// Compatibility name for [`StorageConfigurationMetadata`].
+pub type StorageEntry = StorageConfigurationMetadata;
+
+/// Compatibility name for [`StorageAddRequest`].
+pub type AddStorageRequest = StorageAddRequest;
+
+/// Compatibility name for [`StorageRemoveRequest`].
+pub type RemoveStorageRequest = StorageRemoveRequest;
+
+/// Compatibility name for [`StorageConfigurationListRequest`].
+pub type ListStorageRequest = StorageConfigurationListRequest;
+
+/// Connectivity boundary used by storage-management operations.
+pub trait StorageConnectivity: Send + Sync {
+    /// Validates a configured backend without publishing repository data.
+    fn check(
+        &self,
+        configuration: &StorageConfiguration,
+    ) -> StorageConfigurationResult<StorageHealth>;
+}
+
+impl<T> StorageConnectivity for std::sync::Arc<T>
+where
+    T: StorageConnectivity + ?Sized,
+{
+    fn check(
+        &self,
+        configuration: &StorageConfiguration,
+    ) -> StorageConfigurationResult<StorageHealth> {
+        self.as_ref().check(configuration)
+    }
+}
+
+impl<T> StorageConnectivity for &T
+where
+    T: StorageConnectivity + ?Sized,
+{
+    fn check(
+        &self,
+        configuration: &StorageConfiguration,
+    ) -> StorageConfigurationResult<StorageHealth> {
+        (*self).check(configuration)
+    }
+}
+
+/// Compatibility name for [`StorageConnectivity`].
+pub trait StorageProbe: StorageConnectivity {}
+
+impl<T> StorageProbe for T where T: StorageConnectivity + ?Sized {}
+
+/// Persistence boundary used by the storage-management use case.
+pub trait StorageConfigurationRepository: Send + Sync {
+    /// Returns whether one validated name has a record.
+    fn contains(&self, name: &StorageName) -> StorageConfigurationResult<bool>;
+
+    /// Publishes a new record and rejects an existing name.
+    fn save_new(
+        &self,
+        name: &StorageName,
+        configuration: StorageConfiguration,
+    ) -> StorageConfigurationResult<()>;
+
+    /// Publishes a new record or replaces an existing record, returning whether
+    /// a previous record was replaced.
+    fn save_replacement(
+        &self,
+        name: &StorageName,
+        configuration: StorageConfiguration,
+    ) -> StorageConfigurationResult<bool>;
+
+    /// Returns safe metadata without resolving credentials.
+    fn describe(
+        &self,
+        name: &StorageName,
+    ) -> StorageConfigurationResult<StorageConfigurationMetadata>;
+
+    /// Lists safe metadata in deterministic order.
+    fn list_metadata(&self) -> StorageConfigurationResult<Vec<StorageConfigurationMetadata>>;
+
+    /// Resolves a configuration and its credentials for a requested health check.
+    fn load(&self, name: &StorageName) -> StorageConfigurationResult<StorageConfiguration>;
+
+    /// Removes the record and its credential reference, never backend contents.
+    fn remove(&self, name: &StorageName) -> StorageConfigurationResult<()>;
+}
+
 /// Failures returned by named-storage configuration persistence.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StorageConfigurationError {
     /// The named configuration does not exist.
     NotFound,
+    /// A named configuration already exists and replacement was not requested.
+    AlreadyExists,
     /// The storage name is unsafe or invalid.
     InvalidName,
     /// Backend settings or a backend/credential pairing is invalid.
@@ -909,12 +1377,21 @@ pub enum StorageConfigurationError {
     Io,
     /// The store could not provide a consistent result.
     Unavailable,
+    /// A read-only backend connectivity check failed.
+    ConnectivityFailure {
+        /// The backend whose connectivity was checked.
+        backend: StorageBackendKind,
+        /// The provider-neutral failure returned by the adapter.
+        error: crate::application::ports::StorageError,
+    },
 }
 
 impl fmt::Display for StorageConfigurationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound => formatter.write_str("storage configuration was not found"),
+            Self::AlreadyExists => formatter
+                .write_str("storage configuration already exists; request explicit replacement"),
             Self::InvalidName => formatter.write_str("storage configuration name is invalid"),
             Self::InvalidConfiguration => {
                 formatter.write_str("storage backend configuration is invalid")
@@ -941,7 +1418,44 @@ impl fmt::Display for StorageConfigurationError {
             Self::TooLarge => formatter.write_str("storage configuration is too large"),
             Self::Io => formatter.write_str("storage configuration I/O operation failed"),
             Self::Unavailable => formatter.write_str("storage configuration is unavailable"),
+            Self::ConnectivityFailure { backend, error } => write!(
+                formatter,
+                "{backend} storage connectivity check failed: {error}"
+            ),
         }
+    }
+}
+
+impl StorageConfigurationError {
+    /// Returns the stable machine-readable category for this error.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound => "storage_not_found",
+            Self::AlreadyExists => "storage_already_exists",
+            Self::InvalidName => "storage_invalid_name",
+            Self::InvalidConfiguration => "storage_invalid_configuration",
+            Self::MissingCredentialReference => "storage_missing_credentials",
+            Self::CredentialStoreFailure => "storage_credential_store_failure",
+            Self::Malformed => "storage_configuration_malformed",
+            Self::UnsupportedSchemaVersion { .. } => "storage_configuration_unsupported_version",
+            Self::UnsupportedBackend { .. } => "storage_backend_unsupported",
+            Self::UnsupportedBackendVersion { .. } => "storage_backend_unsupported_version",
+            Self::InvalidPath => "storage_invalid_path",
+            Self::TooLarge => "storage_configuration_too_large",
+            Self::Io => "storage_configuration_io",
+            Self::Unavailable => "storage_configuration_unavailable",
+            Self::ConnectivityFailure { .. } => "storage_connectivity_failure",
+        }
+    }
+
+    /// Returns whether the operation requires explicit replacement consent.
+    pub const fn is_conflict(&self) -> bool {
+        matches!(self, Self::AlreadyExists)
+    }
+
+    /// Returns whether the error represents invalid caller input.
+    pub const fn is_input_error(&self) -> bool {
+        matches!(self, Self::InvalidName | Self::InvalidConfiguration)
     }
 }
 

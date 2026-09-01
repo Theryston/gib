@@ -6,6 +6,7 @@ use gib::{
 #[cfg(test)]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::{fmt, fmt::Formatter};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -206,6 +207,142 @@ pub enum Command {
     Resolve(ResolveRequest),
     #[command(about = "Show the configured global author identity.")]
     Whoami(WhoamiRequest),
+    #[command(about = "Manage named storage configurations.")]
+    #[command(subcommand)]
+    Storage(Box<StorageCommand>),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StorageCommand {
+    #[command(about = "Add or explicitly replace a named storage configuration.")]
+    Add(Box<StorageAddCommand>),
+    #[command(about = "List named storage configurations.")]
+    List(StorageListCommand),
+    #[command(about = "Remove a named storage configuration without deleting its data.")]
+    Remove(StorageRemoveCommand),
+}
+
+#[derive(Args)]
+pub struct StorageAddCommand {
+    #[arg(short = 'n', long, value_name = "NAME", help = "Unique storage name.")]
+    pub name: Option<String>,
+    #[arg(
+        short = 't',
+        long = "backend",
+        visible_alias = "type",
+        value_name = "BACKEND",
+        help = "Backend type: local, s3, or webdav."
+    )]
+    pub backend: Option<String>,
+    #[arg(
+        short = 'p',
+        long,
+        visible_alias = "root",
+        value_name = "PATH",
+        help = "Local storage root."
+    )]
+    pub path: Option<PathBuf>,
+    #[arg(long, value_name = "REGION", help = "S3 region.")]
+    pub region: Option<String>,
+    #[arg(short = 'b', long, value_name = "BUCKET", help = "S3 bucket.")]
+    pub bucket: Option<String>,
+    #[arg(
+        short = 'a',
+        long = "access-key",
+        value_name = "ACCESS_KEY",
+        help = "S3 access key."
+    )]
+    pub access_key: Option<String>,
+    #[arg(
+        long = "secret-key",
+        value_name = "SECRET_KEY",
+        help = "S3 secret key."
+    )]
+    pub secret_key: Option<String>,
+    #[arg(
+        long = "session-token",
+        value_name = "SESSION_TOKEN",
+        help = "Optional S3 session token."
+    )]
+    pub session_token: Option<String>,
+    #[arg(
+        short = 'e',
+        long,
+        value_name = "URL",
+        help = "Optional S3-compatible endpoint."
+    )]
+    pub endpoint: Option<String>,
+    #[arg(long, help = "Use S3 path-style addressing.")]
+    pub force_path_style: bool,
+    #[arg(long, value_name = "URL", help = "WebDAV collection URL.")]
+    pub url: Option<String>,
+    #[arg(long, value_name = "USERNAME", help = "WebDAV username.")]
+    pub username: Option<String>,
+    #[arg(long, value_name = "PASSWORD", help = "WebDAV password.")]
+    pub password: Option<String>,
+    #[arg(long, help = "Permit an explicitly insecure HTTP WebDAV URL.")]
+    pub allow_insecure_http: bool,
+    #[arg(
+        long,
+        visible_alias = "replace-existing",
+        help = "Explicitly replace an existing name."
+    )]
+    pub replace: bool,
+}
+
+impl fmt::Debug for StorageAddCommand {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StorageAddCommand")
+            .field("name", &self.name)
+            .field("backend", &self.backend)
+            .field("path", &self.path)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field(
+                "access_key",
+                &self.access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "secret_key",
+                &self.secret_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("endpoint", &self.endpoint)
+            .field("force_path_style", &self.force_path_style)
+            .field("url", &self.url)
+            .field("username", &self.username.as_ref().map(|_| "<redacted>"))
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("allow_insecure_http", &self.allow_insecure_http)
+            .field("replace", &self.replace)
+            .finish()
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct StorageListCommand {
+    #[arg(long, help = "Perform a read-only health check for every storage.")]
+    pub check_health: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct StorageRemoveCommand {
+    #[arg(
+        short = 'n',
+        long,
+        value_name = "NAME",
+        help = "Storage name to remove."
+    )]
+    pub name: Option<String>,
+    #[arg(
+        long = "yes",
+        visible_alias = "force",
+        help = "Confirm removal without an interactive prompt."
+    )]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -421,6 +558,45 @@ mod tests {
             .expect("valid interactive whoami input");
         assert_eq!(cli.mode, OutputMode::Interactive);
         assert!(matches!(cli.command, Some(Command::Whoami(_))));
+    }
+
+    #[test]
+    fn parses_storage_backend_aliases_and_non_secret_argument_shapes() {
+        let cli = parse_from(arguments(&[
+            "gib",
+            "--mode",
+            "json",
+            "storage",
+            "add",
+            "--name",
+            "remote",
+            "--type",
+            "s3",
+            "--region",
+            "us-east-1",
+            "--bucket",
+            "bucket",
+            "--access-key",
+            "access",
+            "--secret-key",
+            "top-secret",
+            "--endpoint",
+            "https://s3.example.test",
+            "--replace-existing",
+        ]))
+        .expect("valid storage input");
+        let Some(Command::Storage(command)) = cli.command else {
+            panic!("expected storage command");
+        };
+        let StorageCommand::Add(request) = *command else {
+            panic!("expected storage add command");
+        };
+        assert_eq!(request.backend.as_deref(), Some("s3"));
+        assert_eq!(request.secret_key.as_deref(), Some("top-secret"));
+        assert!(request.replace);
+        let debug = format!("{request:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("top-secret"));
     }
 
     #[test]

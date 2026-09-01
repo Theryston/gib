@@ -6,6 +6,7 @@ use super::repository::{
     Repository, RepositoryIdentity, RepositoryInitRequest, RepositoryKey, RepositoryOpenRequest,
     StorageHandle,
 };
+use super::storage_configuration::{StorageConfigurationStore, StorageManager};
 use std::fmt;
 
 /// Entry point for programmatic use of the Gib SDK.
@@ -31,6 +32,11 @@ impl Client {
     /// remains independent of terminal, Tokio, and CLI types.
     pub fn events(&self) -> EventDispatcher {
         self.events.clone()
+    }
+
+    /// Creates a storage manager with the supplied persistence adapter.
+    pub fn storage_manager(&self, store: StorageConfigurationStore) -> StorageManager {
+        StorageManager::new(store)
     }
 
     /// Registers a callback on a dedicated bounded event-consumer worker.

@@ -1,8 +1,9 @@
 use crate::application::ports::{
     CredentialReference, CredentialStore, CredentialStoreError, CredentialStoreOperation,
     STORAGE_CONFIGURATION_FILE_SUFFIX, StorageBackend, StorageConfiguration,
-    StorageConfigurationError, StorageConfigurationOperation, StorageConfigurationResult,
-    StorageCredentials, StorageName,
+    StorageConfigurationError, StorageConfigurationMetadata, StorageConfigurationOperation,
+    StorageConfigurationRepository, StorageConfigurationResult, StorageCredentials, StorageHealth,
+    StorageName,
 };
 use crate::format::{
     DecodedStorageConfiguration, PersistedStorageBackend, decode_storage_configuration,
@@ -21,6 +22,10 @@ static STORAGE_CONFIGURATION_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Mutex<
     OnceLock::new();
 
 const MAX_STORAGE_CONFIGURATION_TEMP_ATTEMPTS: usize = 32;
+
+/// The directory below the user's global configuration directory that holds
+/// named-storage records.
+pub const STORAGE_CONFIGURATION_DIRECTORY_NAME: &str = "storages";
 
 /// A cloneable type-erased handle for an approved credential store.
 #[derive(Clone)]
@@ -250,6 +255,23 @@ impl StorageConfigurationStore {
         })
     }
 
+    /// Creates the named-storage store below the current user's global
+    /// `.gib` directory.
+    pub fn global<C>(credential_store: C) -> StorageConfigurationResult<Self>
+    where
+        C: CredentialStore + 'static,
+    {
+        let global_configuration =
+            crate::infrastructure::configuration::LocalConfiguration::global()
+                .map_err(|_| StorageConfigurationError::Unavailable)?;
+        let directory = global_configuration
+            .path()
+            .parent()
+            .ok_or(StorageConfigurationError::InvalidPath)?
+            .join(STORAGE_CONFIGURATION_DIRECTORY_NAME);
+        Self::new(directory, credential_store)
+    }
+
     /// Returns the canonical directory containing named-storage records.
     pub fn directory(&self) -> &Path {
         &self.state.directory
@@ -268,6 +290,36 @@ impl StorageConfigurationStore {
         name: impl AsRef<str>,
         configuration: StorageConfiguration,
     ) -> StorageConfigurationResult<()> {
+        self.save_with_policy(name, configuration, true).map(|_| ())
+    }
+
+    /// Adds a new named storage and rejects an existing name.
+    pub fn save_new(
+        &self,
+        name: impl AsRef<str>,
+        configuration: StorageConfiguration,
+    ) -> StorageConfigurationResult<()> {
+        self.save_with_policy(name, configuration, false)
+            .map(|_| ())
+    }
+
+    /// Adds a named storage or explicitly replaces an existing one.
+    ///
+    /// The returned flag is `true` when a previous record was replaced.
+    pub fn save_replacement(
+        &self,
+        name: impl AsRef<str>,
+        configuration: StorageConfiguration,
+    ) -> StorageConfigurationResult<bool> {
+        self.save_with_policy(name, configuration, true)
+    }
+
+    fn save_with_policy(
+        &self,
+        name: impl AsRef<str>,
+        configuration: StorageConfiguration,
+        allow_replacement: bool,
+    ) -> StorageConfigurationResult<bool> {
         let name = StorageName::new(name.as_ref())?;
         configuration
             .backend()
@@ -277,6 +329,9 @@ impl StorageConfigurationStore {
         let _guard = self.acquire_lock()?;
         ensure_directory_is_safe(&self.state.directory)?;
         let previous = self.read_previous_record(&path)?;
+        if previous.is_some() && !allow_replacement {
+            return Err(StorageConfigurationError::AlreadyExists);
+        }
         let previous_reference = previous
             .as_ref()
             .and_then(|(_, decoded)| decoded.credential_reference.as_deref())
@@ -335,7 +390,7 @@ impl StorageConfigurationStore {
             }
             return Err(StorageConfigurationError::CredentialStoreFailure);
         }
-        Ok(())
+        Ok(previous.is_some())
     }
 
     /// Alias for [`Self::save`] using update terminology.
@@ -345,6 +400,23 @@ impl StorageConfigurationStore {
         configuration: StorageConfiguration,
     ) -> StorageConfigurationResult<()> {
         self.save(name, configuration)
+    }
+
+    /// Returns whether a named storage record exists without resolving its
+    /// credentials.
+    pub fn contains(&self, name: impl AsRef<str>) -> StorageConfigurationResult<bool> {
+        let name = StorageName::new(name.as_ref())?;
+        let path = self.path_for(&name);
+        let _guard = self.acquire_lock()?;
+        ensure_directory_is_safe(&self.state.directory)?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if is_link_like_metadata(&metadata) || !metadata.is_file() => {
+                Err(StorageConfigurationError::InvalidPath)
+            }
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(map_io_error(error)),
+        }
     }
 
     /// Loads a named configuration and resolves its credential reference.
@@ -384,6 +456,30 @@ impl StorageConfigurationStore {
     /// Alias for [`Self::enumerate`].
     pub fn list(&self) -> StorageConfigurationResult<Vec<StorageName>> {
         self.enumerate()
+    }
+
+    /// Loads safe metadata for one named storage without resolving credentials.
+    pub fn describe(
+        &self,
+        name: impl AsRef<str>,
+    ) -> StorageConfigurationResult<StorageConfigurationMetadata> {
+        let name = StorageName::new(name.as_ref())?;
+        let path = self.path_for(&name);
+        let _guard = self.acquire_lock()?;
+        ensure_directory_is_safe(&self.state.directory)?;
+        let (_, decoded) = self
+            .read_previous_record(&path)?
+            .ok_or(StorageConfigurationError::NotFound)?;
+        metadata_from_decoded(name, decoded)
+    }
+
+    /// Lists safe metadata for all named storages in deterministic order.
+    pub fn list_metadata(&self) -> StorageConfigurationResult<Vec<StorageConfigurationMetadata>> {
+        let names = self.enumerate()?;
+        names
+            .into_iter()
+            .map(|name| self.describe(name.as_str()))
+            .collect()
     }
 
     /// Deletes a named configuration and its referenced credential.
@@ -714,9 +810,77 @@ impl std::fmt::Debug for StorageConfigurationStore {
     }
 }
 
+impl StorageConfigurationRepository for StorageConfigurationStore {
+    fn contains(&self, name: &StorageName) -> StorageConfigurationResult<bool> {
+        Self::contains(self, name.as_str())
+    }
+
+    fn save_new(
+        &self,
+        name: &StorageName,
+        configuration: StorageConfiguration,
+    ) -> StorageConfigurationResult<()> {
+        Self::save_new(self, name.as_str(), configuration)
+    }
+
+    fn save_replacement(
+        &self,
+        name: &StorageName,
+        configuration: StorageConfiguration,
+    ) -> StorageConfigurationResult<bool> {
+        Self::save_replacement(self, name.as_str(), configuration)
+    }
+
+    fn describe(
+        &self,
+        name: &StorageName,
+    ) -> StorageConfigurationResult<StorageConfigurationMetadata> {
+        Self::describe(self, name.as_str())
+    }
+
+    fn list_metadata(&self) -> StorageConfigurationResult<Vec<StorageConfigurationMetadata>> {
+        Self::list_metadata(self)
+    }
+
+    fn load(&self, name: &StorageName) -> StorageConfigurationResult<StorageConfiguration> {
+        Self::load(self, name.as_str())
+    }
+
+    fn remove(&self, name: &StorageName) -> StorageConfigurationResult<()> {
+        Self::remove(self, name.as_str())
+    }
+}
+
 struct AtomicFileError {
     error: StorageConfigurationError,
     published: bool,
+}
+
+fn metadata_from_decoded(
+    name: StorageName,
+    decoded: DecodedStorageConfiguration,
+) -> StorageConfigurationResult<StorageConfigurationMetadata> {
+    let backend = backend_from_decoded(decoded.clone())?;
+    let reference = decoded
+        .credential_reference
+        .as_deref()
+        .map(CredentialReference::new)
+        .transpose()
+        .map_err(|_| StorageConfigurationError::Malformed)?;
+    let credentials_configured = match (&backend, reference) {
+        (StorageBackend::Local(_), None) => false,
+        (StorageBackend::Local(_), Some(_)) => return Err(StorageConfigurationError::Malformed),
+        (StorageBackend::S3(_) | StorageBackend::WebDav(_), Some(_)) => true,
+        (StorageBackend::S3(_) | StorageBackend::WebDav(_), None) => {
+            return Err(StorageConfigurationError::MissingCredentialReference);
+        }
+    };
+    Ok(StorageConfigurationMetadata::new(
+        name,
+        backend,
+        credentials_configured,
+        StorageHealth::NotChecked,
+    ))
 }
 
 impl AtomicFileError {

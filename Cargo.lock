@@ -989,6 +989,7 @@ version = "0.1.0"
 dependencies = [
  "aws-sdk-s3",
  "futures-util",
+ "getrandom 0.2.17",
  "libc",
  "parse-size",
  "percent-encoding",

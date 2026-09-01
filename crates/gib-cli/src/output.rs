@@ -1,7 +1,8 @@
 use crate::input::OutputMode;
 use gib::{
     AuthorIdentity, ConfigurationSource, ResolvedConfiguration, SnapshotReference,
-    SnapshotSummaryPage,
+    SnapshotSummaryPage, StorageAddResult, StorageBackend, StorageConfigurationMetadata,
+    StorageListResult, StorageRemoveResult,
 };
 use serde::Serialize;
 
@@ -164,7 +165,12 @@ pub fn render_resolved_reference(reference: &SnapshotReference, mode: OutputMode
     }
 }
 
-pub fn render_error(error: &dyn std::fmt::Display, code: &str, mode: OutputMode) {
+pub fn render_error(
+    error: &dyn std::fmt::Display,
+    code: &str,
+    field: Option<&str>,
+    mode: OutputMode,
+) {
     match mode {
         OutputMode::Interactive => eprintln!("error: {error}"),
         OutputMode::Json => {
@@ -173,6 +179,7 @@ pub fn render_error(error: &dyn std::fmt::Display, code: &str, mode: OutputMode)
                 ErrorOutput {
                     message: error.to_string(),
                     code,
+                    field,
                 },
                 true,
             );
@@ -184,6 +191,8 @@ pub fn render_error(error: &dyn std::fmt::Display, code: &str, mode: OutputMode)
 struct ErrorOutput<'a> {
     message: String,
     code: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -203,5 +212,178 @@ fn render_json<T: Serialize>(kind: &'static str, data: T, to_stderr: bool) {
         } else {
             println!("{json}");
         }
+    }
+}
+
+#[derive(Serialize)]
+struct StorageOutput {
+    name: String,
+    backend: String,
+    storage_type: String,
+    path: Option<String>,
+    region: Option<String>,
+    bucket: Option<String>,
+    endpoint: Option<String>,
+    url: Option<String>,
+    credentials_configured: bool,
+    health: String,
+}
+
+#[derive(Serialize)]
+struct StorageAddOutput {
+    action: &'static str,
+    storage: StorageOutput,
+    replaced_existing: bool,
+}
+
+#[derive(Serialize)]
+struct StorageListOutput {
+    action: &'static str,
+    storages: Vec<StorageOutput>,
+}
+
+#[derive(Serialize)]
+struct StorageRemoveOutput {
+    action: &'static str,
+    name: String,
+    backend: String,
+    credentials_removed: bool,
+    repository_data_preserved: bool,
+}
+
+pub fn render_storage_add(result: &StorageAddResult, mode: OutputMode) {
+    let storage = storage_output(result.metadata());
+    match mode {
+        OutputMode::Interactive => println!(
+            "{} storage '{}' ({}) [{}]",
+            if result.replaced_existing() {
+                "Replaced"
+            } else {
+                "Added"
+            },
+            storage.name,
+            storage.backend,
+            storage.health
+        ),
+        OutputMode::Json => render_json(
+            "storage",
+            StorageAddOutput {
+                action: if result.replaced_existing() {
+                    "replaced"
+                } else {
+                    "added"
+                },
+                storage,
+                replaced_existing: result.replaced_existing(),
+            },
+            false,
+        ),
+    }
+}
+
+pub fn render_storage_list(result: &StorageListResult, mode: OutputMode) {
+    let storages = result
+        .storages()
+        .iter()
+        .map(storage_output)
+        .collect::<Vec<_>>();
+    match mode {
+        OutputMode::Interactive => {
+            if storages.is_empty() {
+                println!("No storages.");
+                return;
+            }
+            println!("NAME\tBACKEND\tENDPOINT/PATH\tHEALTH\tCREDENTIALS");
+            for storage in storages {
+                let location = storage
+                    .path
+                    .as_deref()
+                    .or(storage.endpoint.as_deref())
+                    .or(storage.url.as_deref())
+                    .unwrap_or("-");
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    storage.name,
+                    storage.backend,
+                    location,
+                    storage.health,
+                    if storage.credentials_configured {
+                        "configured"
+                    } else {
+                        "not_configured"
+                    }
+                );
+            }
+        }
+        OutputMode::Json => render_json(
+            "storage",
+            StorageListOutput {
+                action: "listed",
+                storages,
+            },
+            false,
+        ),
+    }
+}
+
+pub fn render_storage_remove(result: &StorageRemoveResult, mode: OutputMode) {
+    let name = result.name().to_string();
+    let backend = result.backend().to_string();
+    match mode {
+        OutputMode::Interactive => println!(
+            "Removed storage '{}' ({}) and preserved repository data.",
+            name, backend
+        ),
+        OutputMode::Json => render_json(
+            "storage",
+            StorageRemoveOutput {
+                action: "removed",
+                name,
+                backend,
+                credentials_removed: result.credentials_removed(),
+                repository_data_preserved: result.repository_data_preserved(),
+            },
+            false,
+        ),
+    }
+}
+
+fn storage_output(metadata: &StorageConfigurationMetadata) -> StorageOutput {
+    let (path, region, bucket, endpoint, url) = match metadata.backend() {
+        StorageBackend::Local(settings) => (
+            Some(settings.root().display().to_string()),
+            None,
+            None,
+            None,
+            None,
+        ),
+        StorageBackend::S3(settings) => (
+            None,
+            Some(settings.region().to_owned()),
+            Some(settings.bucket().to_owned()),
+            settings.endpoint().map(ToOwned::to_owned),
+            None,
+        ),
+        StorageBackend::WebDav(settings) => (
+            None,
+            None,
+            None,
+            None,
+            Some(settings.collection_url().to_owned()),
+        ),
+        _ => (None, None, None, None, None),
+    };
+    let backend = metadata.backend().kind().to_string();
+    StorageOutput {
+        name: metadata.name().to_string(),
+        backend: backend.clone(),
+        storage_type: backend,
+        path,
+        region,
+        bucket,
+        endpoint,
+        url,
+        credentials_configured: metadata.credentials_configured(),
+        health: metadata.health().to_string(),
     }
 }
