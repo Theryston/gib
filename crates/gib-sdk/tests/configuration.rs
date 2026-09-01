@@ -1,8 +1,9 @@
 use gib::{
-    CURRENT_CONFIGURATION_VERSION, Configuration, ConfigurationFileMetadata,
-    ConfigurationFileSystem, ConfigurationOverrides, ConfigurationResolutionRequest,
-    ConfigurationResolver, ConfigurationSource, LocalConfigurationFileSystem,
-    MAX_CONFIGURATION_BYTES, ProjectConfigurationErrorKind,
+    CONTENT_DEFINED_CHUNKING_ALGORITHM, CURRENT_CHUNKING_VERSION, CURRENT_CONFIGURATION_VERSION,
+    ChunkingConfiguration, Configuration, ConfigurationFileMetadata, ConfigurationFileSystem,
+    ConfigurationOverrides, ConfigurationResolutionRequest, ConfigurationResolver,
+    ConfigurationSource, LocalConfigurationFileSystem, MAX_CONFIGURATION_BYTES,
+    ProjectConfigurationErrorKind,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,8 @@ const UNKNOWN_FIELD: &str =
     include_str!("../../../tests/fixtures/configuration/unknown-field.toml");
 const UNSUPPORTED_VERSION: &str =
     include_str!("../../../tests/fixtures/configuration/unsupported-version.toml");
+const CONTENT_DEFINED: &str =
+    include_str!("../../../tests/fixtures/configuration/content-defined.toml");
 
 static CURRENT_DIRECTORY_LOCK: Mutex<()> = Mutex::new(());
 
@@ -31,12 +34,76 @@ fn minimal_configuration_loads_with_all_optional_values_absent() {
     assert!(configuration.backup().message().is_none());
     assert!(configuration.backup().compress().is_none());
     assert!(configuration.backup().chunk_size().is_none());
+    assert_eq!(
+        configuration.backup().chunking().version(),
+        CURRENT_CHUNKING_VERSION
+    );
+    assert_eq!(
+        configuration.backup().chunking().algorithm(),
+        CONTENT_DEFINED_CHUNKING_ALGORITHM
+    );
     assert!(configuration.backup().concurrency().is_none());
     assert!(configuration.backup().ignore().is_empty());
     assert!(configuration.live().message().is_none());
     assert!(configuration.live().debounce().is_none());
     assert!(configuration.live().poll().is_none());
     assert!(configuration.restore().target_path().is_none());
+}
+
+#[test]
+fn content_defined_configuration_is_validated_and_exposed_as_policy_metadata() {
+    let configuration = Configuration::parse(CONTENT_DEFINED, Path::new("/project"))
+        .expect("content-defined configuration should parse");
+    let chunking = configuration.backup().chunking();
+    assert_eq!(chunking.version(), 1);
+    assert_eq!(chunking.algorithm(), "buzhash");
+    assert_eq!(chunking.window_size(), 64);
+    assert_eq!(chunking.min_size(), 64 * 1024);
+    assert_eq!(chunking.target_size(), 128 * 1024);
+    assert_eq!(chunking.max_size(), 256 * 1024);
+    assert_eq!(chunking.canonical_policy_bytes(), {
+        let mut expected = b"GIB chunking policy\0".to_vec();
+        expected.extend_from_slice(&7_u16.to_be_bytes());
+        expected.extend_from_slice(b"buzhash");
+        expected.extend_from_slice(&1_u16.to_be_bytes());
+        expected.extend_from_slice(&64_u16.to_be_bytes());
+        expected.extend_from_slice(&0x4752_4942_4344_4331_u64.to_be_bytes());
+        expected.extend_from_slice(&(64_u64 * 1024).to_be_bytes());
+        expected.extend_from_slice(&(128_u64 * 1024).to_be_bytes());
+        expected.extend_from_slice(&(256_u64 * 1024).to_be_bytes());
+        expected
+    });
+}
+
+#[test]
+fn content_defined_configuration_rejects_unknown_and_invalid_policy_values() {
+    for (contents, field, kind) in [
+        (
+            "version = 1\n[backup.chunking]\nalgorithm = \"other\"\n",
+            "backup.chunking",
+            ProjectConfigurationErrorKind::InvalidValue,
+        ),
+        (
+            "version = 1\n[backup.chunking]\nversion = 2\n",
+            "backup.chunking",
+            ProjectConfigurationErrorKind::InvalidValue,
+        ),
+        (
+            "version = 1\n[backup.chunking]\nmin_size = \"8 MiB\"\ntarget_size = \"4 MiB\"\nmax_size = \"16 MiB\"\n",
+            "backup.chunking",
+            ProjectConfigurationErrorKind::InvalidValue,
+        ),
+        (
+            "version = 1\n[backup.chunking]\nunknown = true\n",
+            "backup.chunking.unknown",
+            ProjectConfigurationErrorKind::UnknownField,
+        ),
+    ] {
+        let error = Configuration::parse(contents, Path::new("/project"))
+            .expect_err("invalid content-defined policy should fail");
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.field(), Some(field));
+    }
 }
 
 #[test]
@@ -373,6 +440,10 @@ target_path = "file-restore"
         .with_backup_message("cli-backup")
         .with_backup_compress(22)
         .with_backup_chunk_size("8192 B")
+        .with_backup_chunking(
+            ChunkingConfiguration::new(32 * 1024, 64 * 1024, 128 * 1024)
+                .expect("override policy should be valid"),
+        )
         .with_backup_concurrency(8)
         .with_ignore_rules(["cli", "shared"])
         .with_live_message("cli-live")
@@ -399,6 +470,9 @@ target_path = "file-restore"
         configuration.backup().chunk_size().map(|size| size.bytes()),
         Some(8192)
     );
+    assert_eq!(configuration.backup().chunking().min_size(), 32 * 1024);
+    assert_eq!(configuration.backup().chunking().target_size(), 64 * 1024);
+    assert_eq!(configuration.backup().chunking().max_size(), 128 * 1024);
     assert_eq!(configuration.backup().concurrency(), Some(8));
     assert_eq!(
         configuration.backup().ignore(),

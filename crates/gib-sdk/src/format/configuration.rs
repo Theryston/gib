@@ -108,8 +108,18 @@ pub(crate) struct PersistedBackupConfiguration {
     pub(crate) message: Option<String>,
     pub(crate) compress: Option<i32>,
     pub(crate) chunk_size: Option<String>,
+    pub(crate) chunking: Option<PersistedChunkingConfiguration>,
     pub(crate) concurrency: Option<usize>,
     pub(crate) ignore: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PersistedChunkingConfiguration {
+    pub(crate) version: Option<u16>,
+    pub(crate) algorithm: Option<String>,
+    pub(crate) min_size: Option<String>,
+    pub(crate) target_size: Option<String>,
+    pub(crate) max_size: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -209,6 +219,7 @@ fn parse_backup(
             "message",
             "compress",
             "chunk_size",
+            "chunking",
             "concurrency",
             "ignore",
         ],
@@ -218,9 +229,36 @@ fn parse_backup(
         message: optional_string(table, "message", "backup.message")?,
         compress: optional_i32(table, "compress", "backup.compress")?,
         chunk_size: optional_string(table, "chunk_size", "backup.chunk_size")?,
+        chunking: parse_chunking(table.get("chunking"))?,
         concurrency: optional_usize(table, "concurrency", "backup.concurrency")?,
         ignore: optional_string_array(table, "ignore", "backup.ignore")?,
     })
+}
+
+fn parse_chunking(
+    value: Option<&Value>,
+) -> Result<Option<PersistedChunkingConfiguration>, ConfigurationDocumentError> {
+    let Some(table) = optional_table(value, "backup.chunking")? else {
+        return Ok(None);
+    };
+    reject_unknown_fields(
+        table,
+        "backup.chunking",
+        &[
+            "version",
+            "algorithm",
+            "min_size",
+            "target_size",
+            "max_size",
+        ],
+    )?;
+    Ok(Some(PersistedChunkingConfiguration {
+        version: optional_u16(table, "version", "backup.chunking.version")?,
+        algorithm: optional_string(table, "algorithm", "backup.chunking.algorithm")?,
+        min_size: optional_string(table, "min_size", "backup.chunking.min_size")?,
+        target_size: optional_string(table, "target_size", "backup.chunking.target_size")?,
+        max_size: optional_string(table, "max_size", "backup.chunking.max_size")?,
+    }))
 }
 
 fn parse_live(
@@ -335,6 +373,20 @@ fn optional_i32(
     field: &str,
 ) -> Result<Option<i32>, ConfigurationDocumentError> {
     optional_integer(table, key, field, "a 32-bit integer", i32::try_from)
+}
+
+fn optional_u16(
+    table: &toml::map::Map<String, Value>,
+    key: &str,
+    field: &str,
+) -> Result<Option<u16>, ConfigurationDocumentError> {
+    optional_integer(
+        table,
+        key,
+        field,
+        "a non-negative 16-bit integer",
+        u16::try_from,
+    )
 }
 
 fn optional_usize(
@@ -458,6 +510,13 @@ chunk_size = "5 MiB"
 concurrency = 16
 ignore = ["target", "dist"]
 
+[backup.chunking]
+version = 1
+algorithm = "buzhash"
+min_size = "64 KiB"
+target_size = "128 KiB"
+max_size = "256 KiB"
+
 [live]
 message = "live"
 debounce_ms = 1
@@ -475,6 +534,16 @@ target_path = "restore"
         assert_eq!(document.backup.message.as_deref(), Some("backup"));
         assert_eq!(document.backup.compress, Some(22));
         assert_eq!(document.backup.chunk_size.as_deref(), Some("5 MiB"));
+        let chunking = document
+            .backup
+            .chunking
+            .as_ref()
+            .expect("chunking policy should be persisted");
+        assert_eq!(chunking.version, Some(1));
+        assert_eq!(chunking.algorithm.as_deref(), Some("buzhash"));
+        assert_eq!(chunking.min_size.as_deref(), Some("64 KiB"));
+        assert_eq!(chunking.target_size.as_deref(), Some("128 KiB"));
+        assert_eq!(chunking.max_size.as_deref(), Some("256 KiB"));
         assert_eq!(document.backup.concurrency, Some(16));
         assert_eq!(document.backup.ignore, ["target", "dist"]);
         assert_eq!(document.live.message.as_deref(), Some("live"));
@@ -527,6 +596,11 @@ target_path = "restore"
             (
                 "version = 1\n[backup]\nchunk_size = 1\n",
                 "backup.chunk_size",
+            ),
+            ("version = 1\n[backup]\nchunking = 1\n", "backup.chunking"),
+            (
+                "version = 1\n[backup.chunking]\nversion = \"1\"\n",
+                "backup.chunking.version",
             ),
             (
                 "version = 1\n[backup]\nconcurrency = \"8\"\n",

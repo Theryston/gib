@@ -1,0 +1,8 @@
+version = 1
+
+[backup.chunking]
+version = 1
+algorithm = "buzhash"
+min_size = "64 KiB"
+target_size = "128 KiB"
+max_size = "256 KiB"

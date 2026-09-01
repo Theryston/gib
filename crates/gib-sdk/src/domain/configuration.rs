@@ -4,6 +4,10 @@ use std::time::Duration;
 
 use parse_size::parse_size;
 
+use super::chunk::{
+    CONTENT_DEFINED_CHUNKING_ALGORITHM, CURRENT_CHUNKING_VERSION, ChunkingConfiguration,
+    DEFAULT_MAX_CHUNK_SIZE_BYTES, DEFAULT_MIN_CHUNK_SIZE_BYTES, DEFAULT_TARGET_CHUNK_SIZE_BYTES,
+};
 use super::repository::{DomainError, RepositoryKey};
 use super::snapshot::MAX_SNAPSHOT_MESSAGE_LENGTH;
 
@@ -58,8 +62,18 @@ pub(crate) struct BackupConfigurationInput {
     pub(crate) message: Option<String>,
     pub(crate) compress: Option<i32>,
     pub(crate) chunk_size: Option<String>,
+    pub(crate) chunking: Option<ChunkingConfigurationInput>,
     pub(crate) concurrency: Option<usize>,
     pub(crate) ignore: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ChunkingConfigurationInput {
+    pub(crate) version: Option<u16>,
+    pub(crate) algorithm: Option<String>,
+    pub(crate) min_size: Option<String>,
+    pub(crate) target_size: Option<String>,
+    pub(crate) max_size: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -118,6 +132,7 @@ pub(crate) struct ValidatedBackupConfiguration {
     pub(crate) message: Option<String>,
     pub(crate) compress: Option<i32>,
     pub(crate) chunk_size: Option<ByteSize>,
+    pub(crate) chunking: ChunkingConfiguration,
     pub(crate) concurrency: Option<NonZeroUsize>,
     pub(crate) ignore: Vec<String>,
 }
@@ -259,6 +274,7 @@ fn validate_backup(
         .chunk_size
         .map(|value| validate_chunk_size(value, "backup.chunk_size"))
         .transpose()?;
+    let chunking = validate_chunking(input.chunking)?;
     let concurrency = input
         .concurrency
         .map(|value| validate_concurrency(value, "backup.concurrency"))
@@ -270,9 +286,43 @@ fn validate_backup(
         message,
         compress,
         chunk_size,
+        chunking,
         concurrency,
         ignore,
     })
+}
+
+fn validate_chunking(
+    input: Option<ChunkingConfigurationInput>,
+) -> Result<ChunkingConfiguration, ConfigurationValidationError> {
+    let Some(input) = input else {
+        return Ok(ChunkingConfiguration::default());
+    };
+    let version = input.version.unwrap_or(CURRENT_CHUNKING_VERSION);
+    let algorithm = input
+        .algorithm
+        .unwrap_or_else(|| CONTENT_DEFINED_CHUNKING_ALGORITHM.to_owned());
+    let min_size = input
+        .min_size
+        .map(|value| validate_chunk_size(value, "backup.chunking.min_size"))
+        .transpose()?
+        .map(ByteSize::bytes)
+        .unwrap_or(DEFAULT_MIN_CHUNK_SIZE_BYTES);
+    let target_size = input
+        .target_size
+        .map(|value| validate_chunk_size(value, "backup.chunking.target_size"))
+        .transpose()?
+        .map(ByteSize::bytes)
+        .unwrap_or(DEFAULT_TARGET_CHUNK_SIZE_BYTES);
+    let max_size = input
+        .max_size
+        .map(|value| validate_chunk_size(value, "backup.chunking.max_size"))
+        .transpose()?
+        .map(ByteSize::bytes)
+        .unwrap_or(DEFAULT_MAX_CHUNK_SIZE_BYTES);
+
+    ChunkingConfiguration::from_parts(version, &algorithm, min_size, target_size, max_size)
+        .map_err(|error| ConfigurationValidationError::new("backup.chunking", error.to_string()))
 }
 
 fn validate_live(

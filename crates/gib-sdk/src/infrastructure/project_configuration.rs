@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use crate::application::ports::{ConfigurationFileMetadata, ConfigurationFileSystem};
 use crate::domain::{
-    BackupConfigurationInput, ConfigurationInput, ConfigurationValidationError,
-    LiveConfigurationInput, RepositoryConfigurationInput, RestoreConfigurationInput,
-    ValidatedConfiguration, validate_configuration,
+    BackupConfigurationInput, ChunkingConfigurationInput, ConfigurationInput,
+    ConfigurationValidationError, LiveConfigurationInput, RepositoryConfigurationInput,
+    RestoreConfigurationInput, ValidatedConfiguration, validate_configuration,
 };
 use crate::format::{
     ConfigurationDocumentError, PersistedConfiguration, parse_configuration_document,
@@ -161,6 +161,16 @@ fn input_from_document(document: PersistedConfiguration) -> ConfigurationInput {
             message: document.backup.message,
             compress: document.backup.compress,
             chunk_size: document.backup.chunk_size,
+            chunking: document
+                .backup
+                .chunking
+                .map(|chunking| ChunkingConfigurationInput {
+                    version: chunking.version,
+                    algorithm: chunking.algorithm,
+                    min_size: chunking.min_size,
+                    target_size: chunking.target_size,
+                    max_size: chunking.max_size,
+                }),
             concurrency: document.backup.concurrency,
             ignore: document.backup.ignore,
         },

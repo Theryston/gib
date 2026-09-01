@@ -1,16 +1,27 @@
 mod author;
+mod chunk;
 mod configuration;
 mod object;
 mod repository;
 mod snapshot;
 
 pub use author::{AuthorIdentity, MAX_AUTHOR_IDENTITY_LENGTH};
+#[cfg(feature = "async")]
+pub use chunk::{AsyncChunkStream, AsyncChunker, async_chunk_reader};
+pub use chunk::{
+    BUZHASH_TABLE_SEED, BUZHASH_WINDOW_SIZE, CHUNK_BUFFER_POOL_CAPACITY, CHUNKING_READ_BUFFER_SIZE,
+    CONTENT_DEFINED_CHUNKING_ALGORITHM, CURRENT_CHUNKING_VERSION, Chunk, ChunkBoundary, ChunkId,
+    ChunkIdError, ChunkStream, Chunker, ChunkingConfiguration, ChunkingConfigurationError,
+    ChunkingError, ChunkingResult, DEFAULT_MAX_CHUNK_SIZE_BYTES, DEFAULT_MIN_CHUNK_SIZE_BYTES,
+    DEFAULT_TARGET_CHUNK_SIZE_BYTES, MAX_CONTENT_DEFINED_CHUNK_SIZE_BYTES, chunk_reader,
+    chunk_reader_with_cancellation,
+};
 pub(crate) use configuration::{
-    BackupConfigurationInput, CURRENT_CONFIGURATION_VERSION, ConfigurationInput,
-    ConfigurationValidationError, LiveConfigurationInput, MAX_BACKUP_CONCURRENCY,
-    MAX_CHUNK_SIZE_BYTES, MAX_COMPRESSION_LEVEL, MAX_LIVE_INTERVAL_MS, MIN_COMPRESSION_LEVEL,
-    RepositoryConfigurationInput, RestoreConfigurationInput, ValidatedConfiguration,
-    validate_configuration,
+    BackupConfigurationInput, CURRENT_CONFIGURATION_VERSION, ChunkingConfigurationInput,
+    ConfigurationInput, ConfigurationValidationError, LiveConfigurationInput,
+    MAX_BACKUP_CONCURRENCY, MAX_CHUNK_SIZE_BYTES, MAX_COMPRESSION_LEVEL, MAX_LIVE_INTERVAL_MS,
+    MIN_COMPRESSION_LEVEL, RepositoryConfigurationInput, RestoreConfigurationInput,
+    ValidatedConfiguration, validate_configuration,
 };
 pub(crate) use object::ImmutableObjectParts;
 pub use object::{

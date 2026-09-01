@@ -50,6 +50,16 @@ pub use operation::{
     CancellationHandle, CancellationToken, OperationHandle, OperationId, OperationKind,
     OperationRequest, OperationResult, OperationStatus, Request,
 };
+#[cfg(feature = "async")]
+pub use repository::{AsyncChunkStream, AsyncChunker, async_chunk_reader};
+pub use repository::{
+    BUZHASH_TABLE_SEED, BUZHASH_WINDOW_SIZE, CHUNK_BUFFER_POOL_CAPACITY, CHUNKING_READ_BUFFER_SIZE,
+    CONTENT_DEFINED_CHUNKING_ALGORITHM, CURRENT_CHUNKING_VERSION, Chunk, ChunkBoundary, ChunkId,
+    ChunkIdError, ChunkStream, Chunker, ChunkingConfiguration, ChunkingConfigurationError,
+    ChunkingError, ChunkingResult, DEFAULT_MAX_CHUNK_SIZE_BYTES, DEFAULT_MIN_CHUNK_SIZE_BYTES,
+    DEFAULT_TARGET_CHUNK_SIZE_BYTES, MAX_CONTENT_DEFINED_CHUNK_SIZE_BYTES, chunk_reader,
+    chunk_reader_with_cancellation,
+};
 pub use repository::{
     BackupReference, ByteRange, CURRENT_INDEX_OBJECT_VERSION, CURRENT_OBJECT_ENVELOPE_VERSION,
     CURRENT_PACK_OBJECT_VERSION, CURRENT_REPOSITORY_BOOTSTRAP_VERSION,

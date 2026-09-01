@@ -5,9 +5,9 @@ use std::time::Duration;
 
 pub use crate::application::ports::{ConfigurationFileMetadata, ConfigurationFileSystem};
 use crate::domain::{
-    BackupConfigurationInput, ConfigurationInput, LiveConfigurationInput,
-    RepositoryConfigurationInput, RestoreConfigurationInput, ValidatedConfiguration,
-    validate_configuration,
+    BackupConfigurationInput, ChunkingConfiguration, ChunkingConfigurationInput,
+    ConfigurationInput, LiveConfigurationInput, RepositoryConfigurationInput,
+    RestoreConfigurationInput, ValidatedConfiguration, validate_configuration,
 };
 use crate::format::{
     ConfigurationDocumentError, ConfigurationDocumentErrorKind,
@@ -209,6 +209,7 @@ pub struct ConfigurationOverrides {
     backup_message: Option<String>,
     backup_compress: Option<i32>,
     backup_chunk_size: Option<String>,
+    backup_chunking: Option<ChunkingConfiguration>,
     backup_concurrency: Option<usize>,
     backup_ignore: Vec<String>,
     live_message: Option<String>,
@@ -227,6 +228,7 @@ impl ConfigurationOverrides {
             backup_message: None,
             backup_compress: None,
             backup_chunk_size: None,
+            backup_chunking: None,
             backup_concurrency: None,
             backup_ignore: Vec::new(),
             live_message: None,
@@ -300,6 +302,17 @@ impl ConfigurationOverrides {
     /// Alias for [`Self::with_backup_chunk_size`].
     pub fn with_chunk_size(self, value: impl Into<String>) -> Self {
         self.with_backup_chunk_size(value)
+    }
+
+    /// Overrides `backup.chunking` with a validated content-defined policy.
+    pub fn with_backup_chunking(mut self, value: ChunkingConfiguration) -> Self {
+        self.backup_chunking = Some(value);
+        self
+    }
+
+    /// Alias for [`Self::with_backup_chunking`].
+    pub fn with_chunking(self, value: ChunkingConfiguration) -> Self {
+        self.with_backup_chunking(value)
     }
 
     /// Overrides `backup.concurrency`.
@@ -396,6 +409,11 @@ impl ConfigurationOverrides {
     /// Returns the `backup.chunk_size` override, when present.
     pub fn backup_chunk_size(&self) -> Option<&str> {
         self.backup_chunk_size.as_deref()
+    }
+
+    /// Returns the validated `backup.chunking` override, when present.
+    pub const fn backup_chunking(&self) -> Option<ChunkingConfiguration> {
+        self.backup_chunking
     }
 
     /// Returns the `backup.concurrency` override, when present.
@@ -1047,6 +1065,9 @@ impl ProjectConfiguration {
         if let Some(value) = &overrides.backup_chunk_size {
             input.backup.chunk_size = Some(value.clone());
         }
+        if let Some(value) = overrides.backup_chunking {
+            input.backup.chunking = Some(chunking_input_from_configuration(value));
+        }
         if let Some(value) = overrides.backup_concurrency {
             input.backup.concurrency = Some(value);
         }
@@ -1106,6 +1127,7 @@ impl ProjectConfiguration {
                     .backup
                     .chunk_size
                     .map(|chunk_size| ByteSize(chunk_size.bytes())),
+                chunking: configuration.backup.chunking,
                 concurrency: configuration
                     .backup
                     .concurrency
@@ -1143,6 +1165,9 @@ fn input_from_configuration(configuration: &ProjectConfiguration) -> Configurati
                 .backup
                 .chunk_size
                 .map(|value| format!("{} B", value.bytes())),
+            chunking: Some(chunking_input_from_configuration(
+                configuration.backup.chunking,
+            )),
             concurrency: configuration.backup.concurrency,
             ignore: configuration.backup.ignore.clone(),
         },
@@ -1169,6 +1194,18 @@ fn input_from_configuration(configuration: &ProjectConfiguration) -> Configurati
 
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn chunking_input_from_configuration(
+    configuration: ChunkingConfiguration,
+) -> ChunkingConfigurationInput {
+    ChunkingConfigurationInput {
+        version: Some(configuration.version()),
+        algorithm: Some(configuration.algorithm().to_owned()),
+        min_size: Some(format!("{} B", configuration.min_size())),
+        target_size: Some(format!("{} B", configuration.target_size())),
+        max_size: Some(format!("{} B", configuration.max_size())),
+    }
 }
 
 fn resolve_cli_path(value: &str, invocation_directory: &Path) -> String {
@@ -1237,6 +1274,7 @@ pub struct BackupConfiguration {
     message: Option<String>,
     compress: Option<i32>,
     chunk_size: Option<ByteSize>,
+    chunking: ChunkingConfiguration,
     concurrency: Option<usize>,
     ignore: Vec<String>,
 }
@@ -1270,6 +1308,16 @@ impl BackupConfiguration {
     /// Returns the configured chunk size as validated bytes, if present.
     pub const fn chunk_size(&self) -> Option<ByteSize> {
         self.chunk_size
+    }
+
+    /// Returns the validated content-defined chunking policy.
+    pub const fn chunking(&self) -> ChunkingConfiguration {
+        self.chunking
+    }
+
+    /// Alias for [`Self::chunking`] using policy terminology.
+    pub const fn chunking_policy(&self) -> ChunkingConfiguration {
+        self.chunking()
     }
 
     /// Returns the configured backup concurrency, if present.
