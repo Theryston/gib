@@ -73,6 +73,11 @@ pub enum DomainError {
         /// The stable reason for rejecting the identifier.
         reason: &'static str,
     },
+    /// An immutable object identifier is not a valid SHA-256 value.
+    InvalidObjectId {
+        /// The stable reason for rejecting the identifier.
+        reason: &'static str,
+    },
     /// A snapshot selector is not a valid user-facing reference.
     InvalidSnapshotSelector {
         /// The stable reason for rejecting the selector.
@@ -100,6 +105,7 @@ impl DomainError {
             | Self::InvalidRepositoryObject { reason }
             | Self::InvalidSnapshotReference { reason }
             | Self::InvalidSnapshotId { reason }
+            | Self::InvalidObjectId { reason }
             | Self::InvalidSnapshotSelector { reason }
             | Self::InvalidSnapshotMetadata { reason }
             | Self::InvalidRepositoryHead { reason } => reason,
@@ -127,6 +133,9 @@ impl fmt::Display for DomainError {
             }
             Self::InvalidSnapshotId { reason } => {
                 write!(formatter, "invalid snapshot ID: {reason}")
+            }
+            Self::InvalidObjectId { reason } => {
+                write!(formatter, "invalid immutable object ID: {reason}")
             }
             Self::InvalidSnapshotSelector { reason } => {
                 write!(formatter, "invalid snapshot selector: {reason}")

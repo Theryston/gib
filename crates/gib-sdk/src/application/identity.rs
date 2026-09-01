@@ -67,6 +67,17 @@ fn map_format_error(error: FormatError) -> IdentityError {
         | FormatError::MissingRequiredFeature
         | FormatError::UnsupportedRequiredFeature
         | FormatError::VersionMismatch
-        | FormatError::InvalidChecksum => IdentityError::Malformed,
+        | FormatError::InvalidChecksum
+        | FormatError::InvalidObjectKind
+        | FormatError::UnsupportedObjectVersion { .. }
+        | FormatError::InvalidCodec
+        | FormatError::UnsupportedCodec
+        | FormatError::InvalidEncryption
+        | FormatError::UnsupportedEncryption
+        | FormatError::InvalidLength
+        | FormatError::InvalidDigestLength
+        | FormatError::InvalidObjectId
+        | FormatError::InvalidPayloadChecksum
+        | FormatError::InvalidEnvelopeChecksum => IdentityError::Malformed,
     }
 }

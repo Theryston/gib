@@ -235,7 +235,18 @@ fn map_format_error(error: FormatError) -> StorageConfigurationFormatError {
         | FormatError::UnsupportedRequiredFeature
         | FormatError::UnsupportedVersion { .. }
         | FormatError::VersionMismatch
-        | FormatError::InvalidChecksum => StorageConfigurationFormatError::InvalidEncoding,
+        | FormatError::InvalidChecksum
+        | FormatError::InvalidObjectKind
+        | FormatError::UnsupportedObjectVersion { .. }
+        | FormatError::InvalidCodec
+        | FormatError::UnsupportedCodec
+        | FormatError::InvalidEncryption
+        | FormatError::UnsupportedEncryption
+        | FormatError::InvalidLength
+        | FormatError::InvalidDigestLength
+        | FormatError::InvalidObjectId
+        | FormatError::InvalidPayloadChecksum
+        | FormatError::InvalidEnvelopeChecksum => StorageConfigurationFormatError::InvalidEncoding,
     }
 }
 

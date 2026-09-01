@@ -737,6 +737,26 @@ fn map_format_error(error: FormatError) -> RepositoryError {
         FormatError::InvalidChecksum => RepositoryError::Malformed {
             reason: "repository object integrity check failed",
         },
+        FormatError::InvalidObjectKind => RepositoryError::Malformed {
+            reason: "repository object kind is invalid",
+        },
+        FormatError::UnsupportedObjectVersion { version } => {
+            RepositoryError::UnsupportedVersion { version }
+        }
+        FormatError::InvalidCodec
+        | FormatError::InvalidEncryption
+        | FormatError::InvalidLength
+        | FormatError::InvalidDigestLength
+        | FormatError::InvalidObjectId
+        | FormatError::InvalidPayloadChecksum
+        | FormatError::InvalidEnvelopeChecksum => RepositoryError::Malformed {
+            reason: "repository immutable object integrity or metadata is invalid",
+        },
+        FormatError::UnsupportedCodec | FormatError::UnsupportedEncryption => {
+            RepositoryError::Incompatible {
+                reason: "repository immutable object transport metadata is not supported",
+            }
+        }
         FormatError::Serialization => RepositoryError::Storage {
             operation: "encode",
         },

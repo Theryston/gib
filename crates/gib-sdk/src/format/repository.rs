@@ -2,9 +2,10 @@ use crate::domain::{
     CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
     CURRENT_REPOSITORY_FORMAT_VERSION, CURRENT_REPOSITORY_HEAD_VERSION,
     CURRENT_SNAPSHOT_HISTORY_VERSION, CURRENT_SNAPSHOT_SUMMARY_VERSION, CURRENT_SNAPSHOT_VERSION,
-    DomainError, REPOSITORY_DESCRIPTOR_OBJECT_KEY, REPOSITORY_MAGIC, REQUIRED_REPOSITORY_FEATURE,
-    RepositoryDescriptor, RepositoryFeature, RepositoryHead, RepositoryIdentity, RepositoryKey,
-    RepositoryObject, RepositoryRoots, Snapshot, SnapshotId, SnapshotReference, SnapshotSummary,
+    DomainError, ObjectKind, REPOSITORY_DESCRIPTOR_OBJECT_KEY, REPOSITORY_MAGIC,
+    REQUIRED_REPOSITORY_FEATURE, RepositoryDescriptor, RepositoryFeature, RepositoryHead,
+    RepositoryIdentity, RepositoryKey, RepositoryObject, RepositoryRoots, Snapshot, SnapshotId,
+    SnapshotReference, SnapshotSummary,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -35,6 +36,17 @@ pub(crate) enum FormatError {
     UnsupportedVersion { version: u16 },
     VersionMismatch,
     InvalidChecksum,
+    InvalidObjectKind,
+    UnsupportedObjectVersion { version: u16 },
+    InvalidCodec,
+    UnsupportedCodec,
+    InvalidEncryption,
+    UnsupportedEncryption,
+    InvalidLength,
+    InvalidDigestLength,
+    InvalidObjectId,
+    InvalidPayloadChecksum,
+    InvalidEnvelopeChecksum,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,21 +150,21 @@ struct SnapshotUnsignedWire<'a> {
     total_size: u64,
 }
 
-#[derive(Serialize)]
-struct SnapshotWire<'a> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotPayloadWireOwned {
     snapshot_version: u16,
-    magic: &'a str,
-    id: &'a str,
-    parent: Option<&'a str>,
+    magic: String,
+    id: String,
+    parent: Option<String>,
     created_at: u64,
-    message: &'a str,
-    author: Option<&'a str>,
-    root_tree: Option<&'a str>,
-    path_delta: Option<&'a str>,
+    message: String,
+    author: Option<String>,
+    root_tree: Option<String>,
+    path_delta: Option<String>,
     file_count: u64,
     directory_count: u64,
     total_size: u64,
-    checksum: Vec<u8>,
 }
 
 #[derive(Deserialize)]
@@ -171,6 +183,19 @@ struct SnapshotWireOwned {
     directory_count: u64,
     total_size: u64,
     checksum: Vec<u8>,
+}
+
+struct SnapshotParts {
+    id: String,
+    parent: Option<String>,
+    created_at: u64,
+    message: String,
+    author: Option<String>,
+    root_tree: Option<String>,
+    path_delta: Option<String>,
+    file_count: u64,
+    directory_count: u64,
+    total_size: u64,
 }
 
 #[derive(Serialize)]
@@ -395,11 +420,33 @@ pub(crate) fn decode_head(bytes: &[u8]) -> Result<RepositoryHead, FormatError> {
 }
 
 pub(crate) fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>, FormatError> {
+    let payload = encode_snapshot_payload(snapshot)?;
+    super::envelope::encode_object_envelope(
+        ObjectKind::Snapshot,
+        CURRENT_SNAPSHOT_VERSION,
+        crate::domain::ObjectCodec::None,
+        crate::domain::ObjectEncryption::None,
+        &payload,
+    )
+}
+
+pub(crate) fn snapshot_object_id(
+    snapshot: &Snapshot,
+) -> Result<crate::domain::ObjectId, FormatError> {
+    let payload = encode_snapshot_payload(snapshot)?;
+    Ok(super::envelope::calculate_object_id(
+        ObjectKind::Snapshot,
+        CURRENT_SNAPSHOT_VERSION,
+        &payload,
+    ))
+}
+
+fn encode_snapshot_payload(snapshot: &Snapshot) -> Result<Vec<u8>, FormatError> {
     let parent = snapshot.parent().map(SnapshotId::as_str);
     let author = snapshot.author();
     let root_tree = snapshot.root_tree().map(RepositoryObject::as_str);
     let path_delta = snapshot.path_delta().map(RepositoryObject::as_str);
-    let unsigned_wire = SnapshotUnsignedWire {
+    let wire = SnapshotUnsignedWire {
         snapshot_version: CURRENT_SNAPSHOT_VERSION,
         magic: REPOSITORY_MAGIC,
         id: snapshot.id().as_str(),
@@ -413,24 +460,7 @@ pub(crate) fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>, FormatErro
         directory_count: snapshot.directory_count(),
         total_size: snapshot.total_size(),
     };
-    let unsigned = encode_snapshot_unsigned(&unsigned_wire)?;
-    let checksum = Sha256::digest(&unsigned);
-    let bytes = rmp_serde::to_vec_named(&SnapshotWire {
-        snapshot_version: CURRENT_SNAPSHOT_VERSION,
-        magic: REPOSITORY_MAGIC,
-        id: snapshot.id().as_str(),
-        parent,
-        created_at: snapshot.created_at(),
-        message: snapshot.message(),
-        author,
-        root_tree,
-        path_delta,
-        file_count: snapshot.file_count(),
-        directory_count: snapshot.directory_count(),
-        total_size: snapshot.total_size(),
-        checksum: checksum.to_vec(),
-    })
-    .map_err(|_| FormatError::Serialization)?;
+    let bytes = rmp_serde::to_vec_named(&wire).map_err(|_| FormatError::Serialization)?;
     if bytes.len() > MAX_SNAPSHOT_BYTES {
         return Err(FormatError::InputTooLarge);
     }
@@ -438,6 +468,53 @@ pub(crate) fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>, FormatErro
 }
 
 pub(crate) fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, FormatError> {
+    match super::envelope::decode_object_envelope(bytes) {
+        Ok(object) => {
+            if object.kind() != ObjectKind::Snapshot {
+                return Err(FormatError::InvalidObjectKind);
+            }
+            if object.version() != CURRENT_SNAPSHOT_VERSION {
+                return Err(FormatError::UnsupportedObjectVersion {
+                    version: object.version(),
+                });
+            }
+            decode_snapshot_payload(object.payload())
+        }
+        Err(_error) if has_legacy_snapshot_marker(bytes) => decode_legacy_snapshot(bytes),
+        Err(error) => Err(error),
+    }
+}
+
+fn decode_snapshot_payload(bytes: &[u8]) -> Result<Snapshot, FormatError> {
+    let wire: SnapshotPayloadWireOwned = decode_messagepack(bytes, MAX_SNAPSHOT_BYTES)?;
+    if wire.snapshot_version != CURRENT_SNAPSHOT_VERSION {
+        return Err(FormatError::UnsupportedVersion {
+            version: wire.snapshot_version,
+        });
+    }
+    if wire.magic != REPOSITORY_MAGIC {
+        return Err(FormatError::InvalidMagic);
+    }
+
+    let snapshot = snapshot_from_parts(SnapshotParts {
+        id: wire.id,
+        parent: wire.parent,
+        created_at: wire.created_at,
+        message: wire.message,
+        author: wire.author,
+        root_tree: wire.root_tree,
+        path_delta: wire.path_delta,
+        file_count: wire.file_count,
+        directory_count: wire.directory_count,
+        total_size: wire.total_size,
+    })?;
+    if encode_snapshot_payload(&snapshot)? != bytes {
+        return Err(FormatError::InvalidEncoding);
+    }
+    Ok(snapshot)
+}
+
+fn decode_legacy_snapshot(bytes: &[u8]) -> Result<Snapshot, FormatError> {
     let wire: SnapshotWireOwned = decode_messagepack(bytes, MAX_SNAPSHOT_BYTES)?;
     if wire.snapshot_version != CURRENT_SNAPSHOT_VERSION {
         return Err(FormatError::UnsupportedVersion {
@@ -470,29 +547,57 @@ pub(crate) fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, FormatError> {
         return Err(FormatError::InvalidChecksum);
     }
 
-    let id = SnapshotId::new(wire.id).map_err(map_domain_error)?;
-    let parent = wire
+    snapshot_from_parts(SnapshotParts {
+        id: wire.id,
+        parent: wire.parent,
+        created_at: wire.created_at,
+        message: wire.message,
+        author: wire.author,
+        root_tree: wire.root_tree,
+        path_delta: wire.path_delta,
+        file_count: wire.file_count,
+        directory_count: wire.directory_count,
+        total_size: wire.total_size,
+    })
+}
+
+fn snapshot_from_parts(parts: SnapshotParts) -> Result<Snapshot, FormatError> {
+    let id = SnapshotId::new(parts.id).map_err(map_domain_error)?;
+    let parent = parts
         .parent
         .map(SnapshotId::new)
         .transpose()
         .map_err(map_domain_error)?;
     let mut snapshot =
-        Snapshot::new(id, wire.message, wire.created_at).map_err(map_domain_error)?;
+        Snapshot::new(id, parts.message, parts.created_at).map_err(map_domain_error)?;
     if let Some(parent) = parent {
         snapshot = snapshot.with_parent(Some(parent));
     }
-    if let Some(author) = wire.author {
+    if let Some(author) = parts.author {
         snapshot = snapshot.with_author(author).map_err(map_domain_error)?;
     }
-    if let Some(root_tree) = wire.root_tree {
+    if let Some(root_tree) = parts.root_tree {
         snapshot =
             snapshot.with_root_tree(RepositoryObject::new(root_tree).map_err(map_domain_error)?);
     }
-    if let Some(path_delta) = wire.path_delta {
+    if let Some(path_delta) = parts.path_delta {
         snapshot =
             snapshot.with_path_delta(RepositoryObject::new(path_delta).map_err(map_domain_error)?);
     }
-    Ok(snapshot.with_statistics(wire.file_count, wire.directory_count, wire.total_size))
+    Ok(snapshot.with_statistics(parts.file_count, parts.directory_count, parts.total_size))
+}
+
+#[derive(Deserialize)]
+struct SnapshotVersionMarker {
+    #[serde(default)]
+    snapshot_version: Option<u16>,
+}
+
+fn has_legacy_snapshot_marker(bytes: &[u8]) -> bool {
+    rmp_serde::from_slice::<SnapshotVersionMarker>(bytes)
+        .ok()
+        .and_then(|marker| marker.snapshot_version)
+        .is_some()
 }
 
 pub(crate) fn encode_history_record(
@@ -651,7 +756,13 @@ where
         return Err(FormatError::InputTooLarge);
     }
 
-    validate_messagepack(bytes)?;
+    validate_messagepack_with_limits(
+        bytes,
+        MAX_MESSAGEPACK_STRING_BYTES,
+        MAX_MESSAGEPACK_STRING_BYTES,
+        MAX_MESSAGEPACK_COLLECTION_ITEMS,
+        MAX_MESSAGEPACK_DEPTH,
+    )?;
     let mut decoder = rmp_serde::Deserializer::new(Cursor::new(bytes));
     let value = T::deserialize(&mut decoder).map_err(|_| FormatError::InvalidEncoding)?;
     if decoder.position() != bytes.len() as u64 {
@@ -660,8 +771,53 @@ where
     Ok(value)
 }
 
-fn validate_messagepack(bytes: &[u8]) -> Result<(), FormatError> {
-    let mut scanner = MessagePackScanner { bytes, position: 0 };
+pub(crate) fn decode_messagepack_with_limits<T>(
+    bytes: &[u8],
+    max_bytes: usize,
+    max_string_bytes: u32,
+    max_binary_bytes: u32,
+    max_collection_items: u32,
+    max_depth: usize,
+) -> Result<T, FormatError>
+where
+    T: DeserializeOwned,
+{
+    if bytes.is_empty() {
+        return Err(FormatError::InvalidEncoding);
+    }
+    if bytes.len() > max_bytes {
+        return Err(FormatError::InputTooLarge);
+    }
+    validate_messagepack_with_limits(
+        bytes,
+        max_string_bytes,
+        max_binary_bytes,
+        max_collection_items,
+        max_depth,
+    )?;
+    let mut decoder = rmp_serde::Deserializer::new(Cursor::new(bytes));
+    let value = T::deserialize(&mut decoder).map_err(|_| FormatError::InvalidEncoding)?;
+    if decoder.position() != bytes.len() as u64 {
+        return Err(FormatError::TrailingBytes);
+    }
+    Ok(value)
+}
+
+fn validate_messagepack_with_limits(
+    bytes: &[u8],
+    max_string_bytes: u32,
+    max_binary_bytes: u32,
+    max_collection_items: u32,
+    max_depth: usize,
+) -> Result<(), FormatError> {
+    let mut scanner = MessagePackScanner {
+        bytes,
+        position: 0,
+        max_string_bytes,
+        max_binary_bytes,
+        max_collection_items,
+        max_depth,
+    };
     scanner.scan_value(0)?;
     if scanner.position != bytes.len() {
         return Err(FormatError::TrailingBytes);
@@ -672,11 +828,15 @@ fn validate_messagepack(bytes: &[u8]) -> Result<(), FormatError> {
 struct MessagePackScanner<'a> {
     bytes: &'a [u8],
     position: usize,
+    max_string_bytes: u32,
+    max_binary_bytes: u32,
+    max_collection_items: u32,
+    max_depth: usize,
 }
 
 impl MessagePackScanner<'_> {
     fn scan_value(&mut self, depth: usize) -> Result<(), FormatError> {
-        if depth > MAX_MESSAGEPACK_DEPTH {
+        if depth > self.max_depth {
             return Err(FormatError::InputTooLarge);
         }
         let marker = self.read_u8()?;
@@ -757,7 +917,7 @@ impl MessagePackScanner<'_> {
     }
 
     fn scan_array(&mut self, length: u32, depth: usize) -> Result<(), FormatError> {
-        if length > MAX_MESSAGEPACK_COLLECTION_ITEMS {
+        if length > self.max_collection_items {
             return Err(FormatError::InputTooLarge);
         }
         for _ in 0..length {
@@ -767,7 +927,7 @@ impl MessagePackScanner<'_> {
     }
 
     fn scan_map(&mut self, length: u32, depth: usize) -> Result<(), FormatError> {
-        if length > MAX_MESSAGEPACK_COLLECTION_ITEMS {
+        if length > self.max_collection_items {
             return Err(FormatError::InputTooLarge);
         }
         for _ in 0..length {
@@ -778,14 +938,17 @@ impl MessagePackScanner<'_> {
     }
 
     fn skip_string(&mut self, length: u32) -> Result<(), FormatError> {
-        if length > MAX_MESSAGEPACK_STRING_BYTES {
+        if length > self.max_string_bytes {
             return Err(FormatError::InputTooLarge);
         }
         self.skip_exact(usize::try_from(length).map_err(|_| FormatError::InputTooLarge)?)
     }
 
     fn skip_binary(&mut self, length: u32) -> Result<(), FormatError> {
-        self.skip_string(length)
+        if length > self.max_binary_bytes {
+            return Err(FormatError::InputTooLarge);
+        }
+        self.skip_exact(usize::try_from(length).map_err(|_| FormatError::InputTooLarge)?)
     }
 
     fn skip_extension(&mut self, length: u32) -> Result<(), FormatError> {
@@ -846,6 +1009,7 @@ fn map_domain_error(error: DomainError) -> FormatError {
         | DomainError::InvalidRepositoryObject { .. }
         | DomainError::InvalidSnapshotReference { .. }
         | DomainError::InvalidSnapshotId { .. }
+        | DomainError::InvalidObjectId { .. }
         | DomainError::InvalidSnapshotSelector { .. }
         | DomainError::InvalidSnapshotMetadata { .. }
         | DomainError::InvalidRepositoryHead { .. } => FormatError::InvalidField,

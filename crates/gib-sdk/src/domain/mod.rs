@@ -1,5 +1,6 @@
 mod author;
 mod configuration;
+mod object;
 mod repository;
 mod snapshot;
 
@@ -10,6 +11,13 @@ pub(crate) use configuration::{
     MAX_CHUNK_SIZE_BYTES, MAX_COMPRESSION_LEVEL, MAX_LIVE_INTERVAL_MS, MIN_COMPRESSION_LEVEL,
     RepositoryConfigurationInput, RestoreConfigurationInput, ValidatedConfiguration,
     validate_configuration,
+};
+pub(crate) use object::ImmutableObjectParts;
+pub use object::{
+    CURRENT_INDEX_OBJECT_VERSION, CURRENT_OBJECT_ENVELOPE_VERSION, CURRENT_PACK_OBJECT_VERSION,
+    CURRENT_TREE_OBJECT_VERSION, ImmutableObject, MAX_IMMUTABLE_OBJECT_BYTES,
+    MAX_IMMUTABLE_OBJECT_PAYLOAD_BYTES, OBJECT_ID_HEX_LENGTH, ObjectCodec, ObjectEncryption,
+    ObjectId, ObjectKind,
 };
 pub use repository::{
     CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,

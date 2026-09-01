@@ -10,8 +10,12 @@ use crate::application::repository::{
     resolve_snapshot_reference as resolve_snapshot_reference_use_case,
 };
 use crate::domain::DomainError;
-use crate::format::{FormatError, decode_snapshot, encode_snapshot};
+use crate::format::{
+    FormatError, calculate_object_id, decode_object_envelope, decode_object_envelope_from_reader,
+    decode_snapshot, encode_object_envelope, encode_snapshot, snapshot_object_id,
+};
 use std::fmt;
+use std::io::Read;
 use std::sync::Arc;
 
 pub use crate::application::ports::{
@@ -32,6 +36,12 @@ pub use crate::domain::{
     SnapshotId, SnapshotListRequest, SnapshotPage, SnapshotRef, SnapshotReferenceInput,
     SnapshotReferenceSelector, SnapshotSelector, SnapshotSummary, SnapshotSummaryListRequest,
     SnapshotSummaryPage,
+};
+pub use crate::domain::{
+    CURRENT_INDEX_OBJECT_VERSION, CURRENT_OBJECT_ENVELOPE_VERSION, CURRENT_PACK_OBJECT_VERSION,
+    CURRENT_TREE_OBJECT_VERSION, ImmutableObject, MAX_IMMUTABLE_OBJECT_BYTES,
+    MAX_IMMUTABLE_OBJECT_PAYLOAD_BYTES, OBJECT_ID_HEX_LENGTH, ObjectCodec, ObjectEncryption,
+    ObjectId, ObjectKind,
 };
 pub use crate::domain::{
     CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
@@ -731,6 +741,10 @@ impl From<DomainError> for SdkError {
                 field: "snapshot_id",
                 reason,
             },
+            DomainError::InvalidObjectId { reason } => SdkError::InvalidRequest {
+                field: "object_id",
+                reason,
+            },
             DomainError::InvalidSnapshotSelector { reason } => SdkError::InvalidRequest {
                 field: "snapshot_reference",
                 reason,
@@ -801,6 +815,17 @@ impl Snapshot {
     pub fn from_bytes(bytes: &[u8]) -> SdkResult<Self> {
         decode_snapshot(bytes).map_err(map_snapshot_format_error)
     }
+
+    /// Returns the content ID calculated from this snapshot's canonical
+    /// plaintext payload.
+    pub fn object_id(&self) -> SdkResult<ObjectId> {
+        snapshot_object_id(self).map_err(map_snapshot_format_error)
+    }
+
+    /// Alias for [`Self::object_id`].
+    pub fn content_id(&self) -> SdkResult<ObjectId> {
+        self.object_id()
+    }
 }
 
 /// Encodes one compact authoritative snapshot header.
@@ -813,9 +838,78 @@ pub fn decode_snapshot_object(bytes: &[u8]) -> SdkResult<Snapshot> {
     Snapshot::from_bytes(bytes)
 }
 
+/// Calculates an immutable object ID from a kind, payload version, and
+/// canonical plaintext payload. The hash includes only the kind, version, and
+/// payload (with the documented domain separator); codec, encryption, length,
+/// and checksum metadata do not affect the result.
+pub fn object_id_for_content(
+    kind: ObjectKind,
+    object_version: u16,
+    canonical_plaintext: &[u8],
+) -> ObjectId {
+    calculate_object_id(kind, object_version, canonical_plaintext)
+}
+
+/// Alias for [`object_id_for_content`].
+pub fn calculate_object_id_for_content(
+    kind: ObjectKind,
+    object_version: u16,
+    canonical_plaintext: &[u8],
+) -> ObjectId {
+    object_id_for_content(kind, object_version, canonical_plaintext)
+}
+
+/// Encodes canonical plaintext in the common immutable-object envelope.
+///
+/// The current release accepts only [`ObjectCodec::None`] and
+/// [`ObjectEncryption::None`]. Other metadata values are reserved for
+/// decoders that implement their corresponding transforms.
+pub fn encode_immutable_object(
+    kind: ObjectKind,
+    object_version: u16,
+    codec: ObjectCodec,
+    encryption: ObjectEncryption,
+    canonical_plaintext: &[u8],
+) -> SdkResult<Vec<u8>> {
+    encode_object_envelope(kind, object_version, codec, encryption, canonical_plaintext)
+        .map_err(map_object_format_error)
+}
+
+/// Encodes canonical plaintext using the current uncompressed, unencrypted
+/// object representation.
+pub fn encode_object(
+    kind: ObjectKind,
+    object_version: u16,
+    canonical_plaintext: &[u8],
+) -> SdkResult<Vec<u8>> {
+    encode_immutable_object(
+        kind,
+        object_version,
+        ObjectCodec::None,
+        ObjectEncryption::None,
+        canonical_plaintext,
+    )
+}
+
+/// Decodes and authenticates a common immutable-object envelope.
+pub fn decode_immutable_object(bytes: &[u8]) -> SdkResult<ImmutableObject> {
+    decode_object_envelope(bytes).map_err(map_object_format_error)
+}
+
+/// Alias for [`decode_immutable_object`].
+pub fn decode_object(bytes: &[u8]) -> SdkResult<ImmutableObject> {
+    decode_immutable_object(bytes)
+}
+
+/// Reads, bounds, decodes, and authenticates an immutable object.
+pub fn decode_immutable_object_from_reader<R: Read>(mut reader: R) -> SdkResult<ImmutableObject> {
+    decode_object_envelope_from_reader(&mut reader).map_err(map_object_format_error)
+}
+
 fn map_snapshot_format_error(error: FormatError) -> SdkError {
     match error {
-        FormatError::UnsupportedVersion { version } => {
+        FormatError::UnsupportedVersion { version }
+        | FormatError::UnsupportedObjectVersion { version } => {
             SdkError::RepositoryUnsupportedVersion { version }
         }
         FormatError::InvalidEncoding => SdkError::RepositoryMalformed {
@@ -838,8 +932,78 @@ fn map_snapshot_format_error(error: FormatError) -> SdkError {
         | FormatError::MissingRequiredFeature
         | FormatError::UnsupportedRequiredFeature
         | FormatError::VersionMismatch
-        | FormatError::Serialization => SdkError::RepositoryMalformed {
+        | FormatError::Serialization
+        | FormatError::InvalidObjectKind
+        | FormatError::InvalidCodec
+        | FormatError::InvalidEncryption
+        | FormatError::InvalidLength
+        | FormatError::InvalidDigestLength
+        | FormatError::InvalidObjectId
+        | FormatError::InvalidPayloadChecksum
+        | FormatError::InvalidEnvelopeChecksum => SdkError::RepositoryMalformed {
             reason: "snapshot object contains an invalid field",
+        },
+        FormatError::UnsupportedCodec | FormatError::UnsupportedEncryption => {
+            SdkError::RepositoryIncompatible {
+                reason: "snapshot object transport metadata is not supported",
+            }
+        }
+    }
+}
+
+fn map_object_format_error(error: FormatError) -> SdkError {
+    match error {
+        FormatError::UnsupportedVersion { version }
+        | FormatError::UnsupportedObjectVersion { version } => {
+            SdkError::RepositoryUnsupportedVersion { version }
+        }
+        FormatError::UnsupportedCodec | FormatError::UnsupportedEncryption => {
+            SdkError::RepositoryIncompatible {
+                reason: "immutable object transport metadata is not supported",
+            }
+        }
+        FormatError::InvalidEncoding => SdkError::RepositoryMalformed {
+            reason: "immutable object is not valid MessagePack",
+        },
+        FormatError::InputTooLarge => SdkError::RepositoryMalformed {
+            reason: "immutable object exceeds the supported size limit",
+        },
+        FormatError::TrailingBytes => SdkError::RepositoryMalformed {
+            reason: "immutable object contains trailing bytes",
+        },
+        FormatError::InvalidMagic => SdkError::RepositoryMalformed {
+            reason: "immutable object magic is invalid",
+        },
+        FormatError::InvalidObjectKind => SdkError::RepositoryMalformed {
+            reason: "immutable object kind is invalid",
+        },
+        FormatError::InvalidCodec | FormatError::InvalidEncryption => {
+            SdkError::RepositoryMalformed {
+                reason: "immutable object transport metadata is invalid",
+            }
+        }
+        FormatError::InvalidLength => SdkError::RepositoryMalformed {
+            reason: "immutable object length is invalid",
+        },
+        FormatError::InvalidDigestLength => SdkError::RepositoryMalformed {
+            reason: "immutable object digest length is invalid",
+        },
+        FormatError::InvalidObjectId => SdkError::RepositoryMalformed {
+            reason: "immutable object identity check failed",
+        },
+        FormatError::InvalidPayloadChecksum | FormatError::InvalidEnvelopeChecksum => {
+            SdkError::RepositoryMalformed {
+                reason: "immutable object integrity check failed",
+            }
+        }
+        FormatError::InvalidRootReference
+        | FormatError::MissingRequiredFeature
+        | FormatError::UnsupportedRequiredFeature
+        | FormatError::VersionMismatch
+        | FormatError::InvalidChecksum
+        | FormatError::InvalidField
+        | FormatError::Serialization => SdkError::RepositoryMalformed {
+            reason: "immutable object contains an invalid field",
         },
     }
 }
