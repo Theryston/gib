@@ -1,10 +1,12 @@
 use crate::input::OutputMode;
+use crate::interactive;
 use gib::{
     AuthorIdentity, ConfigurationSource, ResolvedConfiguration, SnapshotReference,
-    SnapshotSummaryPage, StorageAddResult, StorageBackend, StorageConfigurationMetadata,
-    StorageListResult, StorageRemoveResult,
+    SnapshotSummaryPage, StorageAddRequest, StorageAddResult, StorageBackend,
+    StorageConfigurationMetadata, StorageListResult, StorageRemoveResult,
 };
 use serde::Serialize;
+use std::path::Path;
 
 const CLI_OUTPUT_SCHEMA_VERSION: u16 = 1;
 
@@ -63,9 +65,11 @@ pub fn render_configuration_source(configuration: &ResolvedConfiguration, mode: 
     match mode {
         OutputMode::Interactive => match source {
             ConfigurationSource::Discovered(path) | ConfigurationSource::Explicit(path) => {
-                println!("Loaded local config {}", path.display());
+                interactive::info(&format!("Using local configuration · {}", path.display()));
             }
-            ConfigurationSource::Disabled => println!("Local config disabled."),
+            ConfigurationSource::Disabled => {
+                interactive::warning("Local configuration discovery is disabled for this command.")
+            }
             ConfigurationSource::Defaults => {}
             _ => {}
         },
@@ -76,11 +80,28 @@ pub fn render_configuration_source(configuration: &ResolvedConfiguration, mode: 
 pub fn render_identity(identity: &AuthorIdentity, mode: OutputMode, action: &str) {
     match mode {
         OutputMode::Interactive => {
-            if action == "configured" {
-                println!("Configured author: {identity}");
-            } else {
-                println!("You are: {identity}");
-            }
+            let configured = action == "configured";
+            interactive::banner(
+                if configured {
+                    "Identity configured"
+                } else {
+                    "Your identity"
+                },
+                if configured {
+                    "This author will be attached to your snapshots."
+                } else {
+                    "The author currently associated with your snapshots."
+                },
+            );
+            interactive::card("Author profile", &[("Author", identity.to_string())]);
+            interactive::success_value(
+                if configured {
+                    "Configured author"
+                } else {
+                    "You are"
+                },
+                identity.as_str(),
+            );
         }
         OutputMode::Json => {
             let envelope = OutputEnvelope {
@@ -95,6 +116,44 @@ pub fn render_identity(identity: &AuthorIdentity, mode: OutputMode, action: &str
             }
         }
     }
+}
+
+pub fn render_identity_prompt_start() {
+    interactive::section(
+        "Set your author identity",
+        Some("Use the format Name <email>; this is saved in your global profile"),
+    );
+}
+
+pub fn render_history_start(repository: &Path, page_size: usize, mode: OutputMode) {
+    if mode != OutputMode::Interactive {
+        return;
+    }
+    interactive::banner(
+        "Snapshot history",
+        "A calm, newest-first view of your repository timeline.",
+    );
+    interactive::card(
+        "Query",
+        &[
+            ("Repository", repository.display().to_string()),
+            ("Page size", page_size.to_string()),
+        ],
+    );
+    println!();
+    println!(
+        "  {}  {}  {}  {}  {}",
+        dialoguer::console::style("TIME").black().bright(),
+        dialoguer::console::style("SIZE").black().bright(),
+        dialoguer::console::style("SNAPSHOT").black().bright(),
+        dialoguer::console::style("AUTHOR").black().bright(),
+        dialoguer::console::style("MESSAGE").black().bright()
+    );
+    println!(
+        "  {}",
+        dialoguer::console::style("────────────────────────────────────────────────────────")
+            .cyan()
+    );
 }
 
 pub fn render_history(page: &SnapshotSummaryPage, mode: OutputMode) {
@@ -125,13 +184,27 @@ pub fn render_history(page: &SnapshotSummaryPage, mode: OutputMode) {
             .map_or_else(|| String::from("-"), |value| value.to_string());
         let size = summary
             .size()
-            .map_or_else(|| String::from("-"), |value| value.to_string());
+            .map_or_else(|| String::from("-"), format_size);
+        let snapshot = shorten(summary.id().as_ref(), 16);
+        let author = summary
+            .author()
+            .map_or_else(|| String::from("-"), |value| shorten(value, 18));
+        let message = one_line(summary.message(), 42);
         println!(
-            "{}\t{}\t{}\t{}",
-            summary.id(),
-            timestamp,
-            size,
-            summary.message()
+            "  {:<20} {:>10}  {:<16}  {:<18}  {}",
+            timestamp, size, snapshot, author, message
+        );
+    }
+}
+
+pub fn render_history_complete(count: usize, mode: OutputMode) {
+    if mode == OutputMode::Interactive {
+        interactive::success(
+            &format!(
+                "{count} snapshot{} shown",
+                if count == 1 { "" } else { "s" }
+            ),
+            Some("Use `gib resolve latest` to inspect the newest snapshot."),
         );
     }
 }
@@ -147,11 +220,11 @@ pub fn render_empty_history(mode: OutputMode) {
             false,
         );
     } else {
-        println!("No snapshots.");
+        interactive::info("No snapshots yet. Run a backup to create your first checkpoint.");
     }
 }
 
-pub fn render_resolved_reference(reference: &SnapshotReference, mode: OutputMode) {
+pub fn render_resolved_reference(requested: &str, reference: &SnapshotReference, mode: OutputMode) {
     if mode == OutputMode::Json {
         render_json(
             "output",
@@ -161,7 +234,18 @@ pub fn render_resolved_reference(reference: &SnapshotReference, mode: OutputMode
             false,
         );
     } else {
-        println!("{reference}");
+        interactive::banner(
+            "Snapshot resolved",
+            "The reference points to an immutable snapshot.",
+        );
+        interactive::card(
+            "Resolution",
+            &[
+                ("Requested", requested.to_owned()),
+                ("Snapshot", reference.to_string()),
+            ],
+        );
+        interactive::success_line("Snapshot reference is ready to use.");
     }
 }
 
@@ -172,7 +256,9 @@ pub fn render_error(
     mode: OutputMode,
 ) {
     match mode {
-        OutputMode::Interactive => eprintln!("error: {error}"),
+        OutputMode::Interactive => {
+            interactive::error("Command failed", &error.to_string(), code, field)
+        }
         OutputMode::Json => {
             render_json(
                 "error",
@@ -251,20 +337,102 @@ struct StorageRemoveOutput {
     repository_data_preserved: bool,
 }
 
+pub fn render_storage_add_start(name: Option<&str>) {
+    interactive::banner(
+        "Add a storage",
+        "Connect a local folder, an S3 bucket, or a WebDAV collection.",
+    );
+    if let Some(name) = name {
+        interactive::info(&format!("Configuring `{}`", one_line(name, 54)));
+    }
+}
+
+pub fn render_storage_add_review(request: &StorageAddRequest) {
+    let backend = request.configuration().backend();
+    let mut fields = vec![
+        ("Name", request.name().to_string()),
+        ("Backend", backend.kind().to_string()),
+    ];
+    match backend {
+        StorageBackend::Local(settings) => {
+            fields.push(("Folder", settings.root().display().to_string()));
+        }
+        StorageBackend::S3(settings) => {
+            fields.push(("Region", settings.region().to_owned()));
+            fields.push(("Bucket", settings.bucket().to_owned()));
+            fields.push((
+                "Endpoint",
+                settings
+                    .endpoint()
+                    .map_or_else(|| "AWS default".to_owned(), ToOwned::to_owned),
+            ));
+            fields.push((
+                "Addressing",
+                if settings.force_path_style() {
+                    "Path style".to_owned()
+                } else {
+                    "Virtual host".to_owned()
+                },
+            ));
+        }
+        StorageBackend::WebDav(settings) => {
+            fields.push(("Collection", settings.collection_url().to_owned()));
+            fields.push((
+                "Transport",
+                if settings.allow_insecure_http() {
+                    "HTTP (explicitly allowed)".to_owned()
+                } else {
+                    "HTTPS".to_owned()
+                },
+            ));
+        }
+        _ => {}
+    }
+    fields.push((
+        "Credentials",
+        if request.configuration().credentials().is_some() {
+            "configured".to_owned()
+        } else {
+            "not required".to_owned()
+        },
+    ));
+    interactive::section(
+        "Check the details",
+        Some("nothing is saved until you confirm"),
+    );
+    interactive::card("Review before saving", &fields);
+}
+
+pub fn render_storage_checking(request: &StorageAddRequest) {
+    interactive::info(&format!(
+        "Checking {} connectivity before saving…",
+        request.configuration().backend().kind()
+    ));
+}
+
+pub fn render_storage_conflict(name: &str) {
+    interactive::warning(&format!(
+        "A storage named `{}` already exists.",
+        one_line(name, 54)
+    ));
+}
+
 pub fn render_storage_add(result: &StorageAddResult, mode: OutputMode) {
     let storage = storage_output(result.metadata());
     match mode {
-        OutputMode::Interactive => println!(
-            "{} storage '{}' ({}) [{}]",
-            if result.replaced_existing() {
-                "Replaced"
-            } else {
-                "Added"
-            },
-            storage.name,
-            storage.backend,
-            storage.health
-        ),
+        OutputMode::Interactive => {
+            interactive::success_line(&format!(
+                "{} storage '{}' ({})",
+                if result.replaced_existing() {
+                    "Replaced"
+                } else {
+                    "Added"
+                },
+                storage.name,
+                storage.backend
+            ));
+            interactive::card("Stored configuration", &storage_card_fields(&storage));
+        }
         OutputMode::Json => render_json(
             "storage",
             StorageAddOutput {
@@ -281,6 +449,21 @@ pub fn render_storage_add(result: &StorageAddResult, mode: OutputMode) {
     }
 }
 
+pub fn render_storage_list_start(check_health: bool) {
+    interactive::banner(
+        "Storage spaces",
+        if check_health {
+            "Reviewing configured backends and checking their health."
+        } else {
+            "Your named storage destinations at a glance."
+        },
+    );
+}
+
+pub fn render_storage_health_check_start() {
+    interactive::info("Running read-only connectivity checks…");
+}
+
 pub fn render_storage_list(result: &StorageListResult, mode: OutputMode) {
     let storages = result
         .storages()
@@ -290,30 +473,48 @@ pub fn render_storage_list(result: &StorageListResult, mode: OutputMode) {
     match mode {
         OutputMode::Interactive => {
             if storages.is_empty() {
-                println!("No storages.");
+                interactive::info("No storages configured yet.");
                 return;
             }
-            println!("NAME\tBACKEND\tENDPOINT/PATH\tHEALTH\tCREDENTIALS");
-            for storage in storages {
-                let location = storage
-                    .path
-                    .as_deref()
-                    .or(storage.endpoint.as_deref())
-                    .or(storage.url.as_deref())
-                    .unwrap_or("-");
+            println!(
+                "  {}  {}  {}  {}  {}",
+                dialoguer::console::style("NAME").black().bright(),
+                dialoguer::console::style("BACKEND").black().bright(),
+                dialoguer::console::style("LOCATION").black().bright(),
+                dialoguer::console::style("HEALTH").black().bright(),
+                dialoguer::console::style("CREDENTIALS").black().bright()
+            );
+            println!(
+                "  {}",
+                dialoguer::console::style(
+                    "────────────────────────────────────────────────────────"
+                )
+                .cyan()
+            );
+            for storage in &storages {
+                let location = storage_location(storage);
+                let health = if storage.health == "healthy" {
+                    dialoguer::console::style("● healthy").green().to_string()
+                } else {
+                    "– not checked".to_owned()
+                };
                 println!(
-                    "{}\t{}\t{}\t{}\t{}",
-                    storage.name,
+                    "  {:<18} {:<8} {:<34} {:<14} {}",
+                    shorten(&storage.name, 18),
                     storage.backend,
-                    location,
-                    storage.health,
-                    if storage.credentials_configured {
-                        "configured"
-                    } else {
-                        "not_configured"
-                    }
+                    shorten(&location, 34),
+                    health,
+                    storage_credentials_label(storage)
                 );
             }
+            interactive::success(
+                &format!(
+                    "{} storage{} configured",
+                    storages.len(),
+                    if storages.len() == 1 { "" } else { "s" }
+                ),
+                None,
+            );
         }
         OutputMode::Json => render_json(
             "storage",
@@ -326,14 +527,30 @@ pub fn render_storage_list(result: &StorageListResult, mode: OutputMode) {
     }
 }
 
+pub fn render_storage_remove_start() {
+    interactive::banner(
+        "Remove a storage",
+        "This removes only Gib’s configuration and credentials.",
+    );
+}
+
+pub fn render_storage_remove_review(metadata: &StorageConfigurationMetadata) {
+    let storage = storage_output(metadata);
+    interactive::section("Confirm removal", Some("repository data remains untouched"));
+    interactive::card("Removal preview", &storage_card_fields(&storage));
+    interactive::warning("Repository contents will not be deleted.");
+}
+
 pub fn render_storage_remove(result: &StorageRemoveResult, mode: OutputMode) {
     let name = result.name().to_string();
     let backend = result.backend().to_string();
     match mode {
-        OutputMode::Interactive => println!(
-            "Removed storage '{}' ({}) and preserved repository data.",
-            name, backend
-        ),
+        OutputMode::Interactive => {
+            interactive::success_line(&format!("Removed storage '{}' ({})", name, backend));
+            interactive::info(
+                "Repository data was preserved; only the configuration and credential were removed.",
+            );
+        }
         OutputMode::Json => render_json(
             "storage",
             StorageRemoveOutput {
@@ -386,4 +603,98 @@ fn storage_output(metadata: &StorageConfigurationMetadata) -> StorageOutput {
         credentials_configured: metadata.credentials_configured(),
         health: metadata.health().to_string(),
     }
+}
+
+fn storage_location(storage: &StorageOutput) -> String {
+    storage
+        .path
+        .as_deref()
+        .or(storage.endpoint.as_deref())
+        .or(storage.url.as_deref())
+        .or(storage.bucket.as_deref())
+        .unwrap_or("-")
+        .to_owned()
+}
+
+fn storage_card_fields(storage: &StorageOutput) -> Vec<(&'static str, String)> {
+    let mut fields = vec![
+        ("Name", storage.name.clone()),
+        ("Backend", storage.backend.clone()),
+        ("Location", storage_location(storage)),
+    ];
+    if let Some(region) = &storage.region {
+        fields.push(("Region", region.clone()));
+    }
+    if let Some(bucket) = &storage.bucket {
+        fields.push(("Bucket", bucket.clone()));
+    }
+    fields.push(("Health", storage_health_label(storage)));
+    fields.push(("Credentials", storage_credentials_label(storage).to_owned()));
+    fields
+}
+
+fn storage_health_label(storage: &StorageOutput) -> String {
+    match storage.health.as_str() {
+        "healthy" => "● healthy".to_owned(),
+        _ => "– not checked".to_owned(),
+    }
+}
+
+fn storage_credentials_label(storage: &StorageOutput) -> &'static str {
+    if storage.credentials_configured {
+        "configured"
+    } else {
+        "not required"
+    }
+}
+
+fn format_size(size: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = size as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{size} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn shorten(value: &str, max_chars: usize) -> String {
+    let value = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+    let mut shortened = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    shortened.push('…');
+    shortened
+}
+
+fn one_line(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(max_chars)
+        .collect()
 }

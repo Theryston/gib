@@ -8,6 +8,6 @@ pub fn run(request: ResolveRequest, mode: OutputMode) -> Result<(), CommandError
     let reference = repository
         .resolve_snapshot_reference(&request.reference)
         .map_err(CommandError::Sdk)?;
-    output::render_resolved_reference(&reference, mode);
+    output::render_resolved_reference(&request.reference, &reference, mode);
     Ok(())
 }

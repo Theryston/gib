@@ -225,12 +225,14 @@ fn run_in(directory: &Path, arguments: &[String]) -> OutputText {
 }
 
 fn parse_single_json(value: &str) -> Value {
+    assert!(!value.contains('\x1b'));
     let lines = value.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 1, "expected one JSON line, got {value:?}");
     serde_json::from_str(lines[0]).expect("output should be valid JSON")
 }
 
 fn parse_json_lines(value: &str) -> Vec<Value> {
+    assert!(!value.contains('\x1b'));
     value
         .lines()
         .map(|line| serde_json::from_str(line).expect("output should be valid JSON"))

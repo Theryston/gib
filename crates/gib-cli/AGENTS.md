@@ -170,6 +170,31 @@ terminal-width adaptation.
 - Never leak secrets through prompts, progress labels, debug output, or terminal
   history. Use hidden input for passphrases and credentials.
 
+### Interactive UX standard
+
+Interactive mode is a first-class, polished terminal experience, not a text
+dump with ad-hoc prompts. Every command must be modern, attractive, contextual,
+and easy to follow while retaining the CLI's directness.
+
+- Start multi-step flows with a concise branded/contextual header and explain
+  what the command is about to do.
+- Use a real themed selector for a finite set of choices; do not ask users to
+  type backend names, enum spellings, or arbitrary indexes when a selector is
+  available.
+- Group related fields into a guided form, use useful defaults and hints, and
+  collect passwords or tokens with hidden input.
+- Show a safe review before configuration changes and ask for explicit
+  confirmation before saving or performing a destructive action.
+- Render successes, warnings, failures, tables, and summaries with consistent
+  visual hierarchy, spacing, symbols, and concise actionable language.
+- Keep interactive output human-readable and avoid raw tab-separated dumps,
+  internal debug representations, or unexplained machine-oriented codes.
+- Detect redirected or non-TTY input/output and fall back to readable line
+  prompts without emitting ANSI control sequences or changing command
+  semantics.
+- Keep all of this presentation in CLI renderers and prompt adapters; SDK
+  requests, validation, persistence, and domain behavior remain unchanged.
+
 ### Mode parity
 
 For every command and behavior, test both modes. A feature is incomplete when it

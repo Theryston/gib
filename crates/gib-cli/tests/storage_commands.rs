@@ -86,12 +86,14 @@ fn local_storage_has_json_add_list_remove_flows() {
 fn local_storage_can_be_added_interactively_with_prompts() {
     let directory = TestDirectory::new();
     let root = directory.path().join("interactive-data");
-    let input = format!("interactive\nlocal\n{}\n", root.display());
+    let input = format!("interactive\nlocal\n{}\ny\n", root.display());
     let output = run_with_stdin(directory.path(), &["storage", "add"], input.as_bytes());
     assert!(output.status.success(), "{output:?}");
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("Added storage 'interactive' (local)")
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains('\x1b'));
+    assert!(stdout.contains("What kind of storage is this?"));
+    assert!(stdout.contains("Review before saving"));
+    assert!(stdout.contains("Added storage 'interactive' (local)"));
     assert!(output.stderr.is_empty());
 }
 
@@ -319,6 +321,7 @@ fn run_with_stdin(home: &Path, arguments: &[&str], input: &[u8]) -> Output {
 
 fn single_json(bytes: &[u8]) -> Value {
     let text = std::str::from_utf8(bytes).expect("output should be UTF-8");
+    assert!(!text.contains('\x1b'));
     let mut lines = text.lines();
     let value = serde_json::from_str(lines.next().expect("one JSON line should be emitted"))
         .expect("output should be JSON");
