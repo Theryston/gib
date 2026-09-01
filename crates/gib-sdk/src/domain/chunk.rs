@@ -882,7 +882,7 @@ impl ChunkAssembler {
         cancellation: Option<&(dyn Fn() -> bool + Send + Sync)>,
     ) -> ChunkingResult<(usize, Option<Chunk>)> {
         for (index, byte) in input.iter().copied().enumerate() {
-            if index % 1_024 == 0 && cancellation.is_some_and(|callback| callback()) {
+            if index & 1_023 == 0 && cancellation.is_some_and(|callback| callback()) {
                 return Err(ChunkingError::Cancelled);
             }
             self.current.push(byte);
@@ -998,7 +998,7 @@ impl BuzHash {
     fn push(&mut self, byte: u8) {
         if self.length < BUZHASH_WINDOW_SIZE {
             self.window[self.position] = byte;
-            self.position = (self.position + 1) % BUZHASH_WINDOW_SIZE;
+            self.advance_position();
             self.length += 1;
             self.hash = self.hash.rotate_left(1) ^ BUZHASH_TABLE[byte as usize];
             return;
@@ -1006,10 +1006,17 @@ impl BuzHash {
 
         let outgoing = self.window[self.position];
         self.window[self.position] = byte;
-        self.position = (self.position + 1) % BUZHASH_WINDOW_SIZE;
+        self.advance_position();
         self.hash = self.hash.rotate_left(1)
             ^ BUZHASH_TABLE[byte as usize]
             ^ BUZHASH_TABLE[outgoing as usize].rotate_left(BUZHASH_WINDOW_SIZE as u32);
+    }
+
+    fn advance_position(&mut self) {
+        self.position += 1;
+        if self.position == BUZHASH_WINDOW_SIZE {
+            self.position = 0;
+        }
     }
 
     fn matches(&self, mask: u64) -> bool {

@@ -126,7 +126,7 @@ fn large_logical_reader_streams_without_an_input_allocation() {
     let length = 64 * 1024 * 1024_u64;
     let configuration =
         ChunkingConfiguration::new(64 * 1024, 128 * 1024, 256 * 1024).expect("valid policy");
-    let mut reader = chunk_reader(LogicalReader::new(length), configuration);
+    let mut reader = chunk_reader(std::io::repeat(0x42).take(length), configuration);
     let mut total = 0_u64;
     let mut chunks = 0_usize;
     while let Some(chunk) = reader
@@ -193,7 +193,7 @@ fn invalid_source_read_count_is_rejected() {
 fn multi_gigabyte_logical_stream_does_not_allocate_the_input() {
     let length = 2 * 1024 * 1024 * 1024_u64;
     let configuration = ChunkingConfiguration::default();
-    let mut reader = chunk_reader(LogicalReader::new(length), configuration);
+    let mut reader = chunk_reader(std::io::repeat(0x42).take(length), configuration);
     let mut total = 0_u64;
     while let Some(chunk) = reader
         .next()
@@ -299,37 +299,6 @@ impl Read for VariableReadReader {
             .min(self.bytes.len() - self.offset);
         buffer[..amount].copy_from_slice(&self.bytes[self.offset..self.offset + amount]);
         self.offset += amount;
-        Ok(amount)
-    }
-}
-
-struct LogicalReader {
-    remaining: u64,
-    position: u64,
-}
-
-impl LogicalReader {
-    fn new(remaining: u64) -> Self {
-        Self {
-            remaining,
-            position: 0,
-        }
-    }
-}
-
-impl Read for LogicalReader {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if self.remaining == 0 {
-            return Ok(0);
-        }
-        let amount = self.remaining.min(buffer.len() as u64) as usize;
-        for (index, byte) in buffer[..amount].iter_mut().enumerate() {
-            let position = self.position + index as u64;
-            *byte = (position.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(23)
-                ^ position.rotate_right(11)) as u8;
-        }
-        self.position += amount as u64;
-        self.remaining -= amount as u64;
         Ok(amount)
     }
 }
