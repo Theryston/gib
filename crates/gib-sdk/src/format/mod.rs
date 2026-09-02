@@ -2,6 +2,7 @@ mod configuration;
 mod envelope;
 mod identity;
 mod pack;
+mod pack_index;
 mod repository;
 mod storage_configuration;
 mod transform;
@@ -23,6 +24,7 @@ pub(crate) use identity::{
     decode_identity_configuration, encode_identity_configuration,
 };
 pub(crate) use pack::{PackBuilder, PackFormatError, VerifiedPack};
+pub(crate) use pack_index::{PackIndexFormatError, PackIndexShardBuilder, VerifiedPackIndexShard};
 pub(crate) use repository::{
     FormatError, decode_bootstrap, decode_descriptor, decode_head, decode_history_record,
     decode_snapshot, encode_bootstrap, encode_descriptor, encode_head, encode_history_record,

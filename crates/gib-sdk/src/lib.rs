@@ -110,6 +110,21 @@ pub use api::{
     PackReader, SealedPack, verify_pack,
 };
 
+pub use api::{
+    CURRENT_PACK_INDEX_FORMAT_VERSION, DEFAULT_PACK_INDEX_CACHE_MAX_BYTES,
+    DEFAULT_PACK_INDEX_CACHE_MAX_SHARDS, DEFAULT_PACK_INDEX_MAX_SHARD_BYTES,
+    MAX_PACK_INDEX_CACHE_BYTES, MAX_PACK_INDEX_SHARD_BYTES, MIN_PACK_INDEX_SHARD_BYTES,
+    PACK_INDEX_ALIGNMENT, PACK_INDEX_FOOTER_LENGTH, PACK_INDEX_HEADER_LENGTH,
+    PACK_INDEX_RECORD_LENGTH, PACK_INDEX_SHARD_COUNT, PACK_INDEX_SHARD_PREFIX_BYTES,
+    PACK_INDEX_STORAGE_PREFIX, PackChunkRead, PackIndexCache, PackIndexCacheConfiguration,
+    PackIndexCacheConfigurationError, PackIndexConfiguration, PackIndexConfigurationError,
+    PackIndexEntry, PackIndexEntryError, PackIndexId, PackIndexIdError, PackIndexLookup,
+    PackIndexPublisher, PackIndexRange, PackIndexRangeError, PackIndexReader,
+    PackIndexShardBuilder, PackIndexShardId, PackIndexShardMetadata, PackIndexStoragePublisher,
+    PackIndexTransform, PackIndexTransformError, SealedPackIndexShard, pack_index_object_key,
+    pack_index_storage_key, verify_pack_index,
+};
+
 #[cfg(feature = "async")]
 pub use api::{AsyncChunkStream, AsyncChunker, async_chunk_reader};
 

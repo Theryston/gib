@@ -162,3 +162,6 @@ public API.
 The historical version-1 golden fixture is kept at
 `tests/fixtures/packs/v1/basic.pack.hex` and is decoded as bytes by the pack
 integration tests.
+
+Versioned pack-index shards and bounded range lookup are specified in
+[`pack-indexes.md`](pack-indexes.md).

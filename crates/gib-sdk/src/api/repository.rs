@@ -1,5 +1,6 @@
 use super::error::{SdkError, SdkResult};
 use super::operation::CancellationToken;
+use crate::application::ports::read_stream_to_vec;
 use crate::application::repository::{
     HeadRead as ApplicationHeadRead, RepositoryError, RepositoryOpenExpectations,
     initialize_repository as initialize_use_case,
@@ -12,16 +13,18 @@ use crate::application::repository::{
 use crate::domain::DomainError;
 use crate::format::{
     EncryptionContext, FormatError, PackBuilder as PackBuilderFormat, PackFormatError,
-    VerifiedPack, calculate_object_id, decode_object_envelope, decode_object_envelope_from_reader,
-    decode_object_envelope_from_reader_with_encryption,
+    PackIndexFormatError, PackIndexShardBuilder as PackIndexShardBuilderFormat, VerifiedPack,
+    VerifiedPackIndexShard, calculate_object_id, decode_object_envelope,
+    decode_object_envelope_from_reader, decode_object_envelope_from_reader_with_encryption,
     decode_object_envelope_from_reader_with_password, decode_object_envelope_with_encryption,
     decode_object_envelope_with_password, decode_snapshot, derive_encryption_context,
     encode_object_envelope, encode_object_envelope_with_encryption,
     encode_object_envelope_with_options, encode_object_envelope_with_password, encode_snapshot,
     generate_encryption_context, snapshot_object_id,
 };
+use std::collections::HashMap;
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::sync::Arc;
 
 pub use crate::application::ports::{
@@ -69,6 +72,18 @@ pub use crate::domain::{
     MAX_PACK_SIZE_BYTES, PACK_ALIGNMENT, PACK_ENTRY_HEADER_LENGTH, PACK_FOOTER_LENGTH,
     PACK_HEADER_LENGTH, PackConfiguration, PackConfigurationError, PackEntryError, PackEntryInput,
     PackEntryLocation, PackId, PackIdError, PackMetadata, SealedPack,
+};
+pub use crate::domain::{
+    CURRENT_PACK_INDEX_FORMAT_VERSION, DEFAULT_PACK_INDEX_CACHE_MAX_BYTES,
+    DEFAULT_PACK_INDEX_CACHE_MAX_SHARDS, DEFAULT_PACK_INDEX_MAX_SHARD_BYTES,
+    MAX_PACK_INDEX_CACHE_BYTES, MAX_PACK_INDEX_SHARD_BYTES, MIN_PACK_INDEX_SHARD_BYTES,
+    PACK_INDEX_ALIGNMENT, PACK_INDEX_FOOTER_LENGTH, PACK_INDEX_HEADER_LENGTH,
+    PACK_INDEX_RECORD_LENGTH, PACK_INDEX_SHARD_COUNT, PACK_INDEX_SHARD_PREFIX_BYTES,
+    PACK_INDEX_STORAGE_PREFIX, PackIndexCacheConfiguration, PackIndexCacheConfigurationError,
+    PackIndexConfiguration, PackIndexConfigurationError, PackIndexEntry, PackIndexEntryError,
+    PackIndexId, PackIndexIdError, PackIndexRange, PackIndexRangeError, PackIndexShardId,
+    PackIndexShardMetadata, PackIndexTransform, PackIndexTransformError, SealedPackIndexShard,
+    pack_index_object_key, pack_index_storage_key,
 };
 pub use crate::domain::{
     CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
@@ -1064,6 +1079,630 @@ impl SealedPack {
     }
 }
 
+/// Publishes one sealed immutable pack-index shard.
+pub trait PackIndexPublisher {
+    /// Publishes one shard after its footer and index ID are complete.
+    fn publish(&mut self, shard: &SealedPackIndexShard) -> SdkResult<()>;
+}
+
+impl<F> PackIndexPublisher for F
+where
+    F: FnMut(&SealedPackIndexShard) -> SdkResult<()>,
+{
+    fn publish(&mut self, shard: &SealedPackIndexShard) -> SdkResult<()> {
+        self(shard)
+    }
+}
+
+/// An immutable-storage publisher for pack-index shards.
+pub struct PackIndexStoragePublisher {
+    storage: StorageHandle,
+}
+
+impl PackIndexStoragePublisher {
+    /// Wraps a storage backend for create-if-absent index publication.
+    pub fn new<S>(storage: S) -> Self
+    where
+        S: Into<StorageHandle>,
+    {
+        Self {
+            storage: storage.into(),
+        }
+    }
+
+    /// Returns the storage handle retained by this publisher.
+    pub fn storage(&self) -> StorageHandle {
+        self.storage.clone()
+    }
+}
+
+impl PackIndexPublisher for PackIndexStoragePublisher {
+    fn publish(&mut self, shard: &SealedPackIndexShard) -> SdkResult<()> {
+        let key = ObjectKey::new(pack_index_object_key(shard.id())).map_err(|_| {
+            SdkError::InvalidRequest {
+                field: "pack_index_key",
+                reason: "derived pack-index storage key is invalid",
+            }
+        })?;
+        let mut source = Cursor::new(shard.as_bytes());
+        let expected_size =
+            u64::try_from(shard.len()).map_err(|_| SdkError::RepositoryPackIndexWriteFailed)?;
+        self.storage
+            .as_storage()
+            .write_stream(
+                &key,
+                &mut source,
+                ObjectWriteOptions::if_absent().with_expected_size(expected_size),
+            )
+            .map(|_| ())
+            .map_err(|error| match error {
+                StorageError::AlreadyExists => SdkError::RepositoryPublicationConflict,
+                StorageError::UnsupportedCapability => SdkError::StorageCapabilityUnsupported,
+                StorageError::Cancelled => SdkError::OperationCancelled { operation_id: None },
+                _ => SdkError::StorageFailure {
+                    operation: "publish_pack_index",
+                },
+            })
+    }
+}
+
+/// Builds one sorted, immutable pack-index shard without retaining other
+/// shards.
+pub struct PackIndexShardBuilder {
+    inner: PackIndexShardBuilderFormat,
+}
+
+impl PackIndexShardBuilder {
+    /// Creates a builder for one validated chunk-ID prefix.
+    pub fn new(
+        configuration: PackIndexConfiguration,
+        shard_id: PackIndexShardId,
+    ) -> SdkResult<Self> {
+        Ok(Self {
+            inner: PackIndexShardBuilderFormat::new(configuration, shard_id)
+                .map_err(map_pack_index_format_error)?,
+        })
+    }
+
+    /// Returns the shard policy used by this builder.
+    pub const fn configuration(&self) -> PackIndexConfiguration {
+        self.inner.configuration()
+    }
+
+    /// Returns the chunk-ID prefix assigned to this builder.
+    pub const fn shard_id(&self) -> PackIndexShardId {
+        self.inner.shard_id()
+    }
+
+    /// Adds one validated location and its transform descriptor.
+    pub fn add(&mut self, entry: PackIndexEntry) -> SdkResult<()> {
+        self.inner.add(entry).map_err(map_pack_index_format_error)
+    }
+
+    /// Adds all entries from a sealed pack using one transform descriptor.
+    ///
+    /// Callers that use different transforms for different entries can call
+    /// [`Self::add`] for each location instead.
+    pub fn add_pack(&mut self, pack: &SealedPack, transform: PackIndexTransform) -> SdkResult<u64> {
+        let mut added = 0_u64;
+        for location in pack.entries() {
+            let entry = PackIndexEntry::from_location(*location, transform)
+                .map_err(map_pack_index_entry_error)?;
+            self.add(entry)?;
+            added = added.checked_add(1).ok_or(SdkError::InvalidRequest {
+                field: "pack_index.entry_count",
+                reason: "entry count exceeds the supported range",
+            })?;
+        }
+        Ok(added)
+    }
+
+    /// Seals the sorted shard and returns its complete immutable bytes.
+    pub fn finish(&mut self) -> SdkResult<SealedPackIndexShard> {
+        self.inner.finish().map_err(map_pack_index_format_error)
+    }
+
+    /// Seals and publishes the shard after all bytes have been verified.
+    pub fn finish_to<P: PackIndexPublisher + ?Sized>(
+        &mut self,
+        publisher: &mut P,
+    ) -> SdkResult<()> {
+        let shard = self.finish()?;
+        if let Err(error) = publisher.publish(&shard) {
+            self.inner.abort();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Aborts this builder and discards all unsealed records.
+    pub fn abort(&mut self) {
+        self.inner.abort();
+    }
+}
+
+impl fmt::Debug for PackIndexShardBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PackIndexShardBuilder")
+            .field("configuration", &self.configuration())
+            .field("shard_id", &self.shard_id())
+            .finish()
+    }
+}
+
+impl SealedPackIndexShard {
+    /// Writes this sealed shard to a writer.
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> SdkResult<u64> {
+        writer
+            .write_all(self.as_bytes())
+            .map_err(|_| SdkError::RepositoryPackIndexWriteFailed)?;
+        u64::try_from(self.len()).map_err(|_| SdkError::RepositoryPackIndexWriteFailed)
+    }
+}
+
+/// A verified index-shard view with binary-search lookup.
+pub struct PackIndexReader {
+    inner: VerifiedPackIndexShard,
+}
+
+impl PackIndexReader {
+    /// Validates the complete shard before exposing any record.
+    pub fn new(bytes: &[u8]) -> SdkResult<Self> {
+        Ok(Self {
+            inner: VerifiedPackIndexShard::new(bytes).map_err(map_pack_index_format_error)?,
+        })
+    }
+
+    /// Returns verified shard metadata.
+    pub const fn metadata(&self) -> PackIndexShardMetadata {
+        self.inner.metadata()
+    }
+
+    /// Returns records in canonical full chunk-ID order.
+    pub fn entries(&self) -> &[PackIndexEntry] {
+        self.inner.entries()
+    }
+
+    /// Finds one chunk using binary search, or returns `None` if absent.
+    pub fn lookup(&self, chunk_id: ChunkId) -> Option<PackIndexEntry> {
+        self.inner.lookup(chunk_id)
+    }
+}
+
+/// Verifies an immutable pack-index shard and returns its metadata.
+pub fn verify_pack_index(bytes: &[u8]) -> SdkResult<PackIndexShardMetadata> {
+    PackIndexReader::new(bytes).map(|reader| reader.metadata())
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PackIndexCacheKey {
+    storage_key: String,
+    shard_id: PackIndexShardId,
+}
+
+struct CachedPackIndexShard {
+    shard: Arc<VerifiedPackIndexShard>,
+    weight: usize,
+    last_used: u64,
+}
+
+/// A bounded least-recently-used cache of verified index shards.
+pub struct PackIndexCache {
+    configuration: PackIndexCacheConfiguration,
+    shards: HashMap<PackIndexCacheKey, CachedPackIndexShard>,
+    resident_bytes: usize,
+    clock: u64,
+}
+
+impl PackIndexCache {
+    /// Creates an empty cache with an explicit resident-memory policy.
+    pub fn new(configuration: PackIndexCacheConfiguration) -> Self {
+        Self {
+            configuration,
+            shards: HashMap::new(),
+            resident_bytes: 0,
+            clock: 0,
+        }
+    }
+
+    /// Returns the cache's validated memory and shard limits.
+    pub const fn configuration(&self) -> PackIndexCacheConfiguration {
+        self.configuration
+    }
+
+    /// Returns the number of resident verified shards.
+    pub fn len(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Returns whether no shard is resident.
+    pub fn is_empty(&self) -> bool {
+        self.shards.is_empty()
+    }
+
+    /// Returns the estimated resident memory used by this cache.
+    pub const fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    /// Removes every cached shard.
+    pub fn clear(&mut self) {
+        self.shards.clear();
+        self.resident_bytes = 0;
+    }
+
+    /// Looks up a chunk in the default static shard layout.
+    pub fn lookup(&mut self, chunk_id: ChunkId) -> Option<PackIndexEntry> {
+        let shard_id = PackIndexShardId::from_chunk_id(chunk_id);
+        let storage_key = pack_index_storage_key(shard_id);
+        self.lookup_at(&storage_key, shard_id, chunk_id)
+    }
+
+    /// Returns whether a default-layout shard is resident.
+    pub fn contains_shard(&self, shard_id: PackIndexShardId) -> bool {
+        let storage_key = pack_index_storage_key(shard_id);
+        self.contains_at(&storage_key, shard_id)
+    }
+
+    /// Inserts a verified shard into the default static layout.
+    ///
+    /// A valid shard larger than the cache budget is intentionally used for
+    /// the current lookup and then discarded; it is never allowed to exceed
+    /// the configured resident-memory limit.
+    pub fn insert(&mut self, shard: &SealedPackIndexShard) -> SdkResult<()> {
+        let storage_key = pack_index_storage_key(shard.metadata().shard_id());
+        self.insert_at(&storage_key, shard)
+    }
+
+    /// Inserts a verified shard under an immutable publication key.
+    pub fn insert_at(&mut self, storage_key: &str, shard: &SealedPackIndexShard) -> SdkResult<()> {
+        let verified =
+            VerifiedPackIndexShard::new(shard.as_bytes()).map_err(map_pack_index_format_error)?;
+        self.insert_verified(storage_key, verified);
+        Ok(())
+    }
+
+    fn contains_at(&self, storage_key: &str, shard_id: PackIndexShardId) -> bool {
+        self.shards.contains_key(&PackIndexCacheKey {
+            storage_key: storage_key.to_owned(),
+            shard_id,
+        })
+    }
+
+    fn lookup_at(
+        &mut self,
+        storage_key: &str,
+        shard_id: PackIndexShardId,
+        chunk_id: ChunkId,
+    ) -> Option<PackIndexEntry> {
+        let key = PackIndexCacheKey {
+            storage_key: storage_key.to_owned(),
+            shard_id,
+        };
+        let last_used = self.next_clock();
+        let cached = self.shards.get_mut(&key)?;
+        cached.last_used = last_used;
+        cached.shard.lookup(chunk_id)
+    }
+
+    fn insert_verified(&mut self, storage_key: &str, shard: VerifiedPackIndexShard) {
+        let shard_id = shard.metadata().shard_id();
+        let key = PackIndexCacheKey {
+            storage_key: storage_key.to_owned(),
+            shard_id,
+        };
+        let key_weight = key.storage_key.len();
+        let Some(weight) = shard.estimated_memory().checked_add(key_weight) else {
+            return;
+        };
+        if weight > self.configuration.max_bytes() {
+            return;
+        }
+        if let Some(previous) = self.shards.remove(&key) {
+            self.resident_bytes = self.resident_bytes.saturating_sub(previous.weight);
+        }
+        while self.resident_bytes.saturating_add(weight) > self.configuration.max_bytes()
+            || self.shards.len() >= self.configuration.max_shards()
+        {
+            if !self.evict_oldest() {
+                return;
+            }
+        }
+        let last_used = self.next_clock();
+        self.resident_bytes = self.resident_bytes.saturating_add(weight);
+        self.shards.insert(
+            key,
+            CachedPackIndexShard {
+                shard: Arc::new(shard),
+                weight,
+                last_used,
+            },
+        );
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        let Some(key) = self
+            .shards
+            .iter()
+            .min_by_key(|(_, cached)| cached.last_used)
+            .map(|(key, _)| key.clone())
+        else {
+            return false;
+        };
+        if let Some(removed) = self.shards.remove(&key) {
+            self.resident_bytes = self.resident_bytes.saturating_sub(removed.weight);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn next_clock(&mut self) -> u64 {
+        self.clock = self.clock.saturating_add(1);
+        self.clock
+    }
+}
+
+impl fmt::Debug for PackIndexCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PackIndexCache")
+            .field("configuration", &self.configuration)
+            .field("shards", &self.shards.len())
+            .field("resident_bytes", &self.resident_bytes)
+            .finish()
+    }
+}
+
+/// A bounded range read returned by pack-index lookup.
+pub struct PackChunkRead {
+    entry: PackIndexEntry,
+    range: PackIndexRange,
+    object: ObjectRead,
+}
+
+impl PackChunkRead {
+    fn new(entry: PackIndexEntry, range: PackIndexRange, object: ObjectRead) -> Self {
+        Self {
+            entry,
+            range,
+            object,
+        }
+    }
+
+    /// Returns the verified index record used for this read.
+    pub const fn entry(&self) -> PackIndexEntry {
+        self.entry
+    }
+
+    /// Returns the exact payload range requested from the pack.
+    pub const fn range(&self) -> PackIndexRange {
+        self.range
+    }
+
+    /// Returns metadata returned by the pack storage backend.
+    pub const fn metadata(&self) -> &ObjectMetadata {
+        self.object.metadata()
+    }
+
+    /// Returns the bounded payload reader.
+    pub fn reader(&mut self) -> &mut dyn Read {
+        self.object.reader()
+    }
+
+    /// Consumes the result and returns its bounded payload reader.
+    pub fn into_reader(self) -> crate::application::ports::StorageReader {
+        self.object.into_reader()
+    }
+}
+
+impl Read for PackChunkRead {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.object.read(buffer)
+    }
+}
+
+impl fmt::Debug for PackChunkRead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PackChunkRead")
+            .field("entry", &self.entry)
+            .field("range", &self.range)
+            .field("metadata", &self.object.metadata())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Storage-backed bounded lookup for pack-index shards and pack payloads.
+pub struct PackIndexLookup {
+    storage: StorageHandle,
+    configuration: PackIndexConfiguration,
+    cache: PackIndexCache,
+}
+
+impl PackIndexLookup {
+    /// Creates a lookup using the default index-shard format policy.
+    pub fn new<S>(storage: S, cache_configuration: PackIndexCacheConfiguration) -> Self
+    where
+        S: Into<StorageHandle>,
+    {
+        Self::with_configuration(
+            storage,
+            PackIndexConfiguration::default_policy(),
+            cache_configuration,
+        )
+    }
+
+    /// Creates a lookup with explicit index and cache policies.
+    pub fn with_configuration<S>(
+        storage: S,
+        configuration: PackIndexConfiguration,
+        cache_configuration: PackIndexCacheConfiguration,
+    ) -> Self
+    where
+        S: Into<StorageHandle>,
+    {
+        Self {
+            storage: storage.into(),
+            configuration,
+            cache: PackIndexCache::new(cache_configuration),
+        }
+    }
+
+    /// Creates a lookup with the SDK's default index and cache policies.
+    pub fn with_defaults<S>(storage: S) -> Self
+    where
+        S: Into<StorageHandle>,
+    {
+        Self::new(storage, PackIndexCacheConfiguration::default_policy())
+    }
+
+    /// Returns the index format policy used for reads.
+    pub const fn configuration(&self) -> PackIndexConfiguration {
+        self.configuration
+    }
+
+    /// Returns the storage handle used by this lookup.
+    pub fn storage(&self) -> StorageHandle {
+        self.storage.clone()
+    }
+
+    /// Returns the mutable bounded shard cache.
+    pub fn cache(&mut self) -> &mut PackIndexCache {
+        &mut self.cache
+    }
+
+    /// Looks up a chunk in the conventional static shard key.
+    pub fn lookup(&mut self, chunk_id: ChunkId) -> SdkResult<Option<PackIndexEntry>> {
+        let shard_id = PackIndexShardId::from_chunk_id(chunk_id);
+        let key = ObjectKey::new(pack_index_storage_key(shard_id)).map_err(|_| {
+            SdkError::InvalidRequest {
+                field: "pack_index_key",
+                reason: "derived pack-index storage key is invalid",
+            }
+        })?;
+        self.lookup_at(chunk_id, &key)
+    }
+
+    /// Looks up a chunk in an explicitly selected immutable shard publication.
+    ///
+    /// The selected key may identify any immutable generation. The decoded
+    /// shard must still contain the requested one-byte prefix.
+    pub fn lookup_at(
+        &mut self,
+        chunk_id: ChunkId,
+        index_key: &ObjectKey,
+    ) -> SdkResult<Option<PackIndexEntry>> {
+        let shard_id = PackIndexShardId::from_chunk_id(chunk_id);
+        if self.cache.contains_at(index_key.as_str(), shard_id) {
+            return Ok(self.cache.lookup_at(index_key.as_str(), shard_id, chunk_id));
+        }
+        let mut object = match self.storage.as_storage().read_stream(index_key) {
+            Ok(object) => object,
+            Err(StorageError::NotFound) => return Ok(None),
+            Err(error) => return Err(map_pack_index_storage_error(error, "read_pack_index")),
+        };
+        let size = object.metadata().size();
+        if size > self.configuration.max_shard_bytes() {
+            return Err(SdkError::RepositoryMalformed {
+                reason: "pack-index shard exceeds its configured size limit",
+            });
+        }
+        let bytes = read_stream_to_vec(object.reader(), Some(size))
+            .map_err(|error| map_pack_index_storage_error(error, "read_pack_index"))?;
+        let shard = VerifiedPackIndexShard::new(&bytes).map_err(map_pack_index_format_error)?;
+        if shard.metadata().shard_id() != shard_id {
+            return Err(SdkError::RepositoryMalformed {
+                reason: "pack-index shard prefix does not match the requested chunk",
+            });
+        }
+        let result = shard.lookup(chunk_id);
+        self.cache.insert_verified(index_key.as_str(), shard);
+        Ok(result)
+    }
+
+    /// Alias for [`Self::lookup`].
+    pub fn locate(&mut self, chunk_id: ChunkId) -> SdkResult<Option<PackIndexEntry>> {
+        self.lookup(chunk_id)
+    }
+
+    /// Reads exactly the transformed payload range for a chunk.
+    pub fn read_chunk(&mut self, chunk_id: ChunkId) -> SdkResult<Option<PackChunkRead>> {
+        let shard_id = PackIndexShardId::from_chunk_id(chunk_id);
+        let key = ObjectKey::new(pack_index_storage_key(shard_id)).map_err(|_| {
+            SdkError::InvalidRequest {
+                field: "pack_index_key",
+                reason: "derived pack-index storage key is invalid",
+            }
+        })?;
+        self.read_chunk_at(chunk_id, &key)
+    }
+
+    /// Reads exactly the transformed payload using an explicit shard key.
+    pub fn read_chunk_at(
+        &mut self,
+        chunk_id: ChunkId,
+        index_key: &ObjectKey,
+    ) -> SdkResult<Option<PackChunkRead>> {
+        let Some(entry) = self.lookup_at(chunk_id, index_key)? else {
+            return Ok(None);
+        };
+        let pack_key =
+            ObjectKey::new(format!("packs/{}", entry.pack_id().as_hex())).map_err(|_| {
+                SdkError::InvalidRequest {
+                    field: "pack_key",
+                    reason: "derived pack storage key is invalid",
+                }
+            })?;
+        let metadata = match self.storage.as_storage().metadata(&pack_key) {
+            Ok(metadata) => metadata,
+            Err(StorageError::NotFound) => return Err(SdkError::RepositoryRequiredObjectMissing),
+            Err(error) => return Err(map_pack_index_storage_error(error, "read_pack_metadata")),
+        };
+        let range = entry
+            .validate_against_pack_length(metadata.size())
+            .map_err(map_pack_index_range_error)?;
+        let storage_range = ObjectRange::new(range.offset(), range.length()).map_err(|_| {
+            SdkError::RepositoryMalformed {
+                reason: "pack-index payload range is invalid",
+            }
+        })?;
+        let object = match self
+            .storage
+            .as_storage()
+            .read_range(&pack_key, storage_range)
+        {
+            Ok(object) => object,
+            Err(StorageError::NotFound) => return Err(SdkError::RepositoryRequiredObjectMissing),
+            Err(error) => return Err(map_pack_index_storage_error(error, "read_pack_range")),
+        };
+        Ok(Some(PackChunkRead::new(entry, range, object)))
+    }
+
+    /// Reads one transformed payload into a bounded vector.
+    pub fn read_chunk_payload(&mut self, chunk_id: ChunkId) -> SdkResult<Option<Vec<u8>>> {
+        let Some(read) = self.read_chunk(chunk_id)? else {
+            return Ok(None);
+        };
+        let expected_size = read.entry().stored_length();
+        let mut reader = read.into_reader();
+        read_stream_to_vec(reader.as_mut(), Some(expected_size))
+            .map(Some)
+            .map_err(|error| map_pack_index_storage_error(error, "read_pack_range"))
+    }
+}
+
+impl fmt::Debug for PackIndexLookup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PackIndexLookup")
+            .field("configuration", &self.configuration)
+            .field("cache", &self.cache)
+            .finish()
+    }
+}
+
 /// A verified, zero-copy view over an immutable pack.
 pub struct PackReader<'a> {
     inner: VerifiedPack<'a>,
@@ -1140,6 +1779,82 @@ fn map_pack_format_error(error: PackFormatError) -> SdkError {
         PackFormatError::AllocationFailure => SdkError::RepositoryMalformed {
             reason: "immutable pack exceeds the available allocation limit",
         },
+    }
+}
+
+fn map_pack_index_format_error(error: PackIndexFormatError) -> SdkError {
+    match error {
+        PackIndexFormatError::UnsupportedVersion { version } => {
+            SdkError::RepositoryUnsupportedVersion { version }
+        }
+        PackIndexFormatError::UnsupportedCodec | PackIndexFormatError::UnsupportedEncryption => {
+            SdkError::RepositoryIncompatible {
+                reason: "pack-index transform metadata is not supported",
+            }
+        }
+        PackIndexFormatError::BuilderFinished => SdkError::InvalidRequest {
+            field: "pack_index_builder",
+            reason: "pack-index builder is already finished",
+        },
+        PackIndexFormatError::BuilderAborted => SdkError::InvalidRequest {
+            field: "pack_index_builder",
+            reason: "pack-index builder is already aborted",
+        },
+        PackIndexFormatError::WrongShard => SdkError::InvalidRequest {
+            field: "pack_index_shard",
+            reason: "entry does not belong to the selected chunk-ID shard",
+        },
+        PackIndexFormatError::ShardTooLarge => SdkError::InvalidRequest {
+            field: "pack_index_shard",
+            reason: "pack-index shard exceeds the configured size limit",
+        },
+        PackIndexFormatError::DuplicateChunkId => SdkError::RepositoryMalformed {
+            reason: "pack-index shard contains a duplicate chunk ID",
+        },
+        PackIndexFormatError::InvalidMagic => SdkError::RepositoryMalformed {
+            reason: "pack-index shard magic is invalid",
+        },
+        PackIndexFormatError::InvalidField => SdkError::RepositoryMalformed {
+            reason: "pack-index shard contains an invalid field",
+        },
+        PackIndexFormatError::InvalidLength => SdkError::RepositoryMalformed {
+            reason: "pack-index shard contains an invalid length or offset",
+        },
+        PackIndexFormatError::InvalidChecksum => SdkError::RepositoryMalformed {
+            reason: "pack-index shard integrity check failed",
+        },
+        PackIndexFormatError::Truncated => SdkError::RepositoryMalformed {
+            reason: "pack-index shard is truncated",
+        },
+        PackIndexFormatError::TrailingData => SdkError::RepositoryMalformed {
+            reason: "pack-index shard contains trailing data",
+        },
+        PackIndexFormatError::AllocationFailure => SdkError::RepositoryMalformed {
+            reason: "pack-index shard exceeds the available allocation limit",
+        },
+    }
+}
+
+fn map_pack_index_entry_error(error: PackIndexEntryError) -> SdkError {
+    let _ = error;
+    SdkError::InvalidRequest {
+        field: "pack_index_entry",
+        reason: "pack-index entry coordinates are invalid",
+    }
+}
+
+fn map_pack_index_range_error(error: PackIndexRangeError) -> SdkError {
+    let _ = error;
+    SdkError::RepositoryMalformed {
+        reason: "pack-index range exceeds the containing pack",
+    }
+}
+
+fn map_pack_index_storage_error(error: StorageError, operation: &'static str) -> SdkError {
+    match error {
+        StorageError::UnsupportedCapability => SdkError::StorageCapabilityUnsupported,
+        StorageError::Cancelled => SdkError::OperationCancelled { operation_id: None },
+        _ => SdkError::StorageFailure { operation },
     }
 }
 

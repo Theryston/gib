@@ -221,6 +221,10 @@ locations, and validation order are specified separately in
 but transport metadata in that envelope does not change the pack's own entry
 identity or framing rules.
 
+The versioned pack-index shard framing, chunk-ID prefix policy, publication
+keys, and bounded range lookup are specified separately in
+[`docs/pack-indexes.md`](pack-indexes.md).
+
 ## Fixtures
 
 The repository contains exact hexadecimal byte fixtures under
@@ -238,3 +242,6 @@ The deterministic version-2 encrypted envelope fixture is
 `tests/fixtures/repository/v2/objects/tree-encrypted-envelope.hex`. Its test
 password is supplied only by the fixture test; passwords and derived keys are
 not persisted in repository objects.
+
+The historical version-1 pack-index fixture is
+`tests/fixtures/pack-indexes/v1/basic.index.hex`.
