@@ -45,6 +45,8 @@ pub enum ErrorCode {
     RepositoryAuthenticationFailed,
     /// A repository object transform could not be applied.
     RepositoryTransformFailed,
+    /// An immutable pack could not be written or published.
+    RepositoryPackWriteFailed,
     /// A repository HEAD publication lost its compare-and-swap race.
     RepositoryPublicationConflict,
     /// A requested snapshot object is missing.
@@ -93,6 +95,7 @@ impl ErrorCode {
             Self::RepositoryEncryptionKeyRequired => "repository_encryption_key_required",
             Self::RepositoryAuthenticationFailed => "repository_authentication_failed",
             Self::RepositoryTransformFailed => "repository_transform_failed",
+            Self::RepositoryPackWriteFailed => "repository_pack_write_failed",
             Self::RepositoryPublicationConflict => "repository_publication_conflict",
             Self::RepositorySnapshotMissing => "repository_snapshot_missing",
             Self::RepositoryRequiredObjectMissing => "repository_required_object_missing",
@@ -191,6 +194,8 @@ pub enum SdkError {
         /// A stable explanation that never contains key material or payloads.
         reason: &'static str,
     },
+    /// A completed immutable pack could not be written or published.
+    RepositoryPackWriteFailed,
     /// Another publisher changed HEAD after the supplied versioned read.
     RepositoryPublicationConflict,
     /// The requested snapshot object is missing.
@@ -260,6 +265,7 @@ impl SdkError {
             Self::RepositoryEncryptionKeyRequired => ErrorCode::RepositoryEncryptionKeyRequired,
             Self::RepositoryAuthenticationFailed => ErrorCode::RepositoryAuthenticationFailed,
             Self::RepositoryTransformFailed { .. } => ErrorCode::RepositoryTransformFailed,
+            Self::RepositoryPackWriteFailed => ErrorCode::RepositoryPackWriteFailed,
             Self::RepositoryPublicationConflict => ErrorCode::RepositoryPublicationConflict,
             Self::RepositorySnapshotMissing => ErrorCode::RepositorySnapshotMissing,
             Self::RepositoryRequiredObjectMissing => ErrorCode::RepositoryRequiredObjectMissing,
@@ -297,6 +303,7 @@ impl SdkError {
             | Self::RepositoryEncryptionKeyRequired
             | Self::RepositoryAuthenticationFailed
             | Self::RepositoryTransformFailed { .. }
+            | Self::RepositoryPackWriteFailed
             | Self::RepositoryPublicationConflict
             | Self::RepositorySnapshotMissing
             | Self::RepositoryRequiredObjectMissing
@@ -395,6 +402,9 @@ impl fmt::Display for SdkError {
             }
             Self::RepositoryTransformFailed { reason } => {
                 write!(formatter, "repository object transform failed: {reason}")
+            }
+            Self::RepositoryPackWriteFailed => {
+                formatter.write_str("immutable pack could not be written or published")
             }
             Self::RepositoryPublicationConflict => {
                 formatter.write_str("repository HEAD publication conflicted with another publisher")

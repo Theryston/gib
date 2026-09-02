@@ -105,6 +105,13 @@ pub use repository::{
     DEFAULT_TARGET_CHUNK_SIZE_BYTES, MAX_CONTENT_DEFINED_CHUNK_SIZE_BYTES, chunk_reader,
     chunk_reader_with_cancellation,
 };
+pub use repository::{
+    CURRENT_PACK_FORMAT_VERSION, DEFAULT_PACK_MAX_SIZE_BYTES, DEFAULT_PACK_TARGET_SIZE_BYTES,
+    MAX_PACK_SIZE_BYTES, PACK_ALIGNMENT, PACK_ENTRY_HEADER_LENGTH, PACK_FOOTER_LENGTH,
+    PACK_HEADER_LENGTH, PackBuilder, PackConfiguration, PackConfigurationError, PackEntryError,
+    PackEntryInput, PackEntryLocation, PackId, PackIdError, PackMetadata, PackPublisher,
+    PackReader, SealedPack, verify_pack,
+};
 #[cfg(feature = "s3")]
 pub use repository::{
     DEFAULT_S3_CAPABILITY_CACHE_FILE_NAME, DEFAULT_S3_CAPABILITY_CACHE_TTL_SECONDS,

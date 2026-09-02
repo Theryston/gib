@@ -11,8 +11,9 @@ use crate::application::repository::{
 };
 use crate::domain::DomainError;
 use crate::format::{
-    EncryptionContext, FormatError, calculate_object_id, decode_object_envelope,
-    decode_object_envelope_from_reader, decode_object_envelope_from_reader_with_encryption,
+    EncryptionContext, FormatError, PackBuilder as PackBuilderFormat, PackFormatError,
+    VerifiedPack, calculate_object_id, decode_object_envelope, decode_object_envelope_from_reader,
+    decode_object_envelope_from_reader_with_encryption,
     decode_object_envelope_from_reader_with_password, decode_object_envelope_with_encryption,
     decode_object_envelope_with_password, decode_snapshot, derive_encryption_context,
     encode_object_envelope, encode_object_envelope_with_encryption,
@@ -20,7 +21,7 @@ use crate::format::{
     generate_encryption_context, snapshot_object_id,
 };
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 pub use crate::application::ports::{
@@ -62,6 +63,12 @@ pub use crate::domain::{
     SnapshotId, SnapshotListRequest, SnapshotPage, SnapshotRef, SnapshotReferenceInput,
     SnapshotReferenceSelector, SnapshotSelector, SnapshotSummary, SnapshotSummaryListRequest,
     SnapshotSummaryPage,
+};
+pub use crate::domain::{
+    CURRENT_PACK_FORMAT_VERSION, DEFAULT_PACK_MAX_SIZE_BYTES, DEFAULT_PACK_TARGET_SIZE_BYTES,
+    MAX_PACK_SIZE_BYTES, PACK_ALIGNMENT, PACK_ENTRY_HEADER_LENGTH, PACK_FOOTER_LENGTH,
+    PACK_HEADER_LENGTH, PackConfiguration, PackConfigurationError, PackEntryError, PackEntryInput,
+    PackEntryLocation, PackId, PackIdError, PackMetadata, SealedPack,
 };
 pub use crate::domain::{
     CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
@@ -877,6 +884,262 @@ impl From<RepositoryError> for SdkError {
             },
             RepositoryError::Storage { operation } => Self::StorageFailure { operation },
         }
+    }
+}
+
+/// Publishes one sealed pack atomically.
+///
+/// The publisher is called only after the pack footer and pack ID have been
+/// completed. A publisher should write the bytes to its durable backend and
+/// make the object visible only after the write has succeeded. Completed packs
+/// are not retained by [`PackBuilder`].
+pub trait PackPublisher {
+    /// Publishes one immutable pack or returns a stable SDK error.
+    fn publish(&mut self, pack: &SealedPack) -> SdkResult<()>;
+}
+
+impl<F> PackPublisher for F
+where
+    F: FnMut(&SealedPack) -> SdkResult<()>,
+{
+    fn publish(&mut self, pack: &SealedPack) -> SdkResult<()> {
+        self(pack)
+    }
+}
+
+/// Builds size-bounded immutable packs from transformed chunk payloads.
+///
+/// The builder owns at most the current pack. Use [`Self::add_to`] or
+/// [`Self::add_stream`] to publish completed packs immediately and keep memory
+/// bounded across a large backup. Entries are written in the order supplied;
+/// identical inputs and configuration therefore produce identical bytes and
+/// IDs.
+pub struct PackBuilder {
+    inner: PackBuilderFormat,
+}
+
+impl PackBuilder {
+    /// Creates an empty builder with a validated pack configuration.
+    pub const fn new(configuration: PackConfiguration) -> Self {
+        Self {
+            inner: PackBuilderFormat::new(configuration),
+        }
+    }
+
+    /// Returns the configuration used by this builder.
+    pub const fn configuration(&self) -> PackConfiguration {
+        self.inner.configuration()
+    }
+
+    /// Adds one transformed chunk.
+    ///
+    /// When adding the entry seals the current pack, that pack is returned and
+    /// must be consumed or published by the caller before continuing. The
+    /// builder retains only the new current pack.
+    pub fn add(&mut self, entry: PackEntryInput) -> SdkResult<Option<SealedPack>> {
+        self.inner.add(entry).map_err(map_pack_format_error)
+    }
+
+    /// Adds one transformed chunk after checking a cooperative cancellation
+    /// token.
+    pub fn add_with_cancellation(
+        &mut self,
+        entry: PackEntryInput,
+        cancellation: &CancellationToken,
+    ) -> SdkResult<Option<SealedPack>> {
+        if cancellation.is_cancelled() {
+            self.inner.abort();
+            return Err(SdkError::OperationCancelled { operation_id: None });
+        }
+        self.add(entry)
+    }
+
+    /// Seals and returns the current pack, if it contains entries.
+    pub fn finish(&mut self) -> SdkResult<Option<SealedPack>> {
+        self.inner.finish().map_err(map_pack_format_error)
+    }
+
+    /// Publishes a completed pack as soon as the next entry crosses a pack
+    /// boundary.
+    pub fn add_to<P: PackPublisher + ?Sized>(
+        &mut self,
+        entry: PackEntryInput,
+        publisher: &mut P,
+    ) -> SdkResult<()> {
+        let sealed = self.inner.add(entry).map_err(map_pack_format_error)?;
+        if let Some(pack) = sealed
+            && let Err(error) = publisher.publish(&pack)
+        {
+            self.inner.abort();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Publishes a completed pack after checking a cooperative cancellation
+    /// token.
+    pub fn add_to_with_cancellation<P: PackPublisher + ?Sized>(
+        &mut self,
+        entry: PackEntryInput,
+        cancellation: &CancellationToken,
+        publisher: &mut P,
+    ) -> SdkResult<()> {
+        if cancellation.is_cancelled() {
+            self.inner.abort();
+            return Err(SdkError::OperationCancelled { operation_id: None });
+        }
+        self.add_to(entry, publisher)
+    }
+
+    /// Consumes a streaming entry iterator, publishes each completed pack,
+    /// and seals the final pack.
+    ///
+    /// The iterator is advanced one entry at a time. The caller remains
+    /// responsible for producing transformed payloads with bounded memory;
+    /// this method never collects the iterator or completed packs.
+    pub fn add_stream<I, P>(
+        &mut self,
+        entries: I,
+        publisher: &mut P,
+        cancellation: &CancellationToken,
+    ) -> SdkResult<u64>
+    where
+        I: IntoIterator<Item = PackEntryInput>,
+        P: PackPublisher + ?Sized,
+    {
+        let mut count = 0_u64;
+        for entry in entries {
+            self.add_to_with_cancellation(entry, cancellation, publisher)?;
+            count = count.checked_add(1).ok_or(SdkError::InvalidRequest {
+                field: "pack.entry_count",
+                reason: "entry count exceeds the supported range",
+            })?;
+        }
+        if cancellation.is_cancelled() {
+            self.inner.abort();
+            return Err(SdkError::OperationCancelled { operation_id: None });
+        }
+        self.finish_to(publisher)?;
+        Ok(count)
+    }
+
+    /// Seals and publishes the current pack, if any.
+    pub fn finish_to<P: PackPublisher + ?Sized>(&mut self, publisher: &mut P) -> SdkResult<()> {
+        let sealed = self.inner.finish().map_err(map_pack_format_error)?;
+        if let Some(pack) = sealed
+            && let Err(error) = publisher.publish(&pack)
+        {
+            self.inner.abort();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Aborts construction and discards the current unsealed pack.
+    ///
+    /// Packs already accepted by a publisher cannot be rolled back by this
+    /// method; publication implementations must provide their own atomicity.
+    pub fn abort(&mut self) {
+        self.inner.abort();
+    }
+}
+
+impl fmt::Debug for PackBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PackBuilder")
+            .field("configuration", &self.configuration())
+            .finish()
+    }
+}
+
+impl SealedPack {
+    /// Writes this sealed pack to a writer and returns the number of bytes
+    /// accepted by the API.
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> SdkResult<u64> {
+        writer
+            .write_all(self.as_bytes())
+            .map_err(|_| SdkError::RepositoryPackWriteFailed)?;
+        u64::try_from(self.len()).map_err(|_| SdkError::RepositoryPackWriteFailed)
+    }
+}
+
+/// A verified, zero-copy view over an immutable pack.
+pub struct PackReader<'a> {
+    inner: VerifiedPack<'a>,
+}
+
+impl<'a> PackReader<'a> {
+    /// Validates the complete pack before exposing any entry payload.
+    pub fn new(bytes: &'a [u8]) -> SdkResult<Self> {
+        Ok(Self {
+            inner: VerifiedPack::new(bytes).map_err(map_pack_format_error)?,
+        })
+    }
+
+    /// Returns verified pack metadata.
+    pub const fn metadata(&self) -> PackMetadata {
+        self.inner.metadata()
+    }
+
+    /// Returns verified entry locations in file order.
+    pub fn entries(&self) -> &[PackEntryLocation] {
+        self.inner.entries()
+    }
+
+    /// Returns one transformed payload without copying it.
+    pub fn payload(&self, location: &PackEntryLocation) -> SdkResult<&'a [u8]> {
+        self.inner.payload(location).map_err(map_pack_format_error)
+    }
+}
+
+/// Verifies an immutable pack and returns its metadata.
+pub fn verify_pack(bytes: &[u8]) -> SdkResult<PackMetadata> {
+    PackReader::new(bytes).map(|reader| reader.metadata())
+}
+
+fn map_pack_format_error(error: PackFormatError) -> SdkError {
+    match error {
+        PackFormatError::UnsupportedVersion { version } => {
+            SdkError::RepositoryUnsupportedVersion { version }
+        }
+        PackFormatError::BuilderFinished => SdkError::InvalidRequest {
+            field: "pack_builder",
+            reason: "pack builder is already finished",
+        },
+        PackFormatError::BuilderAborted => SdkError::InvalidRequest {
+            field: "pack_builder",
+            reason: "pack builder is already aborted",
+        },
+        PackFormatError::PackTooLarge => SdkError::InvalidRequest {
+            field: "pack",
+            reason: "pack exceeds the configured or SDK size limit",
+        },
+        PackFormatError::InvalidLocation => SdkError::InvalidRequest {
+            field: "pack_entry_location",
+            reason: "entry location does not belong to this verified pack",
+        },
+        PackFormatError::InvalidMagic => SdkError::RepositoryMalformed {
+            reason: "immutable pack magic is invalid",
+        },
+        PackFormatError::InvalidField => SdkError::RepositoryMalformed {
+            reason: "immutable pack contains an invalid field",
+        },
+        PackFormatError::InvalidLength => SdkError::RepositoryMalformed {
+            reason: "immutable pack contains an invalid length or offset",
+        },
+        PackFormatError::InvalidChecksum => SdkError::RepositoryMalformed {
+            reason: "immutable pack integrity check failed",
+        },
+        PackFormatError::Truncated => SdkError::RepositoryMalformed {
+            reason: "immutable pack is truncated",
+        },
+        PackFormatError::TrailingData => SdkError::RepositoryMalformed {
+            reason: "immutable pack contains trailing data",
+        },
+        PackFormatError::AllocationFailure => SdkError::RepositoryMalformed {
+            reason: "immutable pack exceeds the available allocation limit",
+        },
     }
 }
 

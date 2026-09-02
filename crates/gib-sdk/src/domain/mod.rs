@@ -2,6 +2,7 @@ mod author;
 mod chunk;
 mod configuration;
 mod object;
+mod pack;
 mod repository;
 mod snapshot;
 
@@ -34,6 +35,13 @@ pub use object::{
     ObjectId, ObjectKind, ObjectTransformOptions, REPOSITORY_ENCRYPTION_KDF,
     REPOSITORY_ENCRYPTION_KEY_LENGTH, REPOSITORY_ENCRYPTION_SALT_LENGTH, RepositorySalt,
     RepositorySaltError, XCHACHA20_POLY1305_NONCE_LENGTH, XCHACHA20_POLY1305_TAG_LENGTH,
+};
+pub(crate) use pack::PackMetadataParts;
+pub use pack::{
+    CURRENT_PACK_FORMAT_VERSION, DEFAULT_PACK_MAX_SIZE_BYTES, DEFAULT_PACK_TARGET_SIZE_BYTES,
+    MAX_PACK_SIZE_BYTES, PACK_ALIGNMENT, PACK_ENTRY_HEADER_LENGTH, PACK_FOOTER_LENGTH,
+    PACK_HEADER_LENGTH, PackConfiguration, PackConfigurationError, PackEntryError, PackEntryInput,
+    PackEntryLocation, PackId, PackIdError, PackMetadata, SealedPack,
 };
 pub use repository::{
     CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,

@@ -215,6 +215,12 @@ SDK callers receive validated domain values such as `ImmutableObject`,
 Tree, pack, and index payload schemas can add their own versioned decoders
 without changing this envelope or the existing snapshot decoder.
 
+The immutable binary pack framing, size policy, pack ID boundary, entry
+locations, and validation order are specified separately in
+[`docs/packs.md`](packs.md). The common object envelope may wrap a pack payload,
+but transport metadata in that envelope does not change the pack's own entry
+identity or framing rules.
+
 ## Fixtures
 
 The repository contains exact hexadecimal byte fixtures under

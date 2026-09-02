@@ -102,6 +102,14 @@ pub use api::{
     set_global_identity, set_identity,
 };
 
+pub use api::{
+    CURRENT_PACK_FORMAT_VERSION, DEFAULT_PACK_MAX_SIZE_BYTES, DEFAULT_PACK_TARGET_SIZE_BYTES,
+    MAX_PACK_SIZE_BYTES, PACK_ALIGNMENT, PACK_ENTRY_HEADER_LENGTH, PACK_FOOTER_LENGTH,
+    PACK_HEADER_LENGTH, PackBuilder, PackConfiguration, PackConfigurationError, PackEntryError,
+    PackEntryInput, PackEntryLocation, PackId, PackIdError, PackMetadata, PackPublisher,
+    PackReader, SealedPack, verify_pack,
+};
+
 #[cfg(feature = "async")]
 pub use api::{AsyncChunkStream, AsyncChunker, async_chunk_reader};
 

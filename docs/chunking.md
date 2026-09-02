@@ -116,3 +116,5 @@ each chunk before requesting the next one.
 
 Chunking does not choose filesystem boundaries, persist chunks, or group them
 into packs. Those policies belong to the backup and repository layers.
+Pack framing and the bounded pack builder are specified in
+[`docs/packs.md`](packs.md).
