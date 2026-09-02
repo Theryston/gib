@@ -47,6 +47,16 @@ pub(crate) enum FormatError {
     InvalidObjectId,
     InvalidPayloadChecksum,
     InvalidEnvelopeChecksum,
+    InvalidCompressionLevel,
+    InvalidTransformMetadata,
+    InvalidNonce,
+    EncryptionKeyRequired,
+    EncryptionKeyMismatch,
+    AuthenticationFailure,
+    KdfFailure,
+    CompressionFailure,
+    DecompressionFailure,
+    RandomnessFailure,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

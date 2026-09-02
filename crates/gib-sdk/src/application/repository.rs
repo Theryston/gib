@@ -749,8 +749,20 @@ fn map_format_error(error: FormatError) -> RepositoryError {
         | FormatError::InvalidDigestLength
         | FormatError::InvalidObjectId
         | FormatError::InvalidPayloadChecksum
-        | FormatError::InvalidEnvelopeChecksum => RepositoryError::Malformed {
+        | FormatError::InvalidEnvelopeChecksum
+        | FormatError::InvalidCompressionLevel
+        | FormatError::InvalidTransformMetadata
+        | FormatError::InvalidNonce
+        | FormatError::EncryptionKeyMismatch
+        | FormatError::AuthenticationFailure
+        | FormatError::KdfFailure
+        | FormatError::CompressionFailure
+        | FormatError::DecompressionFailure
+        | FormatError::RandomnessFailure => RepositoryError::Malformed {
             reason: "repository immutable object integrity or metadata is invalid",
+        },
+        FormatError::EncryptionKeyRequired => RepositoryError::Incompatible {
+            reason: "repository immutable object requires encryption credentials",
         },
         FormatError::UnsupportedCodec | FormatError::UnsupportedEncryption => {
             RepositoryError::Incompatible {

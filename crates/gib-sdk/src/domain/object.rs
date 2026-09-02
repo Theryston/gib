@@ -5,6 +5,10 @@ use std::str::FromStr;
 /// The version of the common immutable-object envelope.
 pub const CURRENT_OBJECT_ENVELOPE_VERSION: u16 = 1;
 
+/// The additive envelope version used when compression or encryption metadata
+/// is present.
+pub const CURRENT_TRANSFORMED_OBJECT_ENVELOPE_VERSION: u16 = 2;
+
 /// The current payload version for tree objects.
 pub const CURRENT_TREE_OBJECT_VERSION: u16 = 1;
 
@@ -20,8 +24,146 @@ pub const OBJECT_ID_HEX_LENGTH: usize = 64;
 /// The largest canonical plaintext accepted by the immutable-object format.
 pub const MAX_IMMUTABLE_OBJECT_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
+/// The largest stored payload accepted after compression and authentication
+/// metadata have been applied.
+pub const MAX_IMMUTABLE_OBJECT_STORED_PAYLOAD_BYTES: usize =
+    MAX_IMMUTABLE_OBJECT_PAYLOAD_BYTES + 1024 * 1024;
+
 /// The largest complete immutable object accepted by the format decoder.
-pub const MAX_IMMUTABLE_OBJECT_BYTES: usize = MAX_IMMUTABLE_OBJECT_PAYLOAD_BYTES + 4 * 1024;
+pub const MAX_IMMUTABLE_OBJECT_BYTES: usize = MAX_IMMUTABLE_OBJECT_STORED_PAYLOAD_BYTES + 8 * 1024;
+
+/// The default Zstandard compression level recorded for new compressed
+/// objects.
+pub const DEFAULT_ZSTD_COMPRESSION_LEVEL: i32 = 3;
+
+/// The stable KDF identifier recorded by transformed object envelopes.
+pub const REPOSITORY_ENCRYPTION_KDF: &str = "argon2id-v1";
+
+/// Argon2id memory cost in KiB for [`REPOSITORY_ENCRYPTION_KDF`].
+pub const ARGON2ID_MEMORY_COST_KIB: u32 = 64 * 1024;
+
+/// Argon2id pass count for [`REPOSITORY_ENCRYPTION_KDF`].
+pub const ARGON2ID_TIME_COST: u32 = 3;
+
+/// Argon2id parallelism for [`REPOSITORY_ENCRYPTION_KDF`].
+pub const ARGON2ID_PARALLELISM: u32 = 1;
+
+/// Argon2id-derived repository key length in bytes.
+pub const REPOSITORY_ENCRYPTION_KEY_LENGTH: usize = 32;
+
+/// Per-repository encryption salt length in bytes.
+pub const REPOSITORY_ENCRYPTION_SALT_LENGTH: usize = 16;
+
+/// XChaCha20-Poly1305 nonce length in bytes.
+pub const XCHACHA20_POLY1305_NONCE_LENGTH: usize = 24;
+
+/// XChaCha20-Poly1305 authentication tag length in bytes.
+pub const XCHACHA20_POLY1305_TAG_LENGTH: usize = 16;
+
+/// A validated Zstandard compression level.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CompressionLevel(i32);
+
+impl CompressionLevel {
+    /// The default level used when no explicit level is supplied.
+    pub const DEFAULT: Self = Self(DEFAULT_ZSTD_COMPRESSION_LEVEL);
+
+    /// Creates a level in the supported Zstandard range.
+    pub fn new(value: i32) -> Result<Self, CompressionLevelError> {
+        if (crate::domain::MIN_COMPRESSION_LEVEL..=crate::domain::MAX_COMPRESSION_LEVEL)
+            .contains(&value)
+        {
+            Ok(Self(value))
+        } else {
+            Err(CompressionLevelError)
+        }
+    }
+
+    /// Returns the numeric Zstandard level.
+    pub const fn value(self) -> i32 {
+        self.0
+    }
+}
+
+impl Default for CompressionLevel {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl TryFrom<i32> for CompressionLevel {
+    type Error = CompressionLevelError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+/// The error returned for a compression level outside the supported range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompressionLevelError;
+
+impl fmt::Display for CompressionLevelError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Zstandard compression level must be between {} and {}",
+            crate::domain::MIN_COMPRESSION_LEVEL,
+            crate::domain::MAX_COMPRESSION_LEVEL
+        )
+    }
+}
+
+impl std::error::Error for CompressionLevelError {}
+
+/// A fixed-size per-repository salt used by the repository KDF.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RepositorySalt([u8; REPOSITORY_ENCRYPTION_SALT_LENGTH]);
+
+impl RepositorySalt {
+    /// Creates a salt from exactly 16 bytes.
+    pub const fn from_bytes(bytes: [u8; REPOSITORY_ENCRYPTION_SALT_LENGTH]) -> Self {
+        Self(bytes)
+    }
+
+    /// Creates a salt from a byte slice of exactly 16 bytes.
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, RepositorySaltError> {
+        let bytes: [u8; REPOSITORY_ENCRYPTION_SALT_LENGTH] =
+            bytes.try_into().map_err(|_| RepositorySaltError)?;
+        Ok(Self(bytes))
+    }
+
+    /// Returns the raw salt bytes.
+    pub const fn as_bytes(&self) -> &[u8; REPOSITORY_ENCRYPTION_SALT_LENGTH] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for RepositorySalt {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl fmt::Debug for RepositorySalt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RepositorySalt")
+            .finish_non_exhaustive()
+    }
+}
+
+/// The error returned for a salt with the wrong length.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RepositorySaltError;
+
+impl fmt::Display for RepositorySaltError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("repository encryption salt must contain exactly 16 bytes")
+    }
+}
+
+impl std::error::Error for RepositorySaltError {}
 
 /// The kind discriminator used by an immutable repository object.
 #[non_exhaustive]
@@ -110,7 +252,7 @@ impl fmt::Display for ObjectKind {
 pub enum ObjectCodec {
     /// The payload is already canonical plaintext.
     None,
-    /// Zstandard-compressed payloads reserved for a future decoder.
+    /// Zstandard-compressed payloads.
     Zstd,
 }
 
@@ -158,7 +300,7 @@ impl fmt::Display for ObjectCodec {
 pub enum ObjectEncryption {
     /// The payload is not encrypted.
     None,
-    /// XChaCha20-Poly1305 encrypted payloads reserved for a future decoder.
+    /// XChaCha20-Poly1305 authenticated encrypted payloads.
     XChaCha20Poly1305,
 }
 
@@ -197,6 +339,46 @@ impl FromStr for ObjectEncryption {
 impl fmt::Display for ObjectEncryption {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+/// Validated transport choices for an immutable object.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ObjectTransformOptions {
+    codec: ObjectCodec,
+    compression_level: CompressionLevel,
+    encryption: ObjectEncryption,
+}
+
+impl ObjectTransformOptions {
+    /// Creates options with the default Zstandard level.
+    pub const fn new(codec: ObjectCodec, encryption: ObjectEncryption) -> Self {
+        Self {
+            codec,
+            compression_level: CompressionLevel::DEFAULT,
+            encryption,
+        }
+    }
+
+    /// Replaces the recorded Zstandard compression level.
+    pub const fn with_compression_level(mut self, level: CompressionLevel) -> Self {
+        self.compression_level = level;
+        self
+    }
+
+    /// Returns the selected codec.
+    pub const fn codec(self) -> ObjectCodec {
+        self.codec
+    }
+
+    /// Returns the validated compression level.
+    pub const fn compression_level(self) -> CompressionLevel {
+        self.compression_level
+    }
+
+    /// Returns the selected encryption scheme.
+    pub const fn encryption(self) -> ObjectEncryption {
+        self.encryption
     }
 }
 

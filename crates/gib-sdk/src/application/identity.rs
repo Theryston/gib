@@ -78,6 +78,16 @@ fn map_format_error(error: FormatError) -> IdentityError {
         | FormatError::InvalidDigestLength
         | FormatError::InvalidObjectId
         | FormatError::InvalidPayloadChecksum
-        | FormatError::InvalidEnvelopeChecksum => IdentityError::Malformed,
+        | FormatError::InvalidEnvelopeChecksum
+        | FormatError::InvalidCompressionLevel
+        | FormatError::InvalidTransformMetadata
+        | FormatError::InvalidNonce
+        | FormatError::EncryptionKeyRequired
+        | FormatError::EncryptionKeyMismatch
+        | FormatError::AuthenticationFailure
+        | FormatError::KdfFailure
+        | FormatError::CompressionFailure
+        | FormatError::DecompressionFailure
+        | FormatError::RandomnessFailure => IdentityError::Malformed,
     }
 }

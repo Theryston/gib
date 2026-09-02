@@ -11,8 +11,13 @@ use crate::application::repository::{
 };
 use crate::domain::DomainError;
 use crate::format::{
-    FormatError, calculate_object_id, decode_object_envelope, decode_object_envelope_from_reader,
-    decode_snapshot, encode_object_envelope, encode_snapshot, snapshot_object_id,
+    EncryptionContext, FormatError, calculate_object_id, decode_object_envelope,
+    decode_object_envelope_from_reader, decode_object_envelope_from_reader_with_encryption,
+    decode_object_envelope_from_reader_with_password, decode_object_envelope_with_encryption,
+    decode_object_envelope_with_password, decode_snapshot, derive_encryption_context,
+    encode_object_envelope, encode_object_envelope_with_encryption,
+    encode_object_envelope_with_options, encode_object_envelope_with_password, encode_snapshot,
+    generate_encryption_context, snapshot_object_id,
 };
 use std::fmt;
 use std::io::Read;
@@ -26,6 +31,17 @@ pub use crate::application::ports::{
     StorageListPage, StorageListRequest, StorageMetadata, StoragePrefix, StorageRange,
     StorageReader, StorageResult, StorageVersion, StorageVersionToken, StorageWriteCondition,
     StorageWriteOptions, VersionToken, VersionedObject, VersionedStorageObject, WriteCondition,
+};
+pub use crate::domain::{
+    ARGON2ID_MEMORY_COST_KIB, ARGON2ID_PARALLELISM, ARGON2ID_TIME_COST,
+    CURRENT_INDEX_OBJECT_VERSION, CURRENT_OBJECT_ENVELOPE_VERSION, CURRENT_PACK_OBJECT_VERSION,
+    CURRENT_TRANSFORMED_OBJECT_ENVELOPE_VERSION, CURRENT_TREE_OBJECT_VERSION, CompressionLevel,
+    CompressionLevelError, DEFAULT_ZSTD_COMPRESSION_LEVEL, ImmutableObject,
+    MAX_IMMUTABLE_OBJECT_BYTES, MAX_IMMUTABLE_OBJECT_PAYLOAD_BYTES,
+    MAX_IMMUTABLE_OBJECT_STORED_PAYLOAD_BYTES, OBJECT_ID_HEX_LENGTH, ObjectCodec, ObjectEncryption,
+    ObjectId, ObjectKind, ObjectTransformOptions, REPOSITORY_ENCRYPTION_KDF,
+    REPOSITORY_ENCRYPTION_KEY_LENGTH, REPOSITORY_ENCRYPTION_SALT_LENGTH, RepositorySalt,
+    RepositorySaltError, XCHACHA20_POLY1305_NONCE_LENGTH, XCHACHA20_POLY1305_TAG_LENGTH,
 };
 #[cfg(feature = "async")]
 pub use crate::domain::{AsyncChunkStream, AsyncChunker, async_chunk_reader};
@@ -46,12 +62,6 @@ pub use crate::domain::{
     SnapshotId, SnapshotListRequest, SnapshotPage, SnapshotRef, SnapshotReferenceInput,
     SnapshotReferenceSelector, SnapshotSelector, SnapshotSummary, SnapshotSummaryListRequest,
     SnapshotSummaryPage,
-};
-pub use crate::domain::{
-    CURRENT_INDEX_OBJECT_VERSION, CURRENT_OBJECT_ENVELOPE_VERSION, CURRENT_PACK_OBJECT_VERSION,
-    CURRENT_TREE_OBJECT_VERSION, ImmutableObject, MAX_IMMUTABLE_OBJECT_BYTES,
-    MAX_IMMUTABLE_OBJECT_PAYLOAD_BYTES, OBJECT_ID_HEX_LENGTH, ObjectCodec, ObjectEncryption,
-    ObjectId, ObjectKind,
 };
 pub use crate::domain::{
     CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,
@@ -82,6 +92,67 @@ pub use crate::infrastructure::storage::{
 pub use crate::infrastructure::storage::{
     LocalStorage, LocalStorageOperation, MemoryStorage, MemoryStorageOperation,
 };
+
+/// Repository encryption material derived from a password and a persistent
+/// per-repository salt.
+///
+/// The derived key is kept private, is redacted from `Debug`, and is zeroized
+/// when this context is dropped. The salt is copied into transformed object
+/// envelopes so a password-only decoder can select the recorded KDF inputs.
+#[derive(Clone)]
+pub struct RepositoryEncryption {
+    context: EncryptionContext,
+}
+
+impl RepositoryEncryption {
+    /// Derives repository encryption material using the fixed Argon2id v1
+    /// parameters documented by the repository format.
+    pub fn from_password(password: &[u8], salt: RepositorySalt) -> SdkResult<Self> {
+        if password.is_empty() {
+            return Err(SdkError::InvalidRequest {
+                field: "password",
+                reason: "must not be empty",
+            });
+        }
+        derive_encryption_context(password, salt)
+            .map(|context| Self { context })
+            .map_err(map_object_format_error)
+    }
+
+    /// Generates a fresh repository salt and derives encryption material from
+    /// the supplied password.
+    pub fn generate(password: &[u8]) -> SdkResult<Self> {
+        if password.is_empty() {
+            return Err(SdkError::InvalidRequest {
+                field: "password",
+                reason: "must not be empty",
+            });
+        }
+        generate_encryption_context(password)
+            .map(|context| Self { context })
+            .map_err(map_object_format_error)
+    }
+
+    /// Returns the per-repository salt that must be retained with the
+    /// repository's encryption configuration.
+    pub const fn salt(&self) -> RepositorySalt {
+        self.context.salt()
+    }
+
+    pub(crate) fn context(&self) -> &EncryptionContext {
+        &self.context
+    }
+}
+
+impl fmt::Debug for RepositoryEncryption {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RepositoryEncryption")
+            .field("salt", &"<redacted>")
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
 
 /// A cloneable type-erased handle for a repository storage backend.
 #[derive(Clone)]
@@ -871,9 +942,11 @@ pub fn calculate_object_id_for_content(
 
 /// Encodes canonical plaintext in the common immutable-object envelope.
 ///
-/// The current release accepts only [`ObjectCodec::None`] and
-/// [`ObjectEncryption::None`]. Other metadata values are reserved for
-/// decoders that implement their corresponding transforms.
+/// Uncompressed and unencrypted objects retain the released version-1 bytes.
+/// Zstandard objects use the default level and a version-2 envelope. An
+/// encrypted request fails with [`SdkError::RepositoryEncryptionKeyRequired`]
+/// unless [`encode_immutable_object_with_options`] is used with an
+/// explicit repository encryption context.
 pub fn encode_immutable_object(
     kind: ObjectKind,
     object_version: u16,
@@ -883,6 +956,95 @@ pub fn encode_immutable_object(
 ) -> SdkResult<Vec<u8>> {
     encode_object_envelope(kind, object_version, codec, encryption, canonical_plaintext)
         .map_err(map_object_format_error)
+}
+
+/// Encodes canonical plaintext with validated transport options.
+///
+/// The optional encryption context is required exactly when
+/// `options.encryption()` is [`ObjectEncryption::XChaCha20Poly1305`]. The
+/// context's salt is persisted in the envelope; its derived key is not.
+pub fn encode_immutable_object_with_options(
+    kind: ObjectKind,
+    object_version: u16,
+    options: ObjectTransformOptions,
+    encryption_context: Option<&RepositoryEncryption>,
+    canonical_plaintext: &[u8],
+) -> SdkResult<Vec<u8>> {
+    encode_object_envelope_with_options(
+        kind,
+        object_version,
+        options,
+        encryption_context.map(RepositoryEncryption::context),
+        canonical_plaintext,
+    )
+    .map_err(map_object_format_error)
+}
+
+/// Encodes canonical plaintext using an explicit repository encryption
+/// context.
+pub fn encode_immutable_object_with_encryption(
+    kind: ObjectKind,
+    object_version: u16,
+    options: ObjectTransformOptions,
+    encryption_context: &RepositoryEncryption,
+    canonical_plaintext: &[u8],
+) -> SdkResult<Vec<u8>> {
+    encode_object_envelope_with_encryption(
+        kind,
+        object_version,
+        options,
+        encryption_context.context(),
+        canonical_plaintext,
+    )
+    .map_err(map_object_format_error)
+}
+
+/// Encodes canonical plaintext after deriving a repository key from a
+/// password and the supplied per-repository salt.
+pub fn encode_immutable_object_with_password(
+    kind: ObjectKind,
+    object_version: u16,
+    codec: ObjectCodec,
+    encryption: ObjectEncryption,
+    password: &[u8],
+    salt: RepositorySalt,
+    canonical_plaintext: &[u8],
+) -> SdkResult<Vec<u8>> {
+    encode_immutable_object_with_password_and_options(
+        kind,
+        object_version,
+        ObjectTransformOptions::new(codec, encryption),
+        password,
+        salt,
+        canonical_plaintext,
+    )
+}
+
+/// Encodes canonical plaintext after deriving a repository key with explicit
+/// compression options.
+pub fn encode_immutable_object_with_password_and_options(
+    kind: ObjectKind,
+    object_version: u16,
+    options: ObjectTransformOptions,
+    password: &[u8],
+    salt: RepositorySalt,
+    canonical_plaintext: &[u8],
+) -> SdkResult<Vec<u8>> {
+    if password.is_empty() {
+        return Err(SdkError::InvalidRequest {
+            field: "password",
+            reason: "must not be empty",
+        });
+    }
+    encode_object_envelope_with_password(
+        kind,
+        object_version,
+        options,
+        password,
+        salt,
+        canonical_plaintext,
+    )
+    .map_err(map_object_format_error)
 }
 
 /// Encodes canonical plaintext using the current uncompressed, unencrypted
@@ -906,6 +1068,30 @@ pub fn decode_immutable_object(bytes: &[u8]) -> SdkResult<ImmutableObject> {
     decode_object_envelope(bytes).map_err(map_object_format_error)
 }
 
+/// Decodes an object using an explicit repository encryption context.
+pub fn decode_immutable_object_with_encryption(
+    bytes: &[u8],
+    encryption_context: &RepositoryEncryption,
+) -> SdkResult<ImmutableObject> {
+    decode_object_envelope_with_encryption(bytes, encryption_context.context())
+        .map_err(map_object_format_error)
+}
+
+/// Decodes an object by deriving its key from the password and the salt
+/// recorded in the validated envelope.
+pub fn decode_immutable_object_with_password(
+    bytes: &[u8],
+    password: &[u8],
+) -> SdkResult<ImmutableObject> {
+    if password.is_empty() {
+        return Err(SdkError::InvalidRequest {
+            field: "password",
+            reason: "must not be empty",
+        });
+    }
+    decode_object_envelope_with_password(bytes, password).map_err(map_object_format_error)
+}
+
 /// Alias for [`decode_immutable_object`].
 pub fn decode_object(bytes: &[u8]) -> SdkResult<ImmutableObject> {
     decode_immutable_object(bytes)
@@ -914,6 +1100,30 @@ pub fn decode_object(bytes: &[u8]) -> SdkResult<ImmutableObject> {
 /// Reads, bounds, decodes, and authenticates an immutable object.
 pub fn decode_immutable_object_from_reader<R: Read>(mut reader: R) -> SdkResult<ImmutableObject> {
     decode_object_envelope_from_reader(&mut reader).map_err(map_object_format_error)
+}
+
+/// Reads, bounds, and decodes an object using an explicit encryption context.
+pub fn decode_immutable_object_from_reader_with_encryption<R: Read>(
+    mut reader: R,
+    encryption_context: &RepositoryEncryption,
+) -> SdkResult<ImmutableObject> {
+    decode_object_envelope_from_reader_with_encryption(&mut reader, encryption_context.context())
+        .map_err(map_object_format_error)
+}
+
+/// Reads, bounds, and decodes an object using a password.
+pub fn decode_immutable_object_from_reader_with_password<R: Read>(
+    mut reader: R,
+    password: &[u8],
+) -> SdkResult<ImmutableObject> {
+    if password.is_empty() {
+        return Err(SdkError::InvalidRequest {
+            field: "password",
+            reason: "must not be empty",
+        });
+    }
+    decode_object_envelope_from_reader_with_password(&mut reader, password)
+        .map_err(map_object_format_error)
 }
 
 fn map_snapshot_format_error(error: FormatError) -> SdkError {
@@ -950,8 +1160,27 @@ fn map_snapshot_format_error(error: FormatError) -> SdkError {
         | FormatError::InvalidDigestLength
         | FormatError::InvalidObjectId
         | FormatError::InvalidPayloadChecksum
-        | FormatError::InvalidEnvelopeChecksum => SdkError::RepositoryMalformed {
+        | FormatError::InvalidEnvelopeChecksum
+        | FormatError::InvalidCompressionLevel
+        | FormatError::InvalidTransformMetadata
+        | FormatError::InvalidNonce => SdkError::RepositoryMalformed {
             reason: "snapshot object contains an invalid field",
+        },
+        FormatError::EncryptionKeyRequired => SdkError::RepositoryEncryptionKeyRequired,
+        FormatError::EncryptionKeyMismatch | FormatError::AuthenticationFailure => {
+            SdkError::RepositoryAuthenticationFailed
+        }
+        FormatError::KdfFailure => SdkError::RepositoryTransformFailed {
+            reason: "repository encryption key derivation failed",
+        },
+        FormatError::CompressionFailure => SdkError::RepositoryTransformFailed {
+            reason: "repository object compression failed",
+        },
+        FormatError::DecompressionFailure => SdkError::RepositoryTransformFailed {
+            reason: "repository object decompression failed",
+        },
+        FormatError::RandomnessFailure => SdkError::RepositoryTransformFailed {
+            reason: "secure random generation failed",
         },
         FormatError::UnsupportedCodec | FormatError::UnsupportedEncryption => {
             SdkError::RepositoryIncompatible {
@@ -1006,6 +1235,30 @@ fn map_object_format_error(error: FormatError) -> SdkError {
                 reason: "immutable object integrity check failed",
             }
         }
+        FormatError::EncryptionKeyRequired => SdkError::RepositoryEncryptionKeyRequired,
+        FormatError::EncryptionKeyMismatch | FormatError::AuthenticationFailure => {
+            SdkError::RepositoryAuthenticationFailed
+        }
+        FormatError::InvalidCompressionLevel | FormatError::InvalidTransformMetadata => {
+            SdkError::RepositoryTransformFailed {
+                reason: "immutable object transform metadata is invalid",
+            }
+        }
+        FormatError::InvalidNonce => SdkError::RepositoryTransformFailed {
+            reason: "immutable object encryption nonce is invalid",
+        },
+        FormatError::KdfFailure => SdkError::RepositoryTransformFailed {
+            reason: "repository encryption key derivation failed",
+        },
+        FormatError::CompressionFailure => SdkError::RepositoryTransformFailed {
+            reason: "repository object compression failed",
+        },
+        FormatError::DecompressionFailure => SdkError::RepositoryTransformFailed {
+            reason: "repository object decompression failed",
+        },
+        FormatError::RandomnessFailure => SdkError::RepositoryTransformFailed {
+            reason: "secure random generation failed",
+        },
         FormatError::InvalidRootReference
         | FormatError::MissingRequiredFeature
         | FormatError::UnsupportedRequiredFeature

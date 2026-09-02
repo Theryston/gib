@@ -246,7 +246,17 @@ fn map_format_error(error: FormatError) -> StorageConfigurationFormatError {
         | FormatError::InvalidDigestLength
         | FormatError::InvalidObjectId
         | FormatError::InvalidPayloadChecksum
-        | FormatError::InvalidEnvelopeChecksum => StorageConfigurationFormatError::InvalidEncoding,
+        | FormatError::InvalidEnvelopeChecksum
+        | FormatError::InvalidCompressionLevel
+        | FormatError::InvalidTransformMetadata
+        | FormatError::InvalidNonce
+        | FormatError::EncryptionKeyRequired
+        | FormatError::EncryptionKeyMismatch
+        | FormatError::AuthenticationFailure
+        | FormatError::KdfFailure
+        | FormatError::CompressionFailure
+        | FormatError::DecompressionFailure
+        | FormatError::RandomnessFailure => StorageConfigurationFormatError::InvalidEncoding,
     }
 }
 

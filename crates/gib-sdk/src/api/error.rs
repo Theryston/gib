@@ -39,6 +39,12 @@ pub enum ErrorCode {
     RepositoryUnsupportedVersion,
     /// A repository is validly encoded but incompatible with this SDK.
     RepositoryIncompatible,
+    /// An encrypted repository object requires an explicit encryption key.
+    RepositoryEncryptionKeyRequired,
+    /// Repository object authentication failed.
+    RepositoryAuthenticationFailed,
+    /// A repository object transform could not be applied.
+    RepositoryTransformFailed,
     /// A repository HEAD publication lost its compare-and-swap race.
     RepositoryPublicationConflict,
     /// A requested snapshot object is missing.
@@ -84,6 +90,9 @@ impl ErrorCode {
             Self::RepositoryMalformed => "repository_malformed",
             Self::RepositoryUnsupportedVersion => "repository_unsupported_version",
             Self::RepositoryIncompatible => "repository_incompatible",
+            Self::RepositoryEncryptionKeyRequired => "repository_encryption_key_required",
+            Self::RepositoryAuthenticationFailed => "repository_authentication_failed",
+            Self::RepositoryTransformFailed => "repository_transform_failed",
             Self::RepositoryPublicationConflict => "repository_publication_conflict",
             Self::RepositorySnapshotMissing => "repository_snapshot_missing",
             Self::RepositoryRequiredObjectMissing => "repository_required_object_missing",
@@ -172,6 +181,16 @@ pub enum SdkError {
         /// A stable explanation of the incompatibility.
         reason: &'static str,
     },
+    /// An encrypted repository object requires an explicit encryption key.
+    RepositoryEncryptionKeyRequired,
+    /// Repository object authentication failed, usually because the key or
+    /// ciphertext is wrong.
+    RepositoryAuthenticationFailed,
+    /// A recorded repository object transform could not be applied.
+    RepositoryTransformFailed {
+        /// A stable explanation that never contains key material or payloads.
+        reason: &'static str,
+    },
     /// Another publisher changed HEAD after the supplied versioned read.
     RepositoryPublicationConflict,
     /// The requested snapshot object is missing.
@@ -238,6 +257,9 @@ impl SdkError {
             Self::RepositoryMalformed { .. } => ErrorCode::RepositoryMalformed,
             Self::RepositoryUnsupportedVersion { .. } => ErrorCode::RepositoryUnsupportedVersion,
             Self::RepositoryIncompatible { .. } => ErrorCode::RepositoryIncompatible,
+            Self::RepositoryEncryptionKeyRequired => ErrorCode::RepositoryEncryptionKeyRequired,
+            Self::RepositoryAuthenticationFailed => ErrorCode::RepositoryAuthenticationFailed,
+            Self::RepositoryTransformFailed { .. } => ErrorCode::RepositoryTransformFailed,
             Self::RepositoryPublicationConflict => ErrorCode::RepositoryPublicationConflict,
             Self::RepositorySnapshotMissing => ErrorCode::RepositorySnapshotMissing,
             Self::RepositoryRequiredObjectMissing => ErrorCode::RepositoryRequiredObjectMissing,
@@ -272,6 +294,9 @@ impl SdkError {
             | Self::RepositoryMalformed { .. }
             | Self::RepositoryUnsupportedVersion { .. }
             | Self::RepositoryIncompatible { .. }
+            | Self::RepositoryEncryptionKeyRequired
+            | Self::RepositoryAuthenticationFailed
+            | Self::RepositoryTransformFailed { .. }
             | Self::RepositoryPublicationConflict
             | Self::RepositorySnapshotMissing
             | Self::RepositoryRequiredObjectMissing
@@ -361,6 +386,15 @@ impl fmt::Display for SdkError {
             }
             Self::RepositoryIncompatible { reason } => {
                 write!(formatter, "repository is incompatible: {reason}")
+            }
+            Self::RepositoryEncryptionKeyRequired => {
+                formatter.write_str("an encryption key is required for this repository object")
+            }
+            Self::RepositoryAuthenticationFailed => {
+                formatter.write_str("repository object authentication failed")
+            }
+            Self::RepositoryTransformFailed { reason } => {
+                write!(formatter, "repository object transform failed: {reason}")
             }
             Self::RepositoryPublicationConflict => {
                 formatter.write_str("repository HEAD publication conflicted with another publisher")
