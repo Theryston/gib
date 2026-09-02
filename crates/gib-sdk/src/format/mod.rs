@@ -6,6 +6,7 @@ mod pack_index;
 mod repository;
 mod storage_configuration;
 mod transform;
+mod tree;
 
 pub(crate) use configuration::{
     ConfigurationDocumentError, ConfigurationDocumentErrorKind, MAX_CONFIGURATION_BYTES,
@@ -36,4 +37,8 @@ pub(crate) use storage_configuration::{
 };
 pub(crate) use transform::{
     EncryptionContext, derive_encryption_context, generate_encryption_context,
+};
+pub(crate) use tree::{
+    decode_tree_node, decode_tree_node_with_encryption, encode_tree_node, encode_tree_node_with_id,
+    tree_node_id,
 };

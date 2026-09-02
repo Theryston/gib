@@ -6,6 +6,7 @@ mod pack;
 mod pack_index;
 mod repository;
 mod snapshot;
+mod tree;
 
 pub use author::{AuthorIdentity, MAX_AUTHOR_IDENTITY_LENGTH};
 #[cfg(feature = "async")]
@@ -77,4 +78,16 @@ pub use snapshot::{
     SnapshotId, SnapshotListRequest, SnapshotPage, SnapshotRef, SnapshotReferenceInput,
     SnapshotReferenceSelector, SnapshotSelector, SnapshotSummary, SnapshotSummaryListRequest,
     SnapshotSummaryPage,
+};
+pub use tree::{
+    CURRENT_TREE_METADATA_VERSION, CURRENT_TREE_NODE_VERSION, ChunkReference, ChunkReferenceError,
+    DirectoryEntry, DirectoryNode, EntryName, EntryNameError, FileChunkReference, FileNode,
+    FilePermissions, LazyTree, MAX_FILE_CHUNK_REFERENCES, MAX_METADATA_EXTENSION_BYTES,
+    MAX_METADATA_EXTENSIONS, MAX_METADATA_NAMESPACE_BYTES, MAX_SYMLINK_TARGET_BYTES,
+    MAX_TREE_ENTRIES, MAX_TREE_NAME_BYTES, MAX_TREE_PATH_BYTES, MetadataError, MetadataExtension,
+    MetadataNamespace, MetadataNamespaceError, Name, NodeKind, NodeReference,
+    NormalizedRelativePath, PermissionError, PortableMetadata, RegularFileNode, RelativePath,
+    RelativePathError, SymbolicLinkNode, SymlinkNode, SymlinkTarget, SymlinkTargetError, TreeEntry,
+    TreeNode, TreeNodeId, TreeNodeKind, TreeNodeReference, TreeNodeStore, TreeTraversalError,
+    TreeValidationError, TreeWalkEntry, TreeWalker, ValidatedName,
 };

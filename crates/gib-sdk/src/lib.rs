@@ -103,6 +103,23 @@ pub use api::{
 };
 
 pub use api::{
+    BuiltTree, CURRENT_TREE_METADATA_VERSION, CURRENT_TREE_NODE_VERSION, ChunkReference,
+    ChunkReferenceError, DirectoryEntry, DirectoryNode, EncodedTreeNode, EntryName, EntryNameError,
+    FileChunkReference, FileNode, FilePermissions, IncrementalTreeBuilder, LazyTree,
+    MAX_FILE_CHUNK_REFERENCES, MAX_METADATA_EXTENSION_BYTES, MAX_METADATA_EXTENSIONS,
+    MAX_METADATA_NAMESPACE_BYTES, MAX_SYMLINK_TARGET_BYTES, MAX_TREE_ENTRIES, MAX_TREE_NAME_BYTES,
+    MAX_TREE_OBJECT_BYTES, MAX_TREE_PATH_BYTES, MetadataError, MetadataExtension,
+    MetadataNamespace, MetadataNamespaceError, Name, NodeKind, NodeReference,
+    NormalizedRelativePath, PermissionError, PortableMetadata, RegularFileNode, RelativePath,
+    RelativePathError, RepositoryTreeStore, SnapshotTree, SymbolicLinkNode, SymlinkNode,
+    SymlinkTarget, SymlinkTargetError, TreeBuilder, TreeEntry, TreeNode, TreeNodeId, TreeNodeKind,
+    TreeNodeReference, TreeNodeStore, TreeObject, TreeObjectPublisher, TreeTraversalError,
+    TreeValidationError, TreeWalkEntry, TreeWalker, ValidatedName, decode_tree,
+    decode_tree_node_object, encode_tree, encode_tree_node_object, tree_node_id_for_content,
+    tree_node_object_id,
+};
+
+pub use api::{
     CURRENT_PACK_FORMAT_VERSION, DEFAULT_PACK_MAX_SIZE_BYTES, DEFAULT_PACK_TARGET_SIZE_BYTES,
     MAX_PACK_SIZE_BYTES, PACK_ALIGNMENT, PACK_ENTRY_HEADER_LENGTH, PACK_FOOTER_LENGTH,
     PACK_HEADER_LENGTH, PackBuilder, PackConfiguration, PackConfigurationError, PackEntryError,

@@ -225,12 +225,65 @@ The versioned pack-index shard framing, chunk-ID prefix policy, publication
 keys, and bounded range lookup are specified separately in
 [`docs/pack-indexes.md`](pack-indexes.md).
 
+## Version-1 Merkle tree payload
+
+A tree object uses `object_version = 1` and stores exactly one immutable node.
+The node payload is a canonical named MessagePack map with these fields, in
+this order:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `tree_version` | unsigned 16-bit integer | Tree payload schema. Value: `1`. |
+| `magic` | UTF-8 string | Repository marker, exactly `GIB`. |
+| `node_kind` | UTF-8 string | `directory`, `file`, or `symlink`. |
+| `metadata` | named map | Portable metadata described below. |
+| `entries` | array of named maps | Direct children for a directory; empty for files and links. |
+| `file_size` | unsigned 64-bit integer | Logical file size; zero for directories and links. |
+| `chunks` | array of named maps | Ordered file chunk references; empty for directories and links. |
+| `symlink_target` | MessagePack binary | Raw link target; empty for directories and files. |
+
+The `metadata` map contains `metadata_version` (`1`), `permissions` (portable
+mode bits `0..=0o7777`), `modified_at` (nil or signed Unix-epoch nanoseconds),
+and `extensions`. An extension contains a lowercase ASCII `namespace`, a
+non-zero unsigned `version`, and an opaque binary `value`. Extensions are
+sorted by `(namespace, version)` and duplicate pairs are rejected. Namespaces
+and extension versions are independent so platform-specific metadata can be
+added without changing the portable fields.
+
+Directory entries contain `name`, `node_kind`, and a 32-byte `node_id`. Names
+are validated UTF-8 components: they are non-empty, at most 255 bytes, never
+`.` or `..`, never contain separators, controls, NUL, Windows-ambiguous
+punctuation, or trailing spaces/dots, and never name a Windows device. Entries
+are sorted by their UTF-8 byte representation and duplicate names are
+rejected. A regular file contains an ordered array of 32-byte `chunk_id`
+values and positive plaintext sizes; their checked sum must equal `file_size`.
+An empty file therefore has no chunk references. A symbolic link stores its
+non-empty raw target bytes without normalization or resolution; the target is
+never followed while traversing the tree.
+
+The payload decoder rejects fields that do not apply to the selected node kind,
+unknown or duplicate fields, non-canonical ordering, invalid names, invalid
+IDs, invalid metadata, and trailing bytes. The node ID is the common immutable
+object ID of this canonical payload, so incidental filesystem scan order,
+transport encoding, and envelope checksums do not affect identity.
+
+The root reference must be a directory. Directory entries carry the expected
+child node kind alongside the child ID; a repository tree source verifies both
+the content ID and kind before returning a node. Lazy lookup loads only the
+root and the requested ancestor chain. Depth-first traversal retains only the
+active directory path, detects cycles in that path, and does not materialize a
+whole snapshot. Rebuilding a changed leaf creates the leaf and its ancestor
+chain while reusing every unrelated child reference.
+
 ## Fixtures
 
 The repository contains exact hexadecimal byte fixtures under
 `tests/fixtures/repository/v1/objects/`:
 
-- `tree-envelope.hex` is the canonical tree envelope and golden ID fixture.
+- `tree-envelope.hex` is the common-envelope compatibility fixture used by the
+  generic immutable-object tests.
+- `tree-node-envelope.hex` is the canonical version-1 empty-directory node and
+  golden ID fixture for the Merkle tree payload above.
 - `snapshot-envelope.hex` is a current enveloped snapshot.
 - `snapshot-legacy.hex` is the released standalone snapshot representation.
 

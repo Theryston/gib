@@ -2168,7 +2168,7 @@ fn map_snapshot_format_error(error: FormatError) -> SdkError {
     }
 }
 
-fn map_object_format_error(error: FormatError) -> SdkError {
+pub(crate) fn map_object_format_error(error: FormatError) -> SdkError {
     match error {
         FormatError::UnsupportedVersion { version }
         | FormatError::UnsupportedObjectVersion { version } => {

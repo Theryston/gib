@@ -7,6 +7,7 @@ mod identity;
 mod operation;
 mod repository;
 mod storage_configuration;
+mod tree;
 
 pub use builder::{ClientBuilder, DEFAULT_EVENT_BUFFER_CAPACITY};
 pub use client::Client;
@@ -141,3 +142,4 @@ pub use repository::{
     WebDavStorageConfig,
 };
 pub use storage_configuration::*;
+pub use tree::*;
