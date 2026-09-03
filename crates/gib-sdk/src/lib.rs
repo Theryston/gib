@@ -120,6 +120,19 @@ pub use api::{
 };
 
 pub use api::{
+    Filesystem, FilesystemChangePhase, FilesystemChangeReason, FilesystemClock,
+    FilesystemDirectory, FilesystemDirectoryEntry, FilesystemEntry, FilesystemEntryError,
+    FilesystemEntryKind, FilesystemErrorKind, FilesystemFile, FilesystemIdentity,
+    FilesystemMetadata, FilesystemOperation, FilesystemPermissionPolicy, FilesystemScan,
+    FilesystemScanError, FilesystemScanOptions, FilesystemScanner, LocalFilesystem,
+    LocalFilesystemScanner, MAX_FILESYSTEM_SCAN_OPEN_DIRECTORIES, PermissionErrorPolicy,
+    SystemClock, VerifiedFileReader, local_filesystem_scanner,
+};
+
+#[cfg(feature = "async")]
+pub use api::AsyncFilesystemScan;
+
+pub use api::{
     CURRENT_PACK_FORMAT_VERSION, DEFAULT_PACK_MAX_SIZE_BYTES, DEFAULT_PACK_TARGET_SIZE_BYTES,
     MAX_PACK_SIZE_BYTES, PACK_ALIGNMENT, PACK_ENTRY_HEADER_LENGTH, PACK_FOOTER_LENGTH,
     PACK_HEADER_LENGTH, PackBuilder, PackConfiguration, PackConfigurationError, PackEntryError,

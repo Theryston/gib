@@ -3,6 +3,7 @@ mod client;
 mod configuration;
 mod error;
 mod event;
+mod filesystem;
 mod identity;
 mod operation;
 mod repository;
@@ -37,6 +38,7 @@ pub use event::{
     EventEnvelope, EventKind, EventMessage, EventPayload, EventPhase, EventSubscription, Progress,
     RecoveryPoint,
 };
+pub use filesystem::*;
 pub use identity::{
     Author, AuthorIdentity, CURRENT_IDENTITY_CONFIGURATION_VERSION, ConfigurationError,
     ConfigurationHandle, ConfigurationResult, ConfigurationStorage, GLOBAL_CONFIG_DIRECTORY,

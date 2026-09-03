@@ -1,3 +1,4 @@
+pub(crate) mod filesystem;
 pub(crate) mod identity;
 pub(crate) mod ports;
 pub(crate) mod repository;

@@ -6,7 +6,7 @@ description.workspace = true
 
 [features]
 default = []
-async = ["dep:futures-util"]
+async = ["dep:futures-util", "dep:tokio"]
 s3 = ["dep:aws-sdk-s3", "dep:tokio"]
 webdav = [
     "dep:futures-util",

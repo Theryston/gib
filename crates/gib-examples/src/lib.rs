@@ -4,4 +4,5 @@
 //!
 //! ```text
 //! cargo run -p gib-examples --example initialize_repository -- /tmp/gib-repository
+//! cargo run -p gib-examples --example filesystem_scan_qa -- scan /tmp/source
 //! ```

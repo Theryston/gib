@@ -1,4 +1,5 @@
 mod configuration;
+mod filesystem;
 mod storage;
 mod storage_configuration;
 
@@ -6,6 +7,10 @@ pub use configuration::{
     ConfigurationError, ConfigurationFileMetadata, ConfigurationFileSystem, ConfigurationResult,
     ConfigurationStorage,
 };
+pub use filesystem::{
+    Filesystem, FilesystemClock, FilesystemDirectory, FilesystemDirectoryEntry, FilesystemFile,
+};
+pub(crate) use filesystem::{io_error, map_io_error};
 pub use storage::{
     ByteRange, DEFAULT_OBJECT_LIST_PAGE_SIZE, ListCursor, MAX_OBJECT_LIST_PAGE_SIZE, ObjectCursor,
     ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata, ObjectPrefix, ObjectRange,

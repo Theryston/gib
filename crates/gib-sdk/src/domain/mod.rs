@@ -1,6 +1,7 @@
 mod author;
 mod chunk;
 mod configuration;
+mod filesystem;
 mod object;
 mod pack;
 mod pack_index;
@@ -69,6 +70,12 @@ pub use repository::{
     SnapshotReference,
 };
 
+pub use filesystem::{
+    FilesystemChangePhase, FilesystemChangeReason, FilesystemEntry, FilesystemEntryError,
+    FilesystemEntryKind, FilesystemErrorKind, FilesystemIdentity, FilesystemMetadata,
+    FilesystemOperation, FilesystemPermissionPolicy, FilesystemScanError,
+    MAX_FILESYSTEM_SCAN_OPEN_DIRECTORIES, PermissionErrorPolicy,
+};
 pub use snapshot::{
     BackupReference, CURRENT_SNAPSHOT_HISTORY_VERSION, CURRENT_SNAPSHOT_SUMMARY_VERSION,
     CURRENT_SNAPSHOT_VERSION, DEFAULT_SNAPSHOT_PAGE_SIZE, LATEST_SNAPSHOT_ALIAS,
