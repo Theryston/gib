@@ -586,6 +586,38 @@ fn stale_head_publication_returns_a_typed_conflict_and_keeps_the_winner()
 }
 
 #[test]
+fn publication_conflict_context_contains_expected_and_current_heads() -> Result<(), Box<dyn Error>>
+{
+    let storage = MemoryStorage::new();
+    let repository = initialize_repository(storage.clone())?;
+    let first = snapshot("snapshots/context-first")?;
+    let second = snapshot("snapshots/context-second")?;
+    storage.put(first.as_str(), b"snapshot-first")?;
+    storage.put(second.as_str(), b"snapshot-second")?;
+    let expected = repository.read_head()?;
+
+    let winner = repository.publish_snapshot(&expected, first)?;
+    let conflict = repository
+        .publish_head(
+            &expected,
+            SnapshotPublication::new(second).with_conflict_context(),
+        )
+        .expect_err("the stale version must return reconciliation context");
+    match conflict {
+        SdkError::RepositoryPublicationConflictContext {
+            expected: observed_expected,
+            current: Some(current),
+        } => {
+            assert_eq!(*observed_expected, expected);
+            assert_eq!(*current, winner);
+        }
+        other => panic!("expected publication conflict context, got {other:?}"),
+    }
+    assert_eq!(repository.read_head()?, winner);
+    Ok(())
+}
+
+#[test]
 fn missing_snapshot_dependencies_cannot_publish_head() -> Result<(), Box<dyn Error>> {
     let storage = MemoryStorage::new();
     let repository = initialize_repository(storage.clone())?;

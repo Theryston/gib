@@ -397,6 +397,10 @@ impl HeadState {
         }
     }
 
+    pub(crate) fn from_application_read(read: ApplicationHeadRead) -> Self {
+        Self::from_read(read)
+    }
+
     /// Returns the validated domain HEAD value.
     pub fn head(&self) -> &RepositoryHead {
         &self.head
@@ -686,7 +690,7 @@ impl Repository {
     {
         let publication = publication.into();
         let is_cancelled = || cancellation.is_some_and(CancellationToken::is_cancelled);
-        publish_head_use_case(
+        let result = publish_head_use_case(
             self.storage.as_storage(),
             &ApplicationHeadRead {
                 head: expected.head.clone(),
@@ -694,9 +698,21 @@ impl Repository {
             },
             &publication,
             Some(&is_cancelled),
-        )
-        .map(HeadState::from_read)
-        .map_err(SdkError::from)
+        );
+        match result {
+            Ok(head) => Ok(HeadState::from_read(head)),
+            Err(RepositoryError::PublicationConflict) if publication.wants_conflict_context() => {
+                let current = read_head_use_case(self.storage.as_storage())
+                    .ok()
+                    .map(HeadState::from_read)
+                    .map(Box::new);
+                Err(SdkError::RepositoryPublicationConflictContext {
+                    expected: Box::new(expected.clone()),
+                    current,
+                })
+            }
+            Err(error) => Err(SdkError::from(error)),
+        }
     }
 
     /// Alias for [`Self::publish_head_with_cancellation`].

@@ -17,7 +17,7 @@ use crate::domain::{
     PackConfiguration, PackEntryInput, PackIndexConfiguration, PackIndexEntry, PackIndexId,
     PackIndexShardId, PackIndexTransform, PortableMetadata, RegularFileNode, RepositoryHead,
     SealedPack, SealedPackIndexShard, Snapshot, SnapshotId, SnapshotPublication, SnapshotReference,
-    SymbolicLinkNode, TreeEntry, TreeNode, TreeNodeReference,
+    SnapshotSummary, SymbolicLinkNode, TreeEntry, TreeNode, TreeNodeReference,
 };
 use crate::format::{
     EncryptionContext, PackBuilder as FormatPackBuilder, PackIndexFormatError,
@@ -92,7 +92,7 @@ pub(crate) enum BackupRepositoryFailure {
     Storage,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BackupError {
     Cancelled,
     Budget {
@@ -122,13 +122,18 @@ pub(crate) enum BackupError {
         stage: BackupStage,
         failure: BackupRepositoryFailure,
     },
+    PublicationConflict {
+        stage: BackupStage,
+        expected: Box<HeadRead>,
+        current: Option<Box<HeadRead>>,
+    },
     Thread {
         stage: BackupStage,
     },
 }
 
 impl BackupError {
-    const fn is_cancelled(self) -> bool {
+    const fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled)
     }
 }
@@ -248,7 +253,6 @@ where
         let storage = Arc::clone(&storage);
         let network_requests = Arc::clone(&network_requests);
         let file_descriptors = Arc::clone(&file_descriptors);
-        let catalog = Arc::clone(&catalog);
         let metrics = Arc::clone(&metrics);
         let progress = progress.clone();
         let worker = UploadWorker {
@@ -260,7 +264,6 @@ where
                 file_descriptors,
                 control: control.clone(),
             },
-            tree_catalog: catalog,
             metrics,
             progress,
         };
@@ -636,16 +639,31 @@ where
         BackupStage::Publish,
         BackupResource::CpuWorkers,
     )?;
-    repository::publish_head(
-        storage.as_ref(),
-        &head,
-        &SnapshotPublication::with_required_objects(
-            snapshot_reference.clone(),
-            [root_object.clone()],
-        ),
-        Some(&cancelled),
+    let summary = SnapshotSummary::from_snapshot(&snapshot).map_err(|_| BackupError::Invalid {
+        stage: BackupStage::Publish,
+    })?;
+    let publication = SnapshotPublication::with_required_objects_and_summary(
+        snapshot_reference.clone(),
+        [root_object.clone()],
+        summary,
     )
-    .map_err(|error| map_repository_error(BackupStage::Publish, error))?;
+    .map_err(|_| BackupError::Invalid {
+        stage: BackupStage::Publish,
+    })?
+    .require_reachability_validation()
+    .with_conflict_context();
+    match repository::publish_head(storage.as_ref(), &head, &publication, Some(&cancelled)) {
+        Ok(_) => {}
+        Err(RepositoryError::PublicationConflict) if publication.wants_conflict_context() => {
+            let current = repository::read_head(storage.as_ref()).ok().map(Box::new);
+            return Err(BackupError::PublicationConflict {
+                stage: BackupStage::Publish,
+                expected: Box::new(head),
+                current,
+            });
+        }
+        Err(error) => return Err(map_repository_error(BackupStage::Publish, error)),
+    }
     progress.emit(1);
 
     Ok(BackupRunResult {
@@ -789,7 +807,7 @@ impl PipelineControl {
     }
 
     fn first_error(&self) -> Option<BackupError> {
-        *lock_or_recover(&self.first_error)
+        lock_or_recover(&self.first_error).clone()
     }
 
     fn wait(&self) {
@@ -1742,7 +1760,6 @@ fn run_hash_worker(
 
 struct ExistingContentCatalog {
     index_keys: Vec<ObjectKey>,
-    tree_keys: HashSet<String>,
     _memory: MemoryPermit,
 }
 
@@ -1774,45 +1791,10 @@ impl ExistingContentCatalog {
             CatalogListResult::Unsupported => Vec::new(),
             CatalogListResult::Keys(keys) => keys,
         };
-        let tree_keys = match list_catalog_keys(
-            storage.as_ref(),
-            "trees",
-            configuration.catalog_entries(),
-            &mut catalog_memory,
-            &network_requests,
-            &file_descriptors,
-            &control,
-            is_tree_object_key,
-        )? {
-            CatalogListResult::Unsupported => HashSet::new(),
-            CatalogListResult::Keys(keys) => {
-                let mut tree_keys = HashSet::new();
-                let additional = keys.len().saturating_mul(
-                    std::mem::size_of::<String>()
-                        .saturating_add(std::mem::size_of::<usize>())
-                        .saturating_add(32),
-                );
-                catalog_memory.grow(additional, &control, BackupStage::Dedup)?;
-                if tree_keys.try_reserve(keys.len()).is_err() {
-                    return Err(BackupError::Format {
-                        stage: BackupStage::Dedup,
-                    });
-                }
-                for key in keys {
-                    tree_keys.insert(key.into_string());
-                }
-                tree_keys
-            }
-        };
         Ok(Self {
             index_keys,
-            tree_keys,
             _memory: catalog_memory,
         })
-    }
-
-    fn contains_tree(&self, key: &str) -> bool {
-        self.tree_keys.contains(key)
     }
 }
 
@@ -1906,11 +1888,6 @@ fn is_pack_index_key(key: &str) -> bool {
         }
         _ => false,
     }
-}
-
-fn is_tree_object_key(key: &str) -> bool {
-    key.strip_prefix("trees/")
-        .is_some_and(|id| ObjectId::from_hex(id).is_ok())
 }
 
 fn map_catalog_storage_error(error: StorageError, operation: &'static str) -> BackupError {
@@ -3680,10 +3657,9 @@ impl ImmutableObjectUploader {
                 newly_stored: true,
                 stored_bytes: metadata.size(),
             }),
-            Err(StorageError::AlreadyExists) => Ok(UploadOutcome {
-                newly_stored: false,
-                stored_bytes: 0,
-            }),
+            Err(StorageError::AlreadyExists) => {
+                self.verify_existing(stage, operation, &object_key, bytes)
+            }
             Err(StorageError::Cancelled) => Err(BackupError::Cancelled),
             Err(error) => Err(BackupError::Storage {
                 stage,
@@ -3692,13 +3668,77 @@ impl ImmutableObjectUploader {
             }),
         }
     }
+
+    fn verify_existing(
+        &self,
+        stage: BackupStage,
+        operation: &'static str,
+        object_key: &ObjectKey,
+        expected: &[u8],
+    ) -> Result<UploadOutcome, BackupError> {
+        self.control.check()?;
+        let expected_size = u64::try_from(expected.len()).map_err(|_| BackupError::Storage {
+            stage,
+            operation,
+            error: StorageError::InvalidRequest,
+        })?;
+        let mut object = self
+            .storage
+            .read_stream(object_key)
+            .map_err(|error| map_existing_object_error(stage, operation, error))?;
+        if object.metadata().size() != expected_size {
+            return Err(BackupError::Repository {
+                stage,
+                failure: BackupRepositoryFailure::Malformed,
+            });
+        }
+        let actual = read_stream_to_vec(object.reader(), Some(expected_size))
+            .map_err(|error| map_existing_object_error(stage, operation, error))?;
+        self.control.check()?;
+        if actual != expected {
+            return Err(BackupError::Repository {
+                stage,
+                failure: BackupRepositoryFailure::Malformed,
+            });
+        }
+        Ok(UploadOutcome {
+            newly_stored: false,
+            stored_bytes: 0,
+        })
+    }
+}
+
+fn map_existing_object_error(
+    stage: BackupStage,
+    operation: &'static str,
+    error: StorageError,
+) -> BackupError {
+    match error {
+        StorageError::NotFound => BackupError::Repository {
+            stage,
+            failure: BackupRepositoryFailure::RequiredObjectMissing,
+        },
+        StorageError::InvalidRequest | StorageError::InvalidRange => BackupError::Repository {
+            stage,
+            failure: BackupRepositoryFailure::Malformed,
+        },
+        StorageError::UnsupportedCapability => BackupError::Repository {
+            stage,
+            failure: BackupRepositoryFailure::UnsupportedCapability,
+        },
+        StorageError::Cancelled => BackupError::Cancelled,
+        other => BackupError::Storage {
+            stage,
+            operation,
+            error: other,
+        },
+    }
 }
 
 struct UploadWorker {
     receiver: Arc<Mutex<Receiver<UploadWork>>>,
     index_sender: SyncSender<IndexMessage>,
     uploader: ImmutableObjectUploader,
-    tree_catalog: Arc<ExistingContentCatalog>,
     metrics: Arc<MetricsState>,
     progress: ProgressReporter,
 }
@@ -3708,7 +3748,6 @@ fn run_upload_worker(worker: UploadWorker) {
         receiver,
         index_sender,
         uploader,
-        tree_catalog,
         metrics,
         progress,
     } = worker;
@@ -3720,20 +3759,18 @@ fn run_upload_worker(worker: UploadWorker) {
         match work {
             UploadWork::Tree { id, bytes, memory } => {
                 let key = format!("trees/{}", id.as_str());
-                if !tree_catalog.contains_tree(&key) {
-                    match uploader.upload(BackupStage::Upload, "tree", &key, &bytes) {
-                        Ok(outcome) if outcome.newly_stored => {
-                            metrics.uploaded_objects.fetch_add(1, Ordering::Relaxed);
-                            metrics
-                                .new_stored_bytes
-                                .fetch_add(outcome.stored_bytes, Ordering::Relaxed);
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            drop(memory);
-                            control.fail(error);
-                            return;
-                        }
+                match uploader.upload(BackupStage::Upload, "tree", &key, &bytes) {
+                    Ok(outcome) if outcome.newly_stored => {
+                        metrics.uploaded_objects.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .new_stored_bytes
+                            .fetch_add(outcome.stored_bytes, Ordering::Relaxed);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        drop(memory);
+                        control.fail(error);
+                        return;
                     }
                 }
                 progress.emit(1);

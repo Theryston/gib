@@ -1,17 +1,19 @@
 use gib::{
     BackupBudgetError, BackupBudgets, BackupDeduplicationConfiguration, BackupRequest, BackupStage,
     ChunkingConfiguration, Client, ErrorCode, MAX_BACKUP_CONCURRENCY, MemoryStorage,
-    MemoryStorageOperation, ObjectKey, ObjectRead, ObjectWriteOptions, PackConfiguration,
-    PackIndexCacheConfiguration, PackIndexConfiguration, PackReader, RepositoryIdentity,
-    RepositoryInitRequest, RepositoryKey, RepositoryStorage, SdkError, StorageCapabilities,
-    StorageError,
+    MemoryStorageOperation, ObjectId, ObjectKey, ObjectListPage, ObjectListRequest, ObjectRange,
+    ObjectRead, ObjectWriteOptions, PackConfiguration, PackIndexCacheConfiguration,
+    PackIndexConfiguration, PackIndexReader, PackReader, RepositoryIdentity, RepositoryInitRequest,
+    RepositoryKey, RepositoryStorage, SdkError, Snapshot, StorageCapabilities, StorageError,
+    StorageVersion, TreeNode, TreeNodeKind, decode_tree_node_object, tree_node_object_id,
 };
+use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -431,6 +433,198 @@ impl RepositoryStorage for SlowStorage {
         self.leave();
         result
     }
+
+    fn read_range(
+        &self,
+        object_key: &ObjectKey,
+        range: ObjectRange,
+    ) -> Result<ObjectRead, StorageError> {
+        self.enter();
+        let result = self.inner.read_range(object_key, range);
+        self.leave();
+        result
+    }
+
+    fn metadata(&self, object_key: &ObjectKey) -> Result<gib::ObjectMetadata, StorageError> {
+        self.enter();
+        let result = self.inner.metadata(object_key);
+        self.leave();
+        result
+    }
+
+    fn list_page(&self, request: &ObjectListRequest) -> Result<ObjectListPage, StorageError> {
+        self.enter();
+        let result = self.inner.list_page(request);
+        self.leave();
+        result
+    }
+}
+
+#[derive(Clone)]
+struct FaultStorage {
+    inner: MemoryStorage,
+    fail_head_cas: Arc<AtomicBool>,
+    fail_history_create: Arc<AtomicBool>,
+}
+
+impl FaultStorage {
+    fn new() -> Self {
+        Self {
+            inner: MemoryStorage::new(),
+            fail_head_cas: Arc::new(AtomicBool::new(false)),
+            fail_history_create: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn fail_next_head_cas(&self) {
+        self.fail_head_cas.store(true, Ordering::Release);
+    }
+
+    fn fail_next_history_create(&self) {
+        self.fail_history_create.store(true, Ordering::Release);
+    }
+}
+
+impl RepositoryStorage for FaultStorage {
+    fn create_if_absent(&self, object_key: &str, contents: &[u8]) -> Result<(), StorageError> {
+        if object_key.starts_with("refs/history/")
+            && self
+                .fail_history_create
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Err(StorageError::Transient);
+        }
+        self.inner.create_if_absent(object_key, contents)
+    }
+
+    fn capabilities(&self) -> StorageCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn read_stream(&self, object_key: &ObjectKey) -> Result<ObjectRead, StorageError> {
+        self.inner.read_stream(object_key)
+    }
+
+    fn read_range(
+        &self,
+        object_key: &ObjectKey,
+        range: ObjectRange,
+    ) -> Result<ObjectRead, StorageError> {
+        self.inner.read_range(object_key, range)
+    }
+
+    fn metadata(&self, object_key: &ObjectKey) -> Result<gib::ObjectMetadata, StorageError> {
+        self.inner.metadata(object_key)
+    }
+
+    fn write_stream(
+        &self,
+        object_key: &ObjectKey,
+        source: &mut dyn Read,
+        options: ObjectWriteOptions,
+    ) -> Result<gib::ObjectMetadata, StorageError> {
+        self.inner.write_stream(object_key, source, options)
+    }
+
+    fn list_page(&self, request: &ObjectListRequest) -> Result<ObjectListPage, StorageError> {
+        self.inner.list_page(request)
+    }
+
+    fn conditional_write(
+        &self,
+        object_key: &str,
+        expected: Option<&StorageVersion>,
+        contents: &[u8],
+    ) -> Result<StorageVersion, StorageError> {
+        if object_key == "refs/latest"
+            && self
+                .fail_head_cas
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Err(StorageError::Conflict);
+        }
+        self.inner.conditional_write(object_key, expected, contents)
+    }
+}
+
+fn assert_published_graph(
+    storage: &MemoryStorage,
+    snapshot: &Snapshot,
+) -> Result<(), Box<dyn Error>> {
+    let root = snapshot
+        .root_tree()
+        .ok_or("published snapshot has no root tree")?;
+    let root_id = ObjectId::from_hex(
+        root.as_str()
+            .strip_prefix("trees/")
+            .ok_or("published root is not a tree object")?,
+    )?;
+    let mut pending = vec![(root_id, TreeNodeKind::Directory)];
+    let mut visited = HashSet::new();
+    let mut chunks = HashSet::new();
+    while let Some((id, expected_kind)) = pending.pop() {
+        assert!(visited.insert(id.clone()), "tree graph contains a cycle");
+        let key = format!("trees/{}", id.as_str());
+        let bytes = storage.read_object(&key)?;
+        let node = decode_tree_node_object(&bytes)?;
+        assert_eq!(node.kind(), expected_kind);
+        assert_eq!(tree_node_object_id(&node)?, id);
+        match node {
+            TreeNode::Directory(directory) => {
+                for entry in directory.entries() {
+                    pending.push((entry.reference().id().clone(), entry.reference().kind()));
+                }
+            }
+            TreeNode::RegularFile(file) => {
+                for chunk in file.chunks() {
+                    chunks.insert(chunk.id());
+                }
+            }
+            TreeNode::SymbolicLink(_) => {}
+            _ => {}
+        }
+    }
+
+    let index_keys = object_keys(storage, "indexes/")?;
+    for chunk in chunks {
+        let mut located = None;
+        for key in &index_keys {
+            let bytes = storage.read_object(key)?;
+            let index = match PackIndexReader::new(&bytes) {
+                Ok(index) => index,
+                Err(_) => continue,
+            };
+            if let Some(entry) = index.lookup(chunk) {
+                located = Some(entry);
+                break;
+            }
+        }
+        let entry = located.ok_or("published chunk has no pack-index entry")?;
+        let pack_key = format!("packs/{}", entry.pack_id().as_hex());
+        let pack_bytes = storage.read_object(&pack_key)?;
+        let pack = PackReader::new(&pack_bytes)?;
+        let location = pack
+            .entries()
+            .iter()
+            .find(|location| {
+                location.chunk_id() == entry.chunk_id()
+                    && location.entry_offset() == entry.entry_offset()
+                    && location.payload_offset() == entry.payload_offset()
+                    && location.entry_length() == entry.entry_length()
+                    && location.payload_length() == entry.stored_length()
+                    && location.plaintext_length() == entry.logical_length()
+            })
+            .ok_or("pack-index entry does not exist in its pack")?;
+        let payload_range = entry.payload_range();
+        let range = ObjectRange::new(payload_range.offset(), payload_range.length())?;
+        let mut range_object = storage.read_range(&ObjectKey::new(pack_key)?, range)?;
+        let mut range_bytes = Vec::new();
+        range_object.reader().read_to_end(&mut range_bytes)?;
+        assert_eq!(range_bytes, pack.payload(location)?);
+    }
+    Ok(())
 }
 
 #[test]
@@ -470,6 +664,164 @@ fn backup_publishes_snapshot_and_reports_observed_budgets() -> Result<(), Box<dy
             .iter()
             .any(|object| object == "refs/latest")
     );
+    Ok(())
+}
+
+#[test]
+fn published_snapshot_contains_authoritative_metadata_and_complete_graph()
+-> Result<(), Box<dyn Error>> {
+    let source = TestDirectory::new()?;
+    fs::create_dir(source.path().join("nested"))?;
+    fs::write(source.path().join("alpha.txt"), b"alpha content")?;
+    fs::write(source.path().join("nested/beta.txt"), b"beta content")?;
+    let storage = MemoryStorage::new();
+    let client = Client::default();
+    let repository = repository(&client, &storage)?;
+    let request = small_request(source.path())?
+        .with_message("authoritative snapshot")
+        .with_author("QA <qa@example.test>")
+        .with_created_at(1_725_000_000);
+
+    let result = client.backup(repository.clone(), request)?;
+    let snapshot = Snapshot::from_bytes(&storage.read_object(result.snapshot().as_str())?)?;
+    assert_eq!(snapshot.id(), &result.snapshot().snapshot_id()?);
+    assert_eq!(snapshot.parent(), None);
+    assert_eq!(snapshot.created_at(), 1_725_000_000);
+    assert_eq!(snapshot.message(), "authoritative snapshot");
+    assert_eq!(snapshot.author(), Some("QA <qa@example.test>"));
+    assert_eq!(snapshot.file_count(), 2);
+    assert_eq!(snapshot.directory_count(), 2);
+    assert_eq!(snapshot.total_size(), 25);
+    assert_published_graph(&storage, &snapshot)?;
+
+    let opened = client.open_repository(storage, gib::RepositoryOpenRequest::new())?;
+    assert_eq!(opened.read_head()?.snapshot(), Some(result.snapshot()));
+    Ok(())
+}
+
+#[test]
+fn publication_validation_failure_after_upload_keeps_previous_head_current()
+-> Result<(), Box<dyn Error>> {
+    let source = TestDirectory::new()?;
+    fs::write(
+        source.path().join("payload.bin"),
+        deterministic_payload(8 * 1024),
+    )?;
+    let storage = MemoryStorage::new();
+    let client = Client::default();
+    let repository = repository(&client, &storage)?;
+    let request = small_request(source.path())?
+        .with_index_configuration(PackIndexConfiguration::new(4096)?)
+        .with_created_at(10);
+    client.backup(repository.clone(), request.clone())?;
+    let previous_head = repository.read_head()?;
+    let object_count_before = immutable_object_count(&storage)?;
+
+    fs::write(
+        source.path().join("payload.bin"),
+        deterministic_payload(8 * 1024 + 37),
+    )?;
+    storage.inject_failure(MemoryStorageOperation::Range, StorageError::Transient);
+    let error = client
+        .backup(repository.clone(), request.with_created_at(11))
+        .expect_err("range validation failure must abort publication");
+    match error {
+        SdkError::BackupStageFailed { stage, source } => {
+            assert_eq!(stage, BackupStage::Publish);
+            assert_eq!(source.code(), ErrorCode::StorageFailure);
+        }
+        other => panic!("expected a publish-stage storage error, got {other:?}"),
+    }
+    assert_eq!(repository.read_head()?, previous_head);
+    assert!(immutable_object_count(&storage)? >= object_count_before);
+    Ok(())
+}
+
+#[test]
+fn retry_after_head_cas_failure_reuses_immutable_bytes_safely() -> Result<(), Box<dyn Error>> {
+    let source = TestDirectory::new()?;
+    fs::write(
+        source.path().join("payload.bin"),
+        deterministic_payload(8 * 1024),
+    )?;
+    let storage = FaultStorage::new();
+    let client = Client::default();
+    let repository = client.initialize_repository(
+        storage.clone(),
+        RepositoryInitRequest::new(
+            RepositoryIdentity::new("backup-retry-test")?,
+            RepositoryKey::new("test")?,
+        ),
+    )?;
+    let request = small_request(source.path())?
+        .with_index_configuration(PackIndexConfiguration::new(4096)?)
+        .with_created_at(22);
+    storage.fail_next_head_cas();
+    let error = client
+        .backup(repository.clone(), request.clone())
+        .expect_err("the injected HEAD CAS error must fail the first attempt");
+    match error {
+        SdkError::BackupStageFailed { stage, source } => {
+            assert_eq!(stage, BackupStage::Publish);
+            assert_eq!(source.code(), ErrorCode::RepositoryPublicationConflict);
+            assert!(matches!(
+                *source,
+                SdkError::RepositoryPublicationConflictContext {
+                    current: Some(_),
+                    ..
+                }
+            ));
+        }
+        other => panic!("expected a publish conflict, got {other:?}"),
+    }
+    assert!(
+        !storage
+            .inner
+            .objects()?
+            .iter()
+            .any(|key| key == "refs/latest")
+    );
+
+    let result = client.backup(repository.clone(), request)?;
+    assert_eq!(repository.read_head()?.snapshot(), Some(result.snapshot()));
+    assert_eq!(repository.read_head()?.generation(), 1);
+    Ok(())
+}
+
+#[test]
+fn history_index_failure_does_not_undo_an_atomic_head_publication() -> Result<(), Box<dyn Error>> {
+    let source = TestDirectory::new()?;
+    fs::write(
+        source.path().join("payload.txt"),
+        b"history remains reconstructable",
+    )?;
+    let storage = FaultStorage::new();
+    let client = Client::default();
+    let repository = client.initialize_repository(
+        storage.clone(),
+        RepositoryInitRequest::new(
+            RepositoryIdentity::new("backup-history-failure-test")?,
+            RepositoryKey::new("test")?,
+        ),
+    )?;
+    storage.fail_next_history_create();
+    let request = small_request(source.path())?
+        .with_message("history failure")
+        .with_created_at(33);
+    let result = client.backup(repository.clone(), request)?;
+
+    assert!(repository.read_head()?.has_snapshot());
+    assert!(
+        !storage
+            .inner
+            .objects()?
+            .iter()
+            .any(|key| key.starts_with("refs/history/"))
+    );
+    let history = repository.list_history(())?;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history.summaries()[0].reference(), result.snapshot());
+    assert_eq!(history.summaries()[0].message(), "history failure");
     Ok(())
 }
 

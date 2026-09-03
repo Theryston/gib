@@ -554,6 +554,8 @@ pub struct SnapshotPublication {
     snapshot: SnapshotReference,
     required_objects: Vec<RepositoryObject>,
     summary: Option<crate::domain::SnapshotSummary>,
+    reachability_validation: bool,
+    conflict_context: bool,
 }
 
 impl SnapshotPublication {
@@ -563,6 +565,8 @@ impl SnapshotPublication {
             snapshot,
             required_objects: Vec::new(),
             summary: None,
+            reachability_validation: false,
+            conflict_context: false,
         }
     }
 
@@ -578,6 +582,8 @@ impl SnapshotPublication {
             snapshot,
             required_objects: required_objects.into_iter().map(Into::into).collect(),
             summary: None,
+            reachability_validation: false,
+            conflict_context: false,
         }
     }
 
@@ -597,7 +603,49 @@ impl SnapshotPublication {
             snapshot,
             required_objects: Vec::new(),
             summary: Some(summary),
+            reachability_validation: false,
+            conflict_context: false,
         })
+    }
+
+    /// Creates a publication target with required objects and its derived
+    /// history summary.
+    pub fn with_required_objects_and_summary<I>(
+        snapshot: SnapshotReference,
+        required_objects: impl IntoIterator<Item = I>,
+        summary: crate::domain::SnapshotSummary,
+    ) -> Result<Self, DomainError>
+    where
+        I: Into<RepositoryObject>,
+    {
+        let mut publication = Self::with_required_objects(snapshot, required_objects);
+        if publication.snapshot != summary.reference().clone() {
+            return Err(DomainError::InvalidSnapshotMetadata {
+                reason: "publication summary must reference the published snapshot",
+            });
+        }
+        publication.summary = Some(summary);
+        Ok(publication)
+    }
+
+    /// Requests a conflict result containing the expected and observed HEAD
+    /// state when publication loses its compare-and-swap race.
+    pub fn with_conflict_context(mut self) -> Self {
+        self.conflict_context = true;
+        self
+    }
+
+    pub(crate) fn require_reachability_validation(mut self) -> Self {
+        self.reachability_validation = true;
+        self
+    }
+
+    pub(crate) const fn requires_reachability_validation(&self) -> bool {
+        self.reachability_validation
+    }
+
+    pub(crate) const fn wants_conflict_context(&self) -> bool {
+        self.conflict_context
     }
 
     /// Creates a publication target from an authoritative compact snapshot.

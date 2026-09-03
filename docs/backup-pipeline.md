@@ -46,12 +46,12 @@ missing packs and malformed indexes fail the backup instead of becoming new
 content. Repeated chunks in the same source are also marked reused, so the
 packer receives only transformed content that is not already available.
 
-Tree nodes are content-addressed. The preflight catalog records existing file,
-symlink, and directory node keys within an explicit bound, allowing unchanged
-Merkle subtrees to skip immutable tree writes. Conditional object creation
-remains the concurrency boundary for publishers that race the catalog view.
-The snapshot publication lists its root tree as a required object, so a missing
-root cannot be committed.
+Tree nodes are content-addressed and are written with an idempotent
+create-if-absent operation. If a concurrent writer wins that operation, the
+uploader compares the existing size and complete bytes with the candidate; an
+existing object with different bytes is malformed and cannot be reused. The
+snapshot publication lists its root tree as a required object, so a missing or
+corrupted root cannot be committed.
 
 `BackupMetrics` reports `logical_bytes` for source content,
 `new_stored_bytes` for immutable object bytes newly accepted by this run, and
@@ -81,8 +81,14 @@ post-order, and file chunks are restored by ordinal before they are forwarded
 to the packer. Only the bounded out-of-order window and the file's compact
 chunk-reference list remain resident until its tree node is created.
 Independent immutable-object uploads may complete in any order. HEAD is
-attempted only after all worker joins and immutable uploads have completed, so
-an unsuccessful run cannot publish a new snapshot.
+attempted only after all worker joins and immutable uploads have completed. The
+publish step then decodes the new snapshot and walks its parent chain, Merkle
+tree nodes, chunk references, pack-index records, packs, and exact payload
+ranges. Snapshot statistics must agree with the walked tree. Only after this
+reachability check does the repository advance HEAD with the expected
+generation and storage version, so an unsuccessful run cannot publish a new
+snapshot. Uploaded objects that are not reachable from the winning HEAD are
+left for pruning rather than deleted in the publication transaction.
 
 Progress is deliberately off the hot path. A separate progress reporter has a
 small bounded queue and uses coalescing/drop semantics. The SDK event dispatcher
@@ -103,15 +109,20 @@ hook to interrupt an in-flight request as well.
 The existing repository publication use case remains the commit boundary. An
 immutable object that finishes just as cancellation is observed may be left as
 an unpublished object, but no new HEAD is published by the failed operation.
-The backup pipeline does not add resume journals or change snapshot publication
+Derived `refs/history/<generation>` records are written after the HEAD CAS and
+can be rebuilt from authoritative snapshot objects if their update fails. The
+backup pipeline does not add resume journals or change snapshot publication
 rules.
 
 ## Validation and measurement
 
-Focused pipeline tests cover successful publication, observed resource peaks,
-cancellation, typed injected storage failure, slow storage, slow events,
-identical snapshots, duplicate files, shifted content, one-leaf tree edits,
-missing packs, corrupt indexes, and a one-shard deduplication cache.
+Focused pipeline tests cover authoritative metadata, complete graph traversal,
+observed resource peaks, cancellation, typed injected storage failures before
+and after upload, slow storage, slow events, idempotent retry after a HEAD
+conflict, history-index failure, identical snapshots, duplicate files, shifted
+content, one-leaf tree edits, missing packs, corrupt indexes, and a one-shard
+deduplication cache. Repository tests also cover concurrent CAS publication and
+typed expected/current HEAD conflict context.
 The one-million-entry stress test is opt-in because it creates a large
 temporary dataset. The standalone benchmark performs and reports a cold first
 backup and a warm unchanged incremental backup against the same repository per

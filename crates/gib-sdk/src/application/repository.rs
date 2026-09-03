@@ -1,17 +1,22 @@
-use super::ports::{RepositoryStorage, StorageError, StorageVersion};
+use super::ports::{
+    ObjectKey, ObjectRange, RepositoryStorage, StorageError, StorageVersion, read_stream_to_vec,
+};
 use crate::domain::{
-    FORMAT_OBJECT_KEY, HEAD_OBJECT_KEY, MAX_SNAPSHOT_PAGE_SIZE, REPOSITORY_DESCRIPTOR_OBJECT_KEY,
-    RepositoryDescriptor, RepositoryHead, RepositoryIdentity, RepositoryKey,
+    ChunkId, FORMAT_OBJECT_KEY, HEAD_OBJECT_KEY, MAX_IMMUTABLE_OBJECT_BYTES,
+    MAX_PACK_INDEX_SHARD_BYTES, MAX_PACK_SIZE_BYTES, MAX_SNAPSHOT_PAGE_SIZE, ObjectId, PackId,
+    PackIndexEntry, PackIndexId, PackIndexShardId, REPOSITORY_DESCRIPTOR_OBJECT_KEY,
+    RepositoryDescriptor, RepositoryHead, RepositoryIdentity, RepositoryKey, RepositoryObject,
     SNAPSHOT_HISTORY_OBJECT_PREFIX, SNAPSHOT_OBJECT_PREFIX, Snapshot, SnapshotCursor,
     SnapshotListRequest, SnapshotPublication, SnapshotReference, SnapshotSelector, SnapshotSummary,
-    SnapshotSummaryPage,
+    SnapshotSummaryPage, TreeNode, TreeNodeReference,
 };
 use crate::format::{
-    FormatError, decode_bootstrap, decode_descriptor, decode_head, decode_history_record,
-    decode_snapshot, encode_bootstrap, encode_descriptor, encode_head, encode_history_record,
+    FormatError, MAX_SNAPSHOT_BYTES, VerifiedPack, VerifiedPackIndexShard, decode_bootstrap,
+    decode_descriptor, decode_head, decode_history_record, decode_snapshot, decode_tree_node,
+    encode_bootstrap, encode_descriptor, encode_head, encode_history_record, tree_node_id,
 };
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 const MAX_PUBLICATION_OBJECTS: usize = 1_024;
 
@@ -175,70 +180,10 @@ pub(crate) fn publish_head(
     check_cancelled(is_cancelled)?;
     validate_publication(publication)?;
 
-    let mut seen = HashSet::with_capacity(publication.required_objects().len() + 1);
-    let snapshot_key = publication.snapshot().as_str();
-    seen.insert(snapshot_key);
-    match storage.read(snapshot_key) {
-        Ok(contents) if !contents.is_empty() => {}
-        Ok(_) => {
-            return Err(RepositoryError::InvalidPublication {
-                reason: "the target snapshot object is empty",
-            });
-        }
-        Err(StorageError::NotFound) => return Err(RepositoryError::SnapshotMissing),
-        Err(StorageError::InvalidObjectKey) => {
-            return Err(RepositoryError::InvalidPublication {
-                reason: "the target snapshot reference is not a valid storage key",
-            });
-        }
-        Err(
-            StorageError::AlreadyExists
-            | StorageError::Io
-            | StorageError::Unavailable
-            | StorageError::UnsupportedCapability
-            | StorageError::ConditionNotMet
-            | StorageError::InvalidVersion,
-        ) => {
-            return Err(RepositoryError::Storage {
-                operation: "validate_snapshot",
-            });
-        }
-        _ => {
-            return Err(RepositoryError::Storage {
-                operation: "validate_snapshot",
-            });
-        }
-    }
-    for object in publication.required_objects() {
-        if !seen.insert(object.as_str()) {
-            continue;
-        }
-        match storage.read(object.as_str()) {
-            Ok(_) => {}
-            Err(StorageError::NotFound) => return Err(RepositoryError::RequiredObjectMissing),
-            Err(StorageError::InvalidObjectKey) => {
-                return Err(RepositoryError::InvalidPublication {
-                    reason: "required object reference is not a valid storage key",
-                });
-            }
-            Err(
-                StorageError::AlreadyExists
-                | StorageError::Io
-                | StorageError::Unavailable
-                | StorageError::UnsupportedCapability
-                | StorageError::ConditionNotMet
-                | StorageError::InvalidVersion,
-            ) => {
-                return Err(RepositoryError::Storage {
-                    operation: "validate_publication",
-                });
-            }
-            _ => {
-                return Err(RepositoryError::Storage {
-                    operation: "validate_publication",
-                });
-            }
-        }
+    if publication.requires_reachability_validation() {
+        validate_reachable_publication(storage, publication, is_cancelled)?;
+    } else {
+        validate_legacy_publication(storage, publication)?;
     }
 
     check_cancelled(is_cancelled)?;
@@ -285,6 +230,570 @@ pub(crate) fn publish_head(
         head,
         version: Some(version),
     })
+}
+
+fn validate_legacy_publication(
+    storage: &dyn RepositoryStorage,
+    publication: &SnapshotPublication,
+) -> Result<(), RepositoryError> {
+    let mut seen = HashSet::new();
+    seen.try_reserve(publication.required_objects().len().saturating_add(1))
+        .map_err(|_| RepositoryError::Malformed {
+            reason: "publication dependency set cannot be allocated",
+        })?;
+    let snapshot_key = publication.snapshot().as_str();
+    seen.insert(snapshot_key);
+    match storage.read(snapshot_key) {
+        Ok(contents) if !contents.is_empty() => {}
+        Ok(_) => {
+            return Err(RepositoryError::InvalidPublication {
+                reason: "the target snapshot object is empty",
+            });
+        }
+        Err(StorageError::NotFound) => return Err(RepositoryError::SnapshotMissing),
+        Err(StorageError::InvalidObjectKey) => {
+            return Err(RepositoryError::InvalidPublication {
+                reason: "the target snapshot reference is not a valid storage key",
+            });
+        }
+        Err(_) => {
+            return Err(RepositoryError::Storage {
+                operation: "validate_snapshot",
+            });
+        }
+    }
+    for object in publication.required_objects() {
+        if !seen.insert(object.as_str()) {
+            continue;
+        }
+        match storage.read(object.as_str()) {
+            Ok(_) => {}
+            Err(StorageError::NotFound) => return Err(RepositoryError::RequiredObjectMissing),
+            Err(StorageError::InvalidObjectKey) => {
+                return Err(RepositoryError::InvalidPublication {
+                    reason: "required object reference is not a valid storage key",
+                });
+            }
+            Err(_) => {
+                return Err(RepositoryError::Storage {
+                    operation: "validate_publication",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_reachable_publication(
+    storage: &dyn RepositoryStorage,
+    publication: &SnapshotPublication,
+    is_cancelled: Option<&dyn Fn() -> bool>,
+) -> Result<(), RepositoryError> {
+    let snapshot_bytes = read_bounded_object(
+        storage,
+        publication.snapshot().as_str(),
+        MAX_SNAPSHOT_BYTES as u64,
+        RepositoryError::SnapshotMissing,
+        "validate_snapshot",
+    )?;
+    if snapshot_bytes.is_empty() {
+        return Err(RepositoryError::InvalidPublication {
+            reason: "the target snapshot object is empty",
+        });
+    }
+    let mut snapshot = decode_snapshot(&snapshot_bytes).map_err(map_format_error)?;
+    validate_snapshot_identity(publication.snapshot(), &snapshot)?;
+
+    let mut seen_snapshots = HashSet::new();
+    seen_snapshots
+        .try_reserve(1)
+        .map_err(|_| RepositoryError::Malformed {
+            reason: "snapshot history cannot be allocated",
+        })?;
+    seen_snapshots.insert(snapshot.id().clone());
+
+    let mut chunks = HashMap::new();
+    loop {
+        check_cancelled(is_cancelled)?;
+        validate_snapshot_contents(storage, &snapshot, &mut chunks, is_cancelled)?;
+        let Some(parent_id) = snapshot.parent().cloned() else {
+            break;
+        };
+        if seen_snapshots.contains(&parent_id) {
+            return Err(RepositoryError::Malformed {
+                reason: "snapshot history contains a parent cycle",
+            });
+        }
+        seen_snapshots
+            .try_reserve(1)
+            .map_err(|_| RepositoryError::Malformed {
+                reason: "snapshot history cannot be allocated",
+            })?;
+        seen_snapshots.insert(parent_id.clone());
+        let parent_reference =
+            parent_id
+                .object_reference()
+                .map_err(|_| RepositoryError::Malformed {
+                    reason: "snapshot parent does not have a valid object reference",
+                })?;
+        let parent_bytes = read_bounded_object(
+            storage,
+            parent_reference.as_str(),
+            MAX_SNAPSHOT_BYTES as u64,
+            RepositoryError::RequiredObjectMissing,
+            "validate_snapshot_parent",
+        )?;
+        snapshot = decode_snapshot(&parent_bytes).map_err(map_format_error)?;
+        validate_snapshot_identity(&parent_reference, &snapshot)?;
+    }
+
+    for object in publication.required_objects() {
+        check_cancelled(is_cancelled)?;
+        let _ = read_bounded_object(
+            storage,
+            object.as_str(),
+            MAX_IMMUTABLE_OBJECT_BYTES as u64,
+            RepositoryError::RequiredObjectMissing,
+            "validate_publication",
+        )?;
+    }
+    validate_chunk_references(storage, &chunks, is_cancelled)
+}
+
+fn validate_snapshot_contents(
+    storage: &dyn RepositoryStorage,
+    snapshot: &Snapshot,
+    chunks: &mut HashMap<ChunkId, u64>,
+    is_cancelled: Option<&dyn Fn() -> bool>,
+) -> Result<(), RepositoryError> {
+    if let Some(path_delta) = snapshot.path_delta() {
+        let _ = read_bounded_object(
+            storage,
+            path_delta.as_str(),
+            MAX_IMMUTABLE_OBJECT_BYTES as u64,
+            RepositoryError::RequiredObjectMissing,
+            "validate_path_delta",
+        )?;
+    }
+    let root = snapshot
+        .root_tree()
+        .ok_or(RepositoryError::InvalidPublication {
+            reason: "snapshot does not contain a root tree",
+        })?;
+    let root_reference = root_tree_reference(root)?;
+    let mut stack = Vec::new();
+    stack
+        .try_reserve(1)
+        .map_err(|_| RepositoryError::Malformed {
+            reason: "snapshot tree traversal cannot be allocated",
+        })?;
+    stack.push(TreeVisit::Enter(root_reference));
+    let mut active = HashSet::new();
+    active
+        .try_reserve(1)
+        .map_err(|_| RepositoryError::Malformed {
+            reason: "snapshot tree cycle detector cannot be allocated",
+        })?;
+    let mut file_count = 0_u64;
+    let mut directory_count = 0_u64;
+    let mut total_size = 0_u64;
+
+    while let Some(visit) = stack.pop() {
+        check_cancelled(is_cancelled)?;
+        match visit {
+            TreeVisit::Exit(id) => {
+                active.remove(&id);
+            }
+            TreeVisit::Enter(reference) => {
+                let id = reference.id().clone();
+                if active.contains(&id) {
+                    return Err(RepositoryError::Malformed {
+                        reason: "snapshot tree contains a cycle",
+                    });
+                }
+                active
+                    .try_reserve(1)
+                    .map_err(|_| RepositoryError::Malformed {
+                        reason: "snapshot tree cycle detector cannot be allocated",
+                    })?;
+                active.insert(id.clone());
+                let object_reference =
+                    reference
+                        .object_reference()
+                        .map_err(|_| RepositoryError::Malformed {
+                            reason: "snapshot tree contains an invalid node reference",
+                        })?;
+                let bytes = read_bounded_object(
+                    storage,
+                    object_reference.as_str(),
+                    MAX_IMMUTABLE_OBJECT_BYTES as u64,
+                    RepositoryError::RequiredObjectMissing,
+                    "validate_tree",
+                )?;
+                let node = decode_tree_node(&bytes).map_err(map_format_error)?;
+                if node.kind() != reference.kind()
+                    || tree_node_id(&node).map_err(map_format_error)? != id
+                {
+                    return Err(RepositoryError::Malformed {
+                        reason: "snapshot tree node identity or kind does not match its reference",
+                    });
+                }
+                match node {
+                    TreeNode::Directory(directory) => {
+                        directory_count =
+                            directory_count
+                                .checked_add(1)
+                                .ok_or(RepositoryError::Malformed {
+                                    reason: "snapshot directory count overflows",
+                                })?;
+                        stack
+                            .try_reserve(1)
+                            .map_err(|_| RepositoryError::Malformed {
+                                reason: "snapshot tree traversal cannot be allocated",
+                            })?;
+                        stack.push(TreeVisit::Exit(id));
+                        for entry in directory.entries().iter().rev() {
+                            stack
+                                .try_reserve(1)
+                                .map_err(|_| RepositoryError::Malformed {
+                                    reason: "snapshot tree traversal cannot be allocated",
+                                })?;
+                            stack.push(TreeVisit::Enter(entry.reference().clone()));
+                        }
+                    }
+                    TreeNode::RegularFile(file) => {
+                        file_count =
+                            file_count
+                                .checked_add(1)
+                                .ok_or(RepositoryError::Malformed {
+                                    reason: "snapshot file count overflows",
+                                })?;
+                        total_size = total_size.checked_add(file.size()).ok_or(
+                            RepositoryError::Malformed {
+                                reason: "snapshot logical size overflows",
+                            },
+                        )?;
+                        for chunk in file.chunks() {
+                            match chunks.get(&chunk.id()) {
+                                Some(size) if *size != chunk.size() => {
+                                    return Err(RepositoryError::Malformed {
+                                        reason: "the same chunk ID has inconsistent logical sizes",
+                                    });
+                                }
+                                Some(_) => {}
+                                None => {
+                                    chunks.try_reserve(1).map_err(|_| {
+                                        RepositoryError::Malformed {
+                                            reason: "snapshot chunk set cannot be allocated",
+                                        }
+                                    })?;
+                                    chunks.insert(chunk.id(), chunk.size());
+                                }
+                            }
+                        }
+                        active.remove(&id);
+                    }
+                    TreeNode::SymbolicLink(_) => {
+                        active.remove(&id);
+                    }
+                }
+            }
+        }
+    }
+
+    if file_count != snapshot.file_count()
+        || directory_count != snapshot.directory_count()
+        || total_size != snapshot.total_size()
+    {
+        return Err(RepositoryError::Malformed {
+            reason: "snapshot logical-size or tree statistics do not match the root tree",
+        });
+    }
+    Ok(())
+}
+
+enum TreeVisit {
+    Enter(TreeNodeReference),
+    Exit(ObjectId),
+}
+
+fn root_tree_reference(root: &RepositoryObject) -> Result<TreeNodeReference, RepositoryError> {
+    let id_text = root
+        .as_str()
+        .strip_prefix("trees/")
+        .ok_or(RepositoryError::Malformed {
+            reason: "snapshot root tree does not reference a tree object",
+        })?;
+    let id = ObjectId::from_hex(id_text).map_err(|_| RepositoryError::Malformed {
+        reason: "snapshot root tree has an invalid object ID",
+    })?;
+    let reference = TreeNodeReference::directory(id);
+    let expected = reference
+        .object_reference()
+        .map_err(|_| RepositoryError::Malformed {
+            reason: "snapshot root tree reference cannot be constructed",
+        })?;
+    if expected != *root {
+        return Err(RepositoryError::Malformed {
+            reason: "snapshot root tree reference is not canonical",
+        });
+    }
+    Ok(reference)
+}
+
+fn validate_chunk_references(
+    storage: &dyn RepositoryStorage,
+    chunks: &HashMap<ChunkId, u64>,
+    is_cancelled: Option<&dyn Fn() -> bool>,
+) -> Result<(), RepositoryError> {
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    let keys = list_objects(storage, "indexes", "list_indexes")?;
+    let mut found = HashMap::new();
+    found
+        .try_reserve(chunks.len())
+        .map_err(|_| RepositoryError::Malformed {
+            reason: "snapshot index lookup cannot be allocated",
+        })?;
+    let mut malformed_index = false;
+
+    for key in keys {
+        check_cancelled(is_cancelled)?;
+        let Some(index_identity) = parse_pack_index_object_key(&key) else {
+            continue;
+        };
+        let bytes = read_bounded_object(
+            storage,
+            &key,
+            MAX_PACK_INDEX_SHARD_BYTES,
+            RepositoryError::RequiredObjectMissing,
+            "validate_pack_index",
+        )?;
+        let shard = match VerifiedPackIndexShard::new(&bytes) {
+            Ok(shard) => shard,
+            Err(_) => {
+                malformed_index = true;
+                continue;
+            }
+        };
+        let metadata = shard.metadata();
+        let identity_matches = match index_identity {
+            PackIndexObjectKey::Content(id) => id == metadata.index_id(),
+            PackIndexObjectKey::Static(shard_id) => shard_id == metadata.shard_id(),
+        };
+        if !identity_matches {
+            malformed_index = true;
+            continue;
+        }
+        for entry in shard.entries() {
+            let Some(expected_size) = chunks.get(&entry.chunk_id()) else {
+                continue;
+            };
+            if entry.logical_length() != *expected_size {
+                malformed_index = true;
+                continue;
+            }
+            if !found.contains_key(&entry.chunk_id()) {
+                found
+                    .try_reserve(1)
+                    .map_err(|_| RepositoryError::Malformed {
+                        reason: "snapshot index lookup cannot be allocated",
+                    })?;
+                found.insert(entry.chunk_id(), *entry);
+            }
+        }
+    }
+
+    if found.len() != chunks.len() {
+        return Err(if malformed_index {
+            RepositoryError::Malformed {
+                reason: "a referenced chunk has no valid pack-index entry",
+            }
+        } else {
+            RepositoryError::RequiredObjectMissing
+        });
+    }
+
+    let mut by_pack: BTreeMap<PackId, Vec<PackIndexEntry>> = BTreeMap::new();
+    for entry in found.values() {
+        let entries = by_pack.entry(entry.pack_id()).or_default();
+        entries
+            .try_reserve(1)
+            .map_err(|_| RepositoryError::Malformed {
+                reason: "snapshot pack lookup cannot be allocated",
+            })?;
+        entries.push(*entry);
+    }
+    for (pack_id, entries) in by_pack {
+        check_cancelled(is_cancelled)?;
+        validate_pack_entries(storage, pack_id, &entries, is_cancelled)?;
+    }
+    Ok(())
+}
+
+fn validate_pack_entries(
+    storage: &dyn RepositoryStorage,
+    pack_id: PackId,
+    entries: &[PackIndexEntry],
+    is_cancelled: Option<&dyn Fn() -> bool>,
+) -> Result<(), RepositoryError> {
+    let pack_key = format!("packs/{}", pack_id.as_hex());
+    let bytes = read_bounded_object(
+        storage,
+        &pack_key,
+        MAX_PACK_SIZE_BYTES,
+        RepositoryError::RequiredObjectMissing,
+        "validate_pack",
+    )?;
+    let pack = VerifiedPack::new(&bytes).map_err(|_| RepositoryError::Malformed {
+        reason: "referenced pack is malformed",
+    })?;
+    if pack.metadata().pack_id() != pack_id {
+        return Err(RepositoryError::Malformed {
+            reason: "pack object ID does not match its storage reference",
+        });
+    }
+    let pack_length = u64::try_from(bytes.len()).map_err(|_| RepositoryError::Malformed {
+        reason: "pack length cannot be represented",
+    })?;
+    for entry in entries {
+        check_cancelled(is_cancelled)?;
+        let range = entry
+            .validate_against_pack_length(pack_length)
+            .map_err(|_| RepositoryError::Malformed {
+                reason: "pack-index range is outside its pack",
+            })?;
+        let location = pack.entries().iter().find(|location| {
+            location.chunk_id() == entry.chunk_id()
+                && location.pack_id() == entry.pack_id()
+                && location.entry_offset() == entry.entry_offset()
+                && location.payload_offset() == entry.payload_offset()
+                && location.entry_length() == entry.entry_length()
+                && location.payload_length() == entry.stored_length()
+                && location.plaintext_length() == entry.logical_length()
+        });
+        let Some(location) = location else {
+            return Err(RepositoryError::Malformed {
+                reason: "pack-index entry does not match its pack",
+            });
+        };
+        if location.plaintext_length() != entry.logical_length() {
+            return Err(RepositoryError::Malformed {
+                reason: "pack-index logical length does not match its pack",
+            });
+        }
+        let range_key =
+            ObjectKey::new(pack_key.clone()).map_err(|_| RepositoryError::Malformed {
+                reason: "pack object reference is invalid",
+            })?;
+        let mut range_object = storage
+            .read_range(
+                &range_key,
+                ObjectRange::new(range.offset(), range.length()).map_err(|_| {
+                    RepositoryError::Malformed {
+                        reason: "pack-index range cannot be represented by storage",
+                    }
+                })?,
+            )
+            .map_err(|error| {
+                map_bounded_storage_error(
+                    error,
+                    RepositoryError::RequiredObjectMissing,
+                    "validate_pack_range",
+                )
+            })?;
+        let reader = range_object.reader();
+        let range_bytes = read_stream_to_vec(reader, Some(range.length())).map_err(|error| {
+            map_bounded_storage_error(
+                error,
+                RepositoryError::RequiredObjectMissing,
+                "validate_pack_range",
+            )
+        })?;
+        let start = usize::try_from(range.offset()).map_err(|_| RepositoryError::Malformed {
+            reason: "pack-index range offset cannot be represented",
+        })?;
+        let end = usize::try_from(range.end()).map_err(|_| RepositoryError::Malformed {
+            reason: "pack-index range end cannot be represented",
+        })?;
+        let expected = bytes.get(start..end).ok_or(RepositoryError::Malformed {
+            reason: "pack-index range is not present in the pack",
+        })?;
+        if range_bytes != expected {
+            return Err(RepositoryError::Malformed {
+                reason: "pack range bytes do not match the complete pack",
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum PackIndexObjectKey {
+    Content(PackIndexId),
+    Static(PackIndexShardId),
+}
+
+fn parse_pack_index_object_key(key: &str) -> Option<PackIndexObjectKey> {
+    let mut components = key.split('/');
+    match (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) {
+        (Some("indexes"), Some(id), None, None) => PackIndexId::from_hex(id)
+            .ok()
+            .map(PackIndexObjectKey::Content),
+        (Some("indexes"), Some("pack-v1"), Some(shard), None) if shard.len() == 2 => {
+            u8::from_str_radix(shard, 16)
+                .ok()
+                .map(PackIndexShardId::from_byte)
+                .map(PackIndexObjectKey::Static)
+        }
+        _ => None,
+    }
+}
+
+fn read_bounded_object(
+    storage: &dyn RepositoryStorage,
+    key: &str,
+    max_size: u64,
+    missing: RepositoryError,
+    operation: &'static str,
+) -> Result<Vec<u8>, RepositoryError> {
+    let object_key = ObjectKey::new(key.to_owned()).map_err(|_| RepositoryError::Malformed {
+        reason: "repository object reference is invalid",
+    })?;
+    let mut object = storage
+        .read_stream(&object_key)
+        .map_err(|error| map_bounded_storage_error(error, missing, operation))?;
+    let size = object.metadata().size();
+    if size > max_size {
+        return Err(RepositoryError::Malformed {
+            reason: "repository object exceeds its validation size limit",
+        });
+    }
+    read_stream_to_vec(object.reader(), Some(size))
+        .map_err(|error| map_bounded_storage_error(error, missing, operation))
+}
+
+fn map_bounded_storage_error(
+    error: StorageError,
+    missing: RepositoryError,
+    operation: &'static str,
+) -> RepositoryError {
+    match error {
+        StorageError::NotFound => missing,
+        StorageError::InvalidObjectKey => RepositoryError::Malformed {
+            reason: "repository object reference is invalid",
+        },
+        StorageError::InvalidRequest | StorageError::InvalidRange => RepositoryError::Malformed {
+            reason: "repository object read did not satisfy its declared length",
+        },
+        other => map_storage_error(other, operation),
+    }
 }
 
 pub(crate) fn list_snapshot_summaries(

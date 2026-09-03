@@ -27,9 +27,9 @@ pub(crate) use identity::{
 pub(crate) use pack::{PackBuilder, PackFormatError, VerifiedPack};
 pub(crate) use pack_index::{PackIndexFormatError, PackIndexShardBuilder, VerifiedPackIndexShard};
 pub(crate) use repository::{
-    FormatError, decode_bootstrap, decode_descriptor, decode_head, decode_history_record,
-    decode_snapshot, encode_bootstrap, encode_descriptor, encode_head, encode_history_record,
-    encode_snapshot, snapshot_object_id,
+    FormatError, MAX_SNAPSHOT_BYTES, decode_bootstrap, decode_descriptor, decode_head,
+    decode_history_record, decode_snapshot, encode_bootstrap, encode_descriptor, encode_head,
+    encode_history_record, encode_snapshot, snapshot_object_id,
 };
 pub(crate) use storage_configuration::{
     DecodedStorageConfiguration, PersistedStorageBackend, decode_storage_configuration,

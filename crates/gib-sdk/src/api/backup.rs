@@ -6,7 +6,7 @@ use super::filesystem::{FilesystemScanner, local_filesystem_scanner};
 use super::operation::{
     OperationHandle, OperationId, OperationKind, OperationRequest, OperationResult, OperationStatus,
 };
-use super::repository::{Repository, RepositoryEncryption};
+use super::repository::{HeadState, Repository, RepositoryEncryption};
 use crate::application::backup::{
     BackupError, BackupRepositoryFailure, BackupRunRequest, BackupRunResult, run_backup,
 };
@@ -578,6 +578,17 @@ fn map_backup_error(error: BackupError) -> SdkError {
                 backup_stage_error(stage, source)
             }
         }
+        BackupError::PublicationConflict {
+            stage,
+            expected,
+            current,
+        } => backup_stage_error(
+            stage,
+            SdkError::RepositoryPublicationConflictContext {
+                expected: Box::new(HeadState::from_application_read(*expected)),
+                current: current.map(|head| Box::new(HeadState::from_application_read(*head))),
+            },
+        ),
         BackupError::Thread { stage } => backup_stage_error(
             stage,
             SdkError::InvalidRequest {

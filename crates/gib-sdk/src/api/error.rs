@@ -1,4 +1,5 @@
 use super::operation::{OperationId, OperationStatus};
+use super::repository::HeadState;
 use crate::application::ports::StorageError;
 use crate::domain::{BackupResource, BackupStage, FilesystemErrorKind, FilesystemOperation};
 use std::fmt;
@@ -217,6 +218,14 @@ pub enum SdkError {
     RepositoryPackIndexWriteFailed,
     /// Another publisher changed HEAD after the supplied versioned read.
     RepositoryPublicationConflict,
+    /// Another publisher changed HEAD and the SDK also captured the
+    /// compare-and-swap precondition and the latest readable state.
+    RepositoryPublicationConflictContext {
+        /// The HEAD state supplied as the publication precondition.
+        expected: Box<HeadState>,
+        /// The state observed after the conflict, when it could be read.
+        current: Option<Box<HeadState>>,
+    },
     /// The requested snapshot object is missing.
     RepositorySnapshotMissing,
     /// An immutable object required by the requested snapshot is missing.
@@ -329,7 +338,10 @@ impl SdkError {
             Self::RepositoryTransformFailed { .. } => ErrorCode::RepositoryTransformFailed,
             Self::RepositoryPackWriteFailed => ErrorCode::RepositoryPackWriteFailed,
             Self::RepositoryPackIndexWriteFailed => ErrorCode::RepositoryPackIndexWriteFailed,
-            Self::RepositoryPublicationConflict => ErrorCode::RepositoryPublicationConflict,
+            Self::RepositoryPublicationConflict
+            | Self::RepositoryPublicationConflictContext { .. } => {
+                ErrorCode::RepositoryPublicationConflict
+            }
             Self::RepositorySnapshotMissing => ErrorCode::RepositorySnapshotMissing,
             Self::RepositoryRequiredObjectMissing => ErrorCode::RepositoryRequiredObjectMissing,
             Self::StorageCapabilityUnsupported => ErrorCode::StorageCapabilityUnsupported,
@@ -373,6 +385,7 @@ impl SdkError {
             | Self::RepositoryPackWriteFailed
             | Self::RepositoryPackIndexWriteFailed
             | Self::RepositoryPublicationConflict
+            | Self::RepositoryPublicationConflictContext { .. }
             | Self::RepositorySnapshotMissing
             | Self::RepositoryRequiredObjectMissing
             | Self::StorageCapabilityUnsupported
@@ -526,6 +539,9 @@ impl fmt::Display for SdkError {
             Self::RepositoryPublicationConflict => {
                 formatter.write_str("repository HEAD publication conflicted with another publisher")
             }
+            Self::RepositoryPublicationConflictContext { .. } => formatter.write_str(
+                "repository HEAD publication conflicted; expected and current HEAD states are available",
+            ),
             Self::RepositorySnapshotMissing => {
                 formatter.write_str("the requested snapshot object is missing")
             }
