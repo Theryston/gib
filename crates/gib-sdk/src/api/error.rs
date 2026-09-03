@@ -1,4 +1,6 @@
 use super::operation::{OperationId, OperationStatus};
+use crate::application::ports::StorageError;
+use crate::domain::{BackupResource, BackupStage, FilesystemErrorKind, FilesystemOperation};
 use std::fmt;
 
 /// Stable machine-readable categories for [`SdkError`].
@@ -23,6 +25,14 @@ pub enum ErrorCode {
     OperationStateConflict,
     /// An operation has been cancelled.
     OperationCancelled,
+    /// A backup request could not obtain a configured resource budget.
+    BackupBudgetExceeded,
+    /// A backup stage failed and includes typed stage context.
+    BackupStageFailed,
+    /// A backup filesystem operation failed with provider-neutral context.
+    BackupFilesystemFailure,
+    /// A backup storage operation failed with a provider-neutral reason.
+    BackupStorageFailure,
     /// The event dispatcher has been closed.
     EventDispatcherClosed,
     /// An event consumer could not be registered.
@@ -86,6 +96,10 @@ impl ErrorCode {
             Self::OperationIdExhausted => "operation_id_exhausted",
             Self::OperationStateConflict => "operation_state_conflict",
             Self::OperationCancelled => "operation_cancelled",
+            Self::BackupBudgetExceeded => "backup_budget_exceeded",
+            Self::BackupStageFailed => "backup_stage_failed",
+            Self::BackupFilesystemFailure => "backup_filesystem_failure",
+            Self::BackupStorageFailure => "backup_storage_failure",
             Self::EventDispatcherClosed => "event_dispatcher_closed",
             Self::EventConsumerRegistration => "event_consumer_registration",
             Self::OperationSequenceExhausted => "operation_sequence_exhausted",
@@ -238,6 +252,45 @@ pub enum SdkError {
         /// The operation involved, when the error came from an operation.
         operation_id: Option<OperationId>,
     },
+    /// A backup stage could not obtain the requested bounded resource.
+    BackupBudgetExceeded {
+        /// The stage waiting for or requesting the resource.
+        stage: BackupStage,
+        /// The resource whose budget was exceeded.
+        resource: BackupResource,
+        /// The amount requested by the stage.
+        requested: usize,
+        /// The configured request-level limit.
+        limit: usize,
+    },
+    /// A backup stage failed with a typed cause.
+    BackupStageFailed {
+        /// The pipeline stage that failed.
+        stage: BackupStage,
+        /// The redacted typed cause. The cause never contains paths,
+        /// credentials, or backend-specific error values.
+        source: Box<SdkError>,
+    },
+    /// A backup filesystem operation failed with provider-neutral context.
+    BackupFilesystemFailure {
+        /// The pipeline stage that owned the filesystem operation.
+        stage: BackupStage,
+        /// The filesystem operation, when the adapter identified one.
+        operation: Option<FilesystemOperation>,
+        /// The provider-neutral failure category, when known.
+        kind: Option<FilesystemErrorKind>,
+        /// Whether the failure indicates a source mutation race.
+        race: bool,
+    },
+    /// A backup storage operation failed with a provider-neutral reason.
+    BackupStorageFailure {
+        /// The pipeline stage that owned the storage operation.
+        stage: BackupStage,
+        /// The stable operation name, such as `pack` or `snapshot`.
+        operation: &'static str,
+        /// The provider-neutral storage failure category.
+        error: StorageError,
+    },
     /// The dispatcher has been closed and cannot accept consumers.
     EventDispatcherClosed,
     /// A dedicated callback worker could not be started.
@@ -260,6 +313,10 @@ impl SdkError {
             Self::OperationSequenceExhausted { .. } => ErrorCode::OperationSequenceExhausted,
             Self::OperationStateConflict { .. } => ErrorCode::OperationStateConflict,
             Self::OperationCancelled { .. } => ErrorCode::OperationCancelled,
+            Self::BackupBudgetExceeded { .. } => ErrorCode::BackupBudgetExceeded,
+            Self::BackupStageFailed { .. } => ErrorCode::BackupStageFailed,
+            Self::BackupFilesystemFailure { .. } => ErrorCode::BackupFilesystemFailure,
+            Self::BackupStorageFailure { .. } => ErrorCode::BackupStorageFailure,
             Self::EventDispatcherClosed => ErrorCode::EventDispatcherClosed,
             Self::EventConsumerRegistration => ErrorCode::EventConsumerRegistration,
             Self::RepositoryAlreadyExists => ErrorCode::RepositoryAlreadyExists,
@@ -292,6 +349,7 @@ impl SdkError {
             Self::OperationSequenceExhausted { operation_id }
             | Self::OperationStateConflict { operation_id, .. } => Some(*operation_id),
             Self::OperationCancelled { operation_id } => *operation_id,
+            Self::BackupStageFailed { source, .. } => source.operation_id(),
             Self::InvalidConfiguration { .. }
             | Self::InvalidRequest { .. }
             | Self::IdentityNotConfigured
@@ -299,6 +357,9 @@ impl SdkError {
             | Self::ConfigurationUnsupportedVersion { .. }
             | Self::ConfigurationFailure { .. }
             | Self::OperationIdExhausted
+            | Self::BackupBudgetExceeded { .. }
+            | Self::BackupFilesystemFailure { .. }
+            | Self::BackupStorageFailure { .. }
             | Self::EventDispatcherClosed
             | Self::EventConsumerRegistration
             | Self::RepositoryAlreadyExists
@@ -328,7 +389,15 @@ impl SdkError {
     /// Returns whether retrying the same request may succeed without changing
     /// its inputs or configuration.
     pub const fn is_retryable(&self) -> bool {
-        false
+        match self {
+            Self::BackupFilesystemFailure {
+                kind: Some(kind), ..
+            } => kind.is_retryable(),
+            Self::BackupFilesystemFailure { kind: None, .. } => false,
+            Self::BackupStorageFailure { error, .. } => error.is_retryable(),
+            Self::BackupStageFailed { source, .. } => source.is_retryable(),
+            _ => false,
+        }
     }
 }
 
@@ -381,6 +450,44 @@ impl fmt::Display for SdkError {
             Self::OperationCancelled { operation_id: None } => {
                 formatter.write_str("operation was cancelled")
             }
+            Self::BackupBudgetExceeded {
+                stage,
+                resource,
+                requested,
+                limit,
+            } => write!(
+                formatter,
+                "backup {stage} stage exceeded {resource} budget: requested {requested}, limit {limit}"
+            ),
+            Self::BackupStageFailed { stage, source } => {
+                write!(formatter, "backup {stage} stage failed: {source}")
+            }
+            Self::BackupFilesystemFailure {
+                stage,
+                operation,
+                kind,
+                race,
+            } => {
+                write!(formatter, "backup {stage} filesystem failure")?;
+                if let Some(operation) = operation {
+                    write!(formatter, " during {operation}")?;
+                }
+                if let Some(kind) = kind {
+                    write!(formatter, ": {kind}")?;
+                }
+                if *race {
+                    formatter.write_str(" (source changed during capture)")?;
+                }
+                Ok(())
+            }
+            Self::BackupStorageFailure {
+                stage,
+                operation,
+                error,
+            } => write!(
+                formatter,
+                "backup {stage} storage {operation} operation failed: {error}"
+            ),
             Self::EventDispatcherClosed => formatter.write_str("event dispatcher is closed"),
             Self::EventConsumerRegistration => {
                 formatter.write_str("event consumer could not be registered")
@@ -453,7 +560,14 @@ impl fmt::Display for SdkError {
     }
 }
 
-impl std::error::Error for SdkError {}
+impl std::error::Error for SdkError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackupStageFailed { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// Result alias used by all public SDK operations.
 pub type SdkResult<T> = std::result::Result<T, SdkError>;

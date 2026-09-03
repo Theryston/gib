@@ -202,6 +202,10 @@ impl StorageHandle {
     pub fn as_storage(&self) -> &dyn RepositoryStorage {
         self.inner.as_ref()
     }
+
+    pub(crate) fn as_arc(&self) -> Arc<dyn RepositoryStorage> {
+        Arc::clone(&self.inner)
+    }
 }
 
 impl<S> From<S> for StorageHandle

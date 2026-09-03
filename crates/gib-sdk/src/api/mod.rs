@@ -1,3 +1,4 @@
+mod backup;
 mod builder;
 mod client;
 mod configuration;
@@ -10,6 +11,13 @@ mod repository;
 mod storage_configuration;
 mod tree;
 
+pub use crate::domain::{
+    BackupBudgetError, BackupBudgets, BackupMetrics, BackupResource, BackupStage,
+    DEFAULT_BACKUP_CPU_WORKERS, DEFAULT_BACKUP_FILE_DESCRIPTORS, DEFAULT_BACKUP_MEMORY_BYTES,
+    DEFAULT_BACKUP_NETWORK_REQUESTS, DEFAULT_BACKUP_QUEUE_CAPACITY, MAX_BACKUP_QUEUE_CAPACITY,
+    MIN_BACKUP_CPU_WORKERS, MIN_BACKUP_FILE_DESCRIPTORS, MIN_BACKUP_NETWORK_REQUESTS,
+};
+pub use backup::{BackupHandle, BackupPipeline, BackupRequest, BackupResult};
 pub use builder::{ClientBuilder, DEFAULT_EVENT_BUFFER_CAPACITY};
 pub use client::Client;
 pub use configuration::{

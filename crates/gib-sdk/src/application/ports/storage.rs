@@ -902,6 +902,36 @@ pub trait RepositoryStorage: Send + Sync {
         Err(StorageError::UnsupportedCapability)
     }
 
+    /// Writes from a bounded source while observing cooperative cancellation.
+    ///
+    /// Adapters that do not provide a native cancellation primitive still get
+    /// cancellation checks between source reads. Adapters with a native
+    /// primitive may override this method to cancel an in-flight request too.
+    /// An immutable object that finishes just as cancellation is observed may
+    /// remain as an unpublished, recoverable object; HEAD publication remains
+    /// the commit boundary.
+    fn write_stream_with_cancellation(
+        &self,
+        object_key: &ObjectKey,
+        source: &mut dyn Read,
+        options: ObjectWriteOptions,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> StorageResult<ObjectMetadata> {
+        if is_cancelled() {
+            return Err(StorageError::Cancelled);
+        }
+        let mut source = CancellationReader {
+            source,
+            is_cancelled,
+        };
+        let result = self.write_stream(object_key, &mut source, options);
+        if is_cancelled() {
+            Err(StorageError::Cancelled)
+        } else {
+            result
+        }
+    }
+
     /// Deletes one object.
     fn delete(&self, object_key: &ObjectKey) -> StorageResult<()> {
         let _ = object_key;
@@ -1084,6 +1114,17 @@ where
         self.as_ref().write_stream(object_key, source, options)
     }
 
+    fn write_stream_with_cancellation(
+        &self,
+        object_key: &ObjectKey,
+        source: &mut dyn Read,
+        options: ObjectWriteOptions,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> StorageResult<ObjectMetadata> {
+        self.as_ref()
+            .write_stream_with_cancellation(object_key, source, options, is_cancelled)
+    }
+
     fn delete(&self, object_key: &ObjectKey) -> StorageResult<()> {
         self.as_ref().delete(object_key)
     }
@@ -1162,6 +1203,23 @@ where
 
     fn delete_object(&self, object_key: &ObjectKey) -> StorageResult<()> {
         self.as_ref().delete_object(object_key)
+    }
+}
+
+struct CancellationReader<'a> {
+    source: &'a mut dyn Read,
+    is_cancelled: &'a dyn Fn() -> bool,
+}
+
+impl Read for CancellationReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if (self.is_cancelled)() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "storage write cancelled",
+            ));
+        }
+        self.source.read(buffer)
     }
 }
 

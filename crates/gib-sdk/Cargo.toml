@@ -40,6 +40,10 @@ harness = false
 name = "trees"
 harness = false
 
+[[bench]]
+name = "backup_pipeline"
+harness = false
+
 [dependencies]
 aws-sdk-s3 = { version = "1.119.0", optional = true, features = ["behavior-version-latest"] }
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "zeroize"] }

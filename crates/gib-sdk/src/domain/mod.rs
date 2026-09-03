@@ -1,4 +1,5 @@
 mod author;
+mod backup;
 mod chunk;
 mod configuration;
 mod filesystem;
@@ -11,6 +12,12 @@ mod snapshot;
 mod tree;
 
 pub use author::{AuthorIdentity, MAX_AUTHOR_IDENTITY_LENGTH};
+pub use backup::{
+    BackupBudgetError, BackupBudgets, BackupMetrics, BackupResource, BackupStage,
+    DEFAULT_BACKUP_CPU_WORKERS, DEFAULT_BACKUP_FILE_DESCRIPTORS, DEFAULT_BACKUP_MEMORY_BYTES,
+    DEFAULT_BACKUP_NETWORK_REQUESTS, DEFAULT_BACKUP_QUEUE_CAPACITY, MAX_BACKUP_QUEUE_CAPACITY,
+    MIN_BACKUP_CPU_WORKERS, MIN_BACKUP_FILE_DESCRIPTORS, MIN_BACKUP_NETWORK_REQUESTS,
+};
 #[cfg(feature = "async")]
 pub use chunk::{AsyncChunkStream, AsyncChunker, async_chunk_reader};
 pub use chunk::{
