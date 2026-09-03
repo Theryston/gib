@@ -6,8 +6,9 @@ use std::time::Duration;
 pub use crate::application::ports::{ConfigurationFileMetadata, ConfigurationFileSystem};
 use crate::domain::{
     BackupConfigurationInput, ChunkingConfiguration, ChunkingConfigurationInput,
-    ConfigurationInput, LiveConfigurationInput, RepositoryConfigurationInput,
-    RestoreConfigurationInput, ValidatedConfiguration, validate_configuration,
+    ConfigurationInput, IgnorePattern, IgnorePatternError, IgnorePolicy, LiveConfigurationInput,
+    RepositoryConfigurationInput, RestoreConfigurationInput, ValidatedConfiguration,
+    validate_configuration,
 };
 use crate::format::{
     ConfigurationDocumentError, ConfigurationDocumentErrorKind,
@@ -212,6 +213,7 @@ pub struct ConfigurationOverrides {
     backup_chunking: Option<ChunkingConfiguration>,
     backup_concurrency: Option<usize>,
     backup_ignore: Vec<String>,
+    no_ignore_git: bool,
     live_message: Option<String>,
     live_debounce_ms: Option<u64>,
     live_poll_ms: Option<u64>,
@@ -231,6 +233,7 @@ impl ConfigurationOverrides {
             backup_chunking: None,
             backup_concurrency: None,
             backup_ignore: Vec::new(),
+            no_ignore_git: false,
             live_message: None,
             live_debounce_ms: None,
             live_poll_ms: None,
@@ -352,6 +355,17 @@ impl ConfigurationOverrides {
         self.with_ignore_rules(values)
     }
 
+    /// Includes `.git` paths in normal Backup and Live captures.
+    pub const fn with_no_ignore_git(mut self) -> Self {
+        self.no_ignore_git = true;
+        self
+    }
+
+    /// Alias for [`Self::with_no_ignore_git`].
+    pub const fn without_git_ignore(self) -> Self {
+        self.with_no_ignore_git()
+    }
+
     /// Overrides `live.message`.
     pub fn with_live_message(mut self, value: impl Into<String>) -> Self {
         self.live_message = Some(value.into());
@@ -424,6 +438,11 @@ impl ConfigurationOverrides {
     /// Returns repeated `backup.ignore` overrides in supplied order.
     pub fn backup_ignore_rules(&self) -> &[String] {
         &self.backup_ignore
+    }
+
+    /// Returns whether the built-in `.git` exclusion is disabled.
+    pub const fn no_ignore_git(&self) -> bool {
+        self.no_ignore_git
     }
 
     /// Returns the `live.message` override, when present.
@@ -518,6 +537,17 @@ impl ConfigurationResolutionRequest {
         self.overrides = overrides;
         self
     }
+
+    /// Includes `.git` paths in the normal capture policy for this request.
+    pub fn with_no_ignore_git(mut self) -> Self {
+        self.overrides = self.overrides.with_no_ignore_git();
+        self
+    }
+
+    /// Alias for [`Self::with_no_ignore_git`].
+    pub fn without_git_ignore(self) -> Self {
+        self.with_no_ignore_git()
+    }
 }
 
 /// Effective project configuration and the source selected to produce it.
@@ -525,13 +555,19 @@ impl ConfigurationResolutionRequest {
 pub struct ResolvedConfiguration {
     configuration: ProjectConfiguration,
     source: ConfigurationSource,
+    ignore_policy: IgnorePolicy,
 }
 
 impl ResolvedConfiguration {
-    fn new(configuration: ProjectConfiguration, source: ConfigurationSource) -> Self {
+    fn new(
+        configuration: ProjectConfiguration,
+        source: ConfigurationSource,
+        ignore_policy: IgnorePolicy,
+    ) -> Self {
         Self {
             configuration,
             source,
+            ignore_policy,
         }
     }
 
@@ -559,6 +595,20 @@ impl ResolvedConfiguration {
     /// Creates the structured diagnostic event for this resolution.
     pub fn source_event(&self) -> ConfigurationSourceEvent {
         ConfigurationSourceEvent::from_source(&self.source)
+    }
+
+    /// Returns the effective ignore policy shared by Backup and Live scans.
+    ///
+    /// The policy contains only normalized relative-path rules and never
+    /// embeds the source root. A command should pass this same value to its
+    /// capture scanner so both capture modes make identical decisions.
+    pub const fn ignore_policy(&self) -> &IgnorePolicy {
+        &self.ignore_policy
+    }
+
+    /// Alias for [`Self::ignore_policy`].
+    pub const fn backup_ignore_policy(&self) -> &IgnorePolicy {
+        self.ignore_policy()
     }
 }
 
@@ -619,7 +669,22 @@ where
         };
         let configuration =
             configuration.with_overrides(&request.overrides, &request.starting_directory)?;
-        Ok(ResolvedConfiguration::new(configuration, source))
+        let mut ignore_policy = configuration.backup().ignore_policy().map_err(|error| {
+            ProjectConfigurationError::new(
+                ProjectConfigurationErrorKind::InvalidValue,
+                None,
+                Some("backup.ignore".to_owned()),
+                error.to_string(),
+            )
+        })?;
+        if request.overrides.no_ignore_git {
+            ignore_policy = ignore_policy.with_no_ignore_git();
+        }
+        Ok(ResolvedConfiguration::new(
+            configuration,
+            source,
+            ignore_policy,
+        ))
     }
 
     fn canonicalize_explicit(&self, path: &Path) -> Result<PathBuf, ProjectConfigurationError> {
@@ -1027,6 +1092,16 @@ impl ProjectConfiguration {
         &self.backup
     }
 
+    /// Builds the capture policy configured for Backup and Live.
+    pub fn ignore_policy(&self) -> Result<IgnorePolicy, IgnorePatternError> {
+        self.backup.ignore_policy()
+    }
+
+    /// Alias for [`Self::ignore_policy`].
+    pub fn backup_ignore_policy(&self) -> Result<IgnorePolicy, IgnorePatternError> {
+        self.ignore_policy()
+    }
+
     /// Returns Live synchronization defaults.
     pub const fn live(&self) -> &LiveConfiguration {
         &self.live
@@ -1225,7 +1300,11 @@ pub fn merge_ignore_rules(config_values: &[String], cli_values: &[String]) -> Ve
     config_values
         .iter()
         .chain(cli_values)
-        .cloned()
+        .map(|value| {
+            IgnorePattern::new(value)
+                .map(|pattern| pattern.as_str().to_owned())
+                .unwrap_or_else(|_| value.clone())
+        })
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -1333,6 +1412,11 @@ impl BackupConfiguration {
     /// Alias for [`Self::ignore`].
     pub fn ignore_rules(&self) -> &[String] {
         self.ignore()
+    }
+
+    /// Builds the normalized capture policy for this backup configuration.
+    pub fn ignore_policy(&self) -> Result<IgnorePolicy, IgnorePatternError> {
+        IgnorePolicy::new(self.ignore.iter().map(String::as_str))
     }
 }
 

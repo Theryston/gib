@@ -4,6 +4,7 @@ use super::ports::{
 use crate::domain::{
     FilesystemChangePhase, FilesystemChangeReason, FilesystemEntry, FilesystemEntryKind,
     FilesystemMetadata, FilesystemOperation, FilesystemPermissionPolicy, FilesystemScanError,
+    IgnoreDecision, IgnorePathError, IgnorePatternError, IgnorePolicy,
     MAX_FILESYSTEM_SCAN_OPEN_DIRECTORIES, RelativePath,
 };
 use std::io::{self, Read};
@@ -71,6 +72,7 @@ pub struct FilesystemScanner<F, C> {
     filesystem: Arc<F>,
     clock: Arc<C>,
     options: FilesystemScanOptions,
+    ignore_policy: Arc<IgnorePolicy>,
 }
 
 impl<F, C> Clone for FilesystemScanner<F, C> {
@@ -79,6 +81,7 @@ impl<F, C> Clone for FilesystemScanner<F, C> {
             filesystem: Arc::clone(&self.filesystem),
             clock: Arc::clone(&self.clock),
             options: self.options,
+            ignore_policy: Arc::clone(&self.ignore_policy),
         }
     }
 }
@@ -94,6 +97,7 @@ where
             filesystem: Arc::new(filesystem),
             clock: Arc::new(clock),
             options: FilesystemScanOptions::default(),
+            ignore_policy: Arc::new(IgnorePolicy::default()),
         }
     }
 
@@ -106,6 +110,54 @@ where
     /// Returns the scanner options.
     pub const fn options(&self) -> FilesystemScanOptions {
         self.options
+    }
+
+    /// Replaces the policy used to select entries for a capture scan.
+    ///
+    /// The policy is evaluated against each normalized path before that entry
+    /// is inspected or, for directories, opened. Backup and Live callers can
+    /// therefore pass the same resolved policy and receive identical
+    /// selection and traversal behavior.
+    pub fn with_ignore_policy(mut self, policy: IgnorePolicy) -> Self {
+        self.ignore_policy = Arc::new(policy);
+        self
+    }
+
+    /// Parses and installs repeated ignore patterns for a capture scan.
+    pub fn with_ignore_patterns<I, T>(self, patterns: I) -> Result<Self, IgnorePatternError>
+    where
+        I: IntoIterator<Item = T>,
+        T: AsRef<str>,
+    {
+        Ok(self.with_ignore_policy(IgnorePolicy::new(patterns)?))
+    }
+
+    /// Opens a root with the supplied capture policy.
+    pub fn scan_with_ignore_policy(
+        &self,
+        root: impl AsRef<Path>,
+        policy: IgnorePolicy,
+    ) -> Result<FilesystemScan<F, C>, FilesystemScanError> {
+        self.clone().with_ignore_policy(policy).scan(root)
+    }
+
+    /// Includes `.git` directories and files in this capture scan.
+    pub fn with_no_ignore_git(self) -> Self {
+        let policy = self.ignore_policy.as_ref().clone().with_no_ignore_git();
+        self.with_ignore_policy(policy)
+    }
+
+    /// Returns the policy used by this scanner for future scans.
+    pub fn ignore_policy(&self) -> &IgnorePolicy {
+        &self.ignore_policy
+    }
+
+    /// Evaluates a relative path using this scanner's capture policy.
+    pub fn ignore_decision<P>(&self, path: P) -> Result<IgnoreDecision, IgnorePathError>
+    where
+        P: AsRef<str>,
+    {
+        self.ignore_policy.decision(path)
     }
 
     /// Opens and validates a source root, returning an incremental scan.
@@ -159,6 +211,7 @@ where
                 reader,
             }],
             options: self.options,
+            ignore_policy: Arc::clone(&self.ignore_policy),
             pending_error: None,
             finished: false,
         })
@@ -203,6 +256,7 @@ pub struct FilesystemScan<F, C> {
     pending_root: bool,
     frames: Vec<DirectoryFrame>,
     options: FilesystemScanOptions,
+    ignore_policy: Arc<IgnorePolicy>,
     pending_error: Option<FilesystemScanError>,
     finished: bool,
 }
@@ -225,6 +279,19 @@ where
     /// Returns the scan options.
     pub const fn options(&self) -> FilesystemScanOptions {
         self.options
+    }
+
+    /// Returns the policy used for this scan.
+    pub fn ignore_policy(&self) -> &IgnorePolicy {
+        &self.ignore_policy
+    }
+
+    /// Evaluates a relative path using this scan's capture policy.
+    pub fn ignore_decision<P>(&self, path: P) -> Result<IgnoreDecision, IgnorePathError>
+    where
+        P: AsRef<str>,
+    {
+        self.ignore_policy.decision(path)
     }
 
     /// Opens an emitted regular-file entry using this scan's selected root.
@@ -358,6 +425,9 @@ where
                     );
                 }
             };
+            if self.ignore_policy.is_ignored(relative_path.as_str()) {
+                continue;
+            }
             let absolute_path = join_root(&self.root_path, &relative_path);
             let metadata = match self.filesystem.symlink_metadata(&absolute_path) {
                 Ok(metadata) => metadata,

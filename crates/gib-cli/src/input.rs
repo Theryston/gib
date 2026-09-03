@@ -105,6 +105,13 @@ pub struct Cli {
     )]
     pub ignore: Vec<String>,
     #[arg(
+        long = "no-ignore-git",
+        global = true,
+        action = clap::ArgAction::SetTrue,
+        help = "Include .git directories and files in Backup and Live captures."
+    )]
+    pub no_ignore_git: bool,
+    #[arg(
         long = "live-message",
         global = true,
         value_name = "MESSAGE",
@@ -178,6 +185,9 @@ impl Cli {
             overrides = overrides.with_backup_concurrency(value);
         }
         overrides = overrides.with_ignore_rules(self.ignore.clone());
+        if self.no_ignore_git {
+            overrides = overrides.with_no_ignore_git();
+        }
         if let Some(value) = &self.live_message {
             overrides = overrides.with_live_message(value.clone());
         }
@@ -623,6 +633,7 @@ mod tests {
             ".git",
             "--ignore",
             "target",
+            "--no-ignore-git",
             "--live-message",
             "live",
             "--debounce-ms",
@@ -658,6 +669,7 @@ mod tests {
             request.overrides().backup_ignore_rules(),
             [String::from(".git"), String::from("target")].as_slice()
         );
+        assert!(request.overrides().no_ignore_git());
         assert_eq!(request.overrides().live_message(), Some("live"));
         assert_eq!(request.overrides().live_debounce_ms(), Some(100));
         assert_eq!(request.overrides().live_poll_ms(), Some(200));

@@ -17,6 +17,44 @@ adapter also treats Windows reparse points as links. Directory enumeration is
 incremental; the scanner keeps only the active directory stack, bounded by
 `FilesystemScanOptions::max_open_directories`.
 
+## Ignore policy
+
+Backup and Live capture use the same `gib::IgnorePolicy`. It evaluates only
+normalized paths relative to the capture root, always using `/` as the
+separator. A policy can be installed with
+`FilesystemScanner::with_ignore_policy`, or built from repeated patterns with
+`FilesystemScanner::with_ignore_patterns`.
+
+Patterns have two forms:
+
+- A pattern without `/` is a name pattern. It matches that name at any depth.
+- A pattern containing `/` is anchored at the capture root and matches the
+  named path and its descendants.
+
+Within one component, `*` matches zero or more characters and `?` matches one
+character. A complete `**` component matches zero or more complete path
+components, so `**/*.tmp` matches temporary files at any depth. Backslashes in
+patterns and diagnostic paths are normalized to `/`; absolute paths, traversal
+components, empty components, and invalid characters are rejected during
+validation. Rules are canonicalized, sorted, and deduplicated when a policy is
+built, including separator-equivalent duplicates. The configuration resolver
+combines `[backup].ignore` with repeated `--ignore` request values before
+building this policy; the resulting order does not depend on source or input
+order.
+
+The built-in `.git` rule is enabled by default and matches an exact `.git`
+component, case-insensitively, at every depth. `.gitignore`, `git`, and similar
+names are not covered. `--no-ignore-git` disables only this built-in capture
+rule; an explicit user pattern such as `.git` still excludes those paths.
+Ignored directories are filtered before metadata inspection and before
+`read_dir`, so their subtrees are not traversed.
+
+`IgnorePolicy::decision` and the scanner's `ignore_decision` methods expose the
+matching rule for diagnostics. They contain only the normalized relative path
+and never the absolute source root. This capture-selection policy is separate
+from destructive cleanup protection: including `.git` in a snapshot must not
+authorize later removal of local `.git` paths.
+
 The default permission policy is fail-closed. With
 `FilesystemPermissionPolicy::Warn`, a permission error is yielded to the
 caller and reachable siblings continue. Other errors stop the scan. A caller

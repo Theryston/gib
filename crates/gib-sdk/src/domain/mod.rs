@@ -5,6 +5,7 @@ mod filesystem;
 mod object;
 mod pack;
 mod pack_index;
+mod policy;
 mod repository;
 mod snapshot;
 mod tree;
@@ -58,6 +59,11 @@ pub use pack_index::{
     PackIndexId, PackIndexIdError, PackIndexRange, PackIndexRangeError, PackIndexShardId,
     PackIndexShardMetadata, PackIndexTransform, PackIndexTransformError, SealedPackIndexShard,
     pack_index_object_key, pack_index_storage_key,
+};
+pub use policy::{
+    DEFAULT_IGNORE_GIT, IgnoreDecision, IgnoreMatch, IgnorePathError, IgnorePattern,
+    IgnorePatternError, IgnorePolicy, IgnoreReason, IgnoreRule, IgnoreRuleError,
+    MAX_IGNORE_RULE_LENGTH, MAX_IGNORE_RULES, is_git_path,
 };
 pub use repository::{
     CURRENT_REPOSITORY_BOOTSTRAP_VERSION, CURRENT_REPOSITORY_DESCRIPTOR_VERSION,

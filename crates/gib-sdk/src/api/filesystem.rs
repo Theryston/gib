@@ -7,10 +7,12 @@ pub use crate::application::ports::{
     Filesystem, FilesystemClock, FilesystemDirectory, FilesystemDirectoryEntry, FilesystemFile,
 };
 pub use crate::domain::{
-    FilesystemChangePhase, FilesystemChangeReason, FilesystemEntry, FilesystemEntryError,
-    FilesystemEntryKind, FilesystemErrorKind, FilesystemIdentity, FilesystemMetadata,
-    FilesystemOperation, FilesystemPermissionPolicy, FilesystemScanError,
-    MAX_FILESYSTEM_SCAN_OPEN_DIRECTORIES, PermissionErrorPolicy,
+    DEFAULT_IGNORE_GIT, FilesystemChangePhase, FilesystemChangeReason, FilesystemEntry,
+    FilesystemEntryError, FilesystemEntryKind, FilesystemErrorKind, FilesystemIdentity,
+    FilesystemMetadata, FilesystemOperation, FilesystemPermissionPolicy, FilesystemScanError,
+    IgnoreDecision, IgnoreMatch, IgnorePathError, IgnorePattern, IgnorePatternError, IgnorePolicy,
+    IgnoreReason, IgnoreRule, IgnoreRuleError, MAX_FILESYSTEM_SCAN_OPEN_DIRECTORIES,
+    MAX_IGNORE_RULE_LENGTH, MAX_IGNORE_RULES, PermissionErrorPolicy, is_git_path,
 };
 pub use crate::infrastructure::filesystem::{LocalFilesystem, SystemClock};
 

@@ -8,6 +8,7 @@ use super::chunk::{
     CONTENT_DEFINED_CHUNKING_ALGORITHM, CURRENT_CHUNKING_VERSION, ChunkingConfiguration,
     DEFAULT_MAX_CHUNK_SIZE_BYTES, DEFAULT_MIN_CHUNK_SIZE_BYTES, DEFAULT_TARGET_CHUNK_SIZE_BYTES,
 };
+use super::policy::{IgnorePattern, MAX_IGNORE_RULES};
 use super::repository::{DomainError, RepositoryKey};
 use super::snapshot::MAX_SNAPSHOT_MESSAGE_LENGTH;
 
@@ -34,12 +35,6 @@ pub(crate) const MAX_STORAGE_NAME_LENGTH: usize = 128;
 
 /// The largest configured path value in UTF-8 bytes.
 pub(crate) const MAX_CONFIGURATION_PATH_LENGTH: usize = 32 * 1_024;
-
-/// The largest ignore rule in UTF-8 bytes.
-pub(crate) const MAX_IGNORE_RULE_LENGTH: usize = 4 * 1_024;
-
-/// The largest number of ignore rules in one configuration.
-pub(crate) const MAX_IGNORE_RULES: usize = 1_024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConfigurationInput {
@@ -455,25 +450,9 @@ fn validate_ignore_rules(values: Vec<String>) -> Result<Vec<String>, Configurati
         .enumerate()
         .map(|(index, value)| {
             let field = format!("backup.ignore[{index}]");
-            if value.trim().is_empty() {
-                return Err(ConfigurationValidationError::new(
-                    field,
-                    "must contain at least one non-whitespace character",
-                ));
-            }
-            if value.len() > MAX_IGNORE_RULE_LENGTH {
-                return Err(ConfigurationValidationError::new(
-                    field,
-                    format!("must contain at most {MAX_IGNORE_RULE_LENGTH} UTF-8 bytes"),
-                ));
-            }
-            if value.contains('\0') {
-                return Err(ConfigurationValidationError::new(
-                    field,
-                    "must not contain a NUL byte",
-                ));
-            }
-            Ok(value)
+            IgnorePattern::new(&value)
+                .map(|pattern| pattern.as_str().to_owned())
+                .map_err(|error| ConfigurationValidationError::new(field, error.to_string()))
         })
         .collect()
 }
@@ -581,7 +560,8 @@ mod tests {
         invalid_field(input, "backup.ignore[0]");
 
         let mut input = valid_input();
-        input.backup.ignore = vec![String::from("x").repeat(MAX_IGNORE_RULE_LENGTH + 1)];
+        input.backup.ignore =
+            vec![String::from("x").repeat(super::super::policy::MAX_IGNORE_RULE_LENGTH + 1)];
         invalid_field(input, "backup.ignore[0]");
 
         let mut input = valid_input();

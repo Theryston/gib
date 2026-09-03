@@ -2,13 +2,14 @@ use gib::{
     EntryName, Filesystem, FilesystemClock, FilesystemDirectory, FilesystemDirectoryEntry,
     FilesystemEntry, FilesystemEntryKind, FilesystemFile, FilesystemMetadata,
     FilesystemPermissionPolicy, FilesystemScanError, FilesystemScanOptions, FilesystemScanner,
-    LocalFilesystem, RelativePath, SymlinkTarget,
+    IgnorePolicy, LocalFilesystem, RelativePath, SymlinkTarget,
 };
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -197,6 +198,109 @@ fn local_scan_preserves_links_and_never_descends_into_them()
         assert!(!paths.iter().any(|path| path.starts_with("nested/loop/")));
     }
     assert!(!paths.iter().any(|path| path.contains("secret.txt")));
+    Ok(())
+}
+
+#[test]
+fn nested_git_paths_are_excluded_by_default_and_included_by_explicit_opt_in()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TestDirectory::new()?;
+    let root = directory.path().join("source");
+    fs::create_dir_all(root.join("nested/.git"))?;
+    fs::create_dir_all(root.join("nested/git"))?;
+    fs::write(root.join("nested/.git/HEAD"), b"head")?;
+    fs::write(root.join("nested/git/HEAD"), b"not metadata")?;
+    fs::write(root.join("nested/.gitignore"), b"ignore file")?;
+    fs::write(root.join("nested/gitignore"), b"similar name")?;
+
+    let default_entries = scan_entries(
+        &FilesystemScanner::new(LocalFilesystem, FixedClock(23)),
+        &root,
+    )?;
+    let default_paths: Vec<_> = default_entries
+        .iter()
+        .map(|entry| entry.path().as_str())
+        .collect();
+    assert!(!default_paths.iter().any(|path| {
+        path.split('/')
+            .any(|component| component.eq_ignore_ascii_case(".git"))
+    }));
+    assert!(default_paths.contains(&"nested/.gitignore"));
+    assert!(default_paths.contains(&"nested/git/HEAD"));
+    assert!(default_paths.contains(&"nested/gitignore"));
+
+    let policy = IgnorePolicy::default().with_no_ignore_git();
+    let included_entries = scan_entries(
+        &FilesystemScanner::new(LocalFilesystem, FixedClock(23)).with_ignore_policy(policy),
+        &root,
+    )?;
+    let included_paths: Vec<_> = included_entries
+        .iter()
+        .map(|entry| entry.path().as_str())
+        .collect();
+    assert!(included_paths.contains(&"nested/.git"));
+    assert!(included_paths.contains(&"nested/.git/HEAD"));
+    Ok(())
+}
+
+#[test]
+fn ignored_directories_are_pruned_before_their_entries_are_inspected()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TestDirectory::new()?;
+    let root = directory.path().join("source");
+    let ignored = root.join("ignored");
+    let kept = root.join("kept");
+    fs::create_dir_all(&ignored)?;
+    fs::create_dir_all(&kept)?;
+    for index in 0..5_000 {
+        fs::write(ignored.join(format!("entry-{index:05}")), b"ignored")?;
+    }
+    fs::write(kept.join("visible"), b"visible")?;
+
+    let read_directories = Arc::new(Mutex::new(Vec::new()));
+    let filesystem = CountingFilesystem {
+        read_directories: Arc::clone(&read_directories),
+    };
+    let scanner =
+        FilesystemScanner::new(filesystem, FixedClock(29)).with_ignore_patterns(["ignored"])?;
+    let entries = scan_entries(&scanner, &root)?;
+    let paths: Vec<_> = entries.iter().map(|entry| entry.path().as_str()).collect();
+
+    assert!(paths.contains(&"kept"));
+    assert!(paths.contains(&"kept/visible"));
+    assert!(!paths.iter().any(|path| path.starts_with("ignored")));
+    let read_directories = read_directories
+        .lock()
+        .map_err(|_| "read directory test lock was poisoned")?;
+    assert_eq!(read_directories.len(), 2);
+    assert!(read_directories.iter().any(|path| path == &root));
+    assert!(read_directories.iter().any(|path| path == &kept));
+    assert!(!read_directories.iter().any(|path| path == &ignored));
+    Ok(())
+}
+
+#[test]
+fn backup_and_live_scans_can_share_the_same_decision_policy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let policy = IgnorePolicy::new(["cache", "src/generated", "**/*.tmp"])?;
+    let backup_scanner =
+        FilesystemScanner::new(LocalFilesystem, FixedClock(31)).with_ignore_policy(policy.clone());
+    let live_scanner =
+        FilesystemScanner::new(LocalFilesystem, FixedClock(31)).with_ignore_policy(policy);
+
+    for path in [
+        "cache/data.bin",
+        "src/generated/code.rs",
+        "work/file.tmp",
+        "work/file.rs",
+        "src/other.rs",
+    ] {
+        assert_eq!(
+            backup_scanner.ignore_decision(path)?,
+            live_scanner.ignore_decision(path)?,
+            "decision mismatch for {path}"
+        );
+    }
     Ok(())
 }
 
@@ -515,6 +619,48 @@ impl Read for PermissionFile {
 impl FilesystemFile for PermissionFile {
     fn metadata(&self) -> io::Result<FilesystemMetadata> {
         Ok(FilesystemMetadata::new(FilesystemEntryKind::RegularFile, 2))
+    }
+}
+
+struct CountingFilesystem {
+    read_directories: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+impl Filesystem for CountingFilesystem {
+    fn symlink_metadata(&self, path: &Path) -> io::Result<FilesystemMetadata> {
+        LocalFilesystem.symlink_metadata(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Box<dyn FilesystemDirectory>> {
+        self.read_directories
+            .lock()
+            .map_err(|_| io::Error::other("read directory test lock was poisoned"))?
+            .push(path.to_path_buf());
+        LocalFilesystem.read_dir(path).map(|reader| {
+            Box::new(CountingDirectory { inner: reader }) as Box<dyn FilesystemDirectory>
+        })
+    }
+
+    fn read_link(&self, path: &Path) -> io::Result<Vec<u8>> {
+        LocalFilesystem.read_link(path)
+    }
+
+    fn open_file(&self, path: &Path) -> io::Result<Box<dyn FilesystemFile>> {
+        LocalFilesystem.open_file(path)
+    }
+}
+
+struct CountingDirectory {
+    inner: Box<dyn FilesystemDirectory>,
+}
+
+impl FilesystemDirectory for CountingDirectory {
+    fn next_entry(&mut self) -> io::Result<Option<FilesystemDirectoryEntry>> {
+        self.inner.next_entry()
+    }
+
+    fn metadata(&self) -> io::Result<FilesystemMetadata> {
+        self.inner.metadata()
     }
 }
 

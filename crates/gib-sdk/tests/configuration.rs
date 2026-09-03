@@ -2,7 +2,7 @@ use gib::{
     CONTENT_DEFINED_CHUNKING_ALGORITHM, CURRENT_CHUNKING_VERSION, CURRENT_CONFIGURATION_VERSION,
     ChunkingConfiguration, Configuration, ConfigurationFileMetadata, ConfigurationFileSystem,
     ConfigurationOverrides, ConfigurationResolutionRequest, ConfigurationResolver,
-    ConfigurationSource, LocalConfigurationFileSystem, MAX_CONFIGURATION_BYTES,
+    ConfigurationSource, IgnoreMatch, LocalConfigurationFileSystem, MAX_CONFIGURATION_BYTES,
     ProjectConfigurationErrorKind,
 };
 use std::fs;
@@ -504,6 +504,102 @@ fn ignore_rules_are_sorted_and_deduplicated_across_sources() {
         ],
     );
     assert_eq!(merged, [".git", "coverage", "node_modules"]);
+
+    let separator_aliases = gib::merge_ignore_rules(
+        &[String::from(r"src\generated")],
+        &[String::from("src/generated")],
+    );
+    assert_eq!(separator_aliases, ["src/generated"]);
+}
+
+#[test]
+fn resolved_configuration_exposes_one_deterministic_policy_for_backup_and_live()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TestDirectory::new();
+    let config_path = directory.path().join("gib.toml");
+    fs::write(
+        &config_path,
+        r#"version = 1
+[backup]
+ignore = ["shared", "src/generated", "cache"]
+"#,
+    )?;
+    let overrides =
+        ConfigurationOverrides::new().with_ignore_rules(["cli-only", "shared", r"src\generated"]);
+    let resolved = ConfigurationResolver::default().resolve(
+        ConfigurationResolutionRequest::new(directory.path())
+            .with_config_path(&config_path)
+            .with_overrides(overrides),
+    )?;
+
+    assert_eq!(
+        resolved.configuration().backup().ignore(),
+        [
+            String::from("cache"),
+            String::from("cli-only"),
+            String::from("shared"),
+            String::from("src/generated"),
+        ]
+        .as_slice()
+    );
+    assert_eq!(
+        resolved
+            .ignore_policy()
+            .pattern_strings()
+            .collect::<Vec<_>>(),
+        ["cache", "cli-only", "shared", "src/generated"]
+    );
+    assert!(resolved.ignore_policy().ignores_git());
+    assert_eq!(
+        resolved
+            .ignore_policy()
+            .decision("src\\generated\\file.rs")?,
+        resolved
+            .backup_ignore_policy()
+            .decision("src/generated/file.rs")?
+    );
+
+    let git_decision = resolved.ignore_policy().decision("nested/.git/HEAD")?;
+    assert!(matches!(git_decision.matched(), Some(IgnoreMatch::GitPath)));
+    assert!(!format!("{git_decision:?}").contains(directory.path().to_string_lossy().as_ref()));
+
+    let included_git = ConfigurationResolver::default().resolve(
+        ConfigurationResolutionRequest::new(directory.path())
+            .with_config_path(&config_path)
+            .with_no_ignore_git(),
+    )?;
+    assert!(included_git.ignore_policy().includes_git());
+    assert!(
+        !included_git
+            .ignore_policy()
+            .decision("nested/.git/HEAD")?
+            .is_ignored()
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_configuration_and_cli_ignore_patterns_fail_request_validation()
+-> Result<(), Box<dyn std::error::Error>> {
+    for pattern in ["/absolute", "a//b", "a/../b", "a:b"] {
+        let contents = format!("version = 1\n[backup]\nignore = [\"{pattern}\"]\n");
+        let error = Configuration::parse(&contents, Path::new("/project"))
+            .expect_err("invalid ignore pattern should be rejected");
+        assert_eq!(error.kind(), ProjectConfigurationErrorKind::InvalidValue);
+        assert_eq!(error.field(), Some("backup.ignore[0]"));
+    }
+
+    let overrides = ConfigurationOverrides::new().with_ignore_rule("../outside");
+    let error = ConfigurationResolver::default()
+        .resolve(
+            ConfigurationResolutionRequest::new(Path::new("/project"))
+                .without_config()
+                .with_overrides(overrides),
+        )
+        .expect_err("invalid CLI ignore pattern should be rejected");
+    assert_eq!(error.kind(), ProjectConfigurationErrorKind::InvalidValue);
+    assert_eq!(error.field(), Some("backup.ignore[0]"));
+    Ok(())
 }
 
 #[test]

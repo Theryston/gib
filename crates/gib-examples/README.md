@@ -43,6 +43,26 @@ For negative checks, replace `complete.toml` with `unknown-field.toml`,
 `unsupported-version.toml`, or `malformed.toml` and inspect the typed error
 context printed by the example.
 
+The filesystem scanner QA example supports the shared Backup/Live ignore
+policy. `scan` prints included entries, while `decide` prints an inclusion or
+ignore reason for one normalized relative path:
+
+```text
+cargo run -p gib-examples --example filesystem_scan_qa -- \
+  scan /path/to/source --ignore node_modules --ignore 'src/*.generated'
+cargo run -p gib-examples --example filesystem_scan_qa -- \
+  scan /path/to/source --config /path/to/gib.toml --ignore cli-only
+cargo run -p gib-examples --example filesystem_scan_qa -- \
+  decide nested/.git/HEAD
+cargo run -p gib-examples --example filesystem_scan_qa -- \
+  decide nested/.git/HEAD --no-ignore-git
+```
+
+`--ignore` may be repeated. A bare name matches at any depth; a path pattern
+is source-root anchored. `--config` loads the file and merges its
+`[backup].ignore` values with the command-line rules. Use
+`--no-ignore-git` to opt into `.git` capture.
+
 The local storage QA example exercises upload, prefix listing, whole-object
 read, range read, deletion, and conditional-writer conflict handling. Its
 `hold-write` mode intentionally slows a large streaming write so it can be

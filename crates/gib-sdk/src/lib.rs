@@ -120,13 +120,15 @@ pub use api::{
 };
 
 pub use api::{
-    Filesystem, FilesystemChangePhase, FilesystemChangeReason, FilesystemClock,
+    DEFAULT_IGNORE_GIT, Filesystem, FilesystemChangePhase, FilesystemChangeReason, FilesystemClock,
     FilesystemDirectory, FilesystemDirectoryEntry, FilesystemEntry, FilesystemEntryError,
     FilesystemEntryKind, FilesystemErrorKind, FilesystemFile, FilesystemIdentity,
     FilesystemMetadata, FilesystemOperation, FilesystemPermissionPolicy, FilesystemScan,
-    FilesystemScanError, FilesystemScanOptions, FilesystemScanner, LocalFilesystem,
-    LocalFilesystemScanner, MAX_FILESYSTEM_SCAN_OPEN_DIRECTORIES, PermissionErrorPolicy,
-    SystemClock, VerifiedFileReader, local_filesystem_scanner,
+    FilesystemScanError, FilesystemScanOptions, FilesystemScanner, IgnoreDecision, IgnoreMatch,
+    IgnorePathError, IgnorePattern, IgnorePatternError, IgnorePolicy, IgnoreReason, IgnoreRule,
+    IgnoreRuleError, LocalFilesystem, LocalFilesystemScanner, MAX_FILESYSTEM_SCAN_OPEN_DIRECTORIES,
+    MAX_IGNORE_RULE_LENGTH, MAX_IGNORE_RULES, PermissionErrorPolicy, SystemClock,
+    VerifiedFileReader, is_git_path, local_filesystem_scanner,
 };
 
 #[cfg(feature = "async")]
