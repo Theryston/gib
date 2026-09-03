@@ -5,7 +5,7 @@ one shared policy for resident memory, CPU permits, filesystem descriptors,
 storage requests, and inter-stage queue capacity:
 
 ```text
-scan -> read -> chunk -> hash -> transform -> tree -> pack -> upload -> index -> publish
+scan -> read -> chunk -> hash -> dedup -> transform -> tree -> pack -> upload -> index -> publish
 ```
 
 The scanner and reader use blocking filesystem adapters on dedicated threads.
@@ -34,6 +34,30 @@ request budget. CPU-heavy work also acquires a shared CPU permit, so a larger
 pool cannot exceed the configured CPU ownership limit. The result exposes
 observed peaks for memory, CPU, descriptors, and network requests, which makes
 resource assertions possible without relying on scheduler timing.
+
+## Content reuse
+
+After hashing, the deduplication stage resolves unique chunk IDs in bounded
+batches. It discovers immutable index objects through paged listings, groups
+queries by their one-byte chunk shard, and retains decoded verified shards in
+the request's configured LRU cache. Index hits are accepted only after the
+referenced pack metadata proves that every recorded range fits in the pack;
+missing packs and malformed indexes fail the backup instead of becoming new
+content. Repeated chunks in the same source are also marked reused, so the
+packer receives only transformed content that is not already available.
+
+Tree nodes are content-addressed. The preflight catalog records existing file,
+symlink, and directory node keys within an explicit bound, allowing unchanged
+Merkle subtrees to skip immutable tree writes. Conditional object creation
+remains the concurrency boundary for publishers that race the catalog view.
+The snapshot publication lists its root tree as a required object, so a missing
+root cannot be committed.
+
+`BackupMetrics` reports `logical_bytes` for source content,
+`new_stored_bytes` for immutable object bytes newly accepted by this run, and
+`reused_bytes` for logical chunk bytes served by existing or earlier-in-run
+content. `uploaded_objects` counts only successful new immutable object
+creates; conditional `AlreadyExists` results are not counted.
 
 The filesystem scanner retains one directory enumerator per active path
 component. Because that adapter owns its private directory-frame collection,
@@ -85,11 +109,13 @@ rules.
 ## Validation and measurement
 
 Focused pipeline tests cover successful publication, observed resource peaks,
-cancellation, typed injected storage failure, slow storage, and slow events.
+cancellation, typed injected storage failure, slow storage, slow events,
+identical snapshots, duplicate files, shifted content, one-leaf tree edits,
+missing packs, corrupt indexes, and a one-shard deduplication cache.
 The one-million-entry stress test is opt-in because it creates a large
-temporary dataset. The standalone benchmark reports throughput and observed
-resource peaks; its dataset size and run count are controlled by environment
-variables.
+temporary dataset. The standalone benchmark performs and reports a cold first
+backup and a warm unchanged incremental backup against the same repository per
+run. Dataset size and run count are controlled by environment variables.
 
 Useful commands from the workspace root:
 

@@ -1,27 +1,31 @@
 use super::filesystem::FilesystemScanner;
-use super::ports::{ObjectKey, ObjectWriteOptions, RepositoryStorage, StorageError};
+use super::ports::{
+    ObjectKey, ObjectListRequest, ObjectPrefix, ObjectWriteOptions, RepositoryStorage,
+    StorageError, read_stream_to_vec,
+};
 use super::repository::{self, HeadRead, RepositoryError};
 use crate::domain::{
-    BackupBudgets, BackupMetrics, BackupResource, BackupStage, CURRENT_OBJECT_ENVELOPE_VERSION,
-    CURRENT_PACK_OBJECT_VERSION, CURRENT_TRANSFORMED_OBJECT_ENVELOPE_VERSION, ChunkId,
-    ChunkingConfiguration, CompressionLevel, DirectoryNode, EntryName, FileChunkReference,
-    FilesystemEntry, FilesystemEntryKind, FilesystemErrorKind, FilesystemMetadata,
-    FilesystemOperation, MAX_FILESYSTEM_SCAN_OPEN_DIRECTORIES, MAX_IMMUTABLE_OBJECT_BYTES,
-    MAX_IMMUTABLE_OBJECT_STORED_PAYLOAD_BYTES, ObjectCodec, ObjectEncryption, ObjectId, ObjectKind,
-    ObjectTransformOptions, PACK_ALIGNMENT, PACK_ENTRY_HEADER_LENGTH, PACK_FOOTER_LENGTH,
-    PACK_HEADER_LENGTH, PACK_INDEX_RECORD_LENGTH, PackConfiguration, PackEntryInput,
-    PackIndexConfiguration, PackIndexEntry, PackIndexShardId, PackIndexTransform, PortableMetadata,
-    RegularFileNode, RepositoryHead, SealedPack, SealedPackIndexShard, Snapshot, SnapshotId,
-    SnapshotPublication, SnapshotReference, SymbolicLinkNode, TreeEntry, TreeNode,
-    TreeNodeReference,
+    BackupBudgets, BackupDeduplicationConfiguration, BackupMetrics, BackupResource, BackupStage,
+    CURRENT_OBJECT_ENVELOPE_VERSION, CURRENT_PACK_OBJECT_VERSION,
+    CURRENT_TRANSFORMED_OBJECT_ENVELOPE_VERSION, ChunkId, ChunkingConfiguration, CompressionLevel,
+    DirectoryNode, EntryName, FileChunkReference, FilesystemEntry, FilesystemEntryKind,
+    FilesystemErrorKind, FilesystemMetadata, FilesystemOperation,
+    MAX_FILESYSTEM_SCAN_OPEN_DIRECTORIES, MAX_IMMUTABLE_OBJECT_BYTES,
+    MAX_IMMUTABLE_OBJECT_STORED_PAYLOAD_BYTES, MAX_PACK_INDEX_SHARD_BYTES, ObjectCodec,
+    ObjectEncryption, ObjectId, ObjectKind, ObjectTransformOptions, PACK_ALIGNMENT,
+    PACK_ENTRY_HEADER_LENGTH, PACK_FOOTER_LENGTH, PACK_HEADER_LENGTH, PACK_INDEX_RECORD_LENGTH,
+    PackConfiguration, PackEntryInput, PackIndexConfiguration, PackIndexEntry, PackIndexId,
+    PackIndexShardId, PackIndexTransform, PortableMetadata, RegularFileNode, RepositoryHead,
+    SealedPack, SealedPackIndexShard, Snapshot, SnapshotId, SnapshotPublication, SnapshotReference,
+    SymbolicLinkNode, TreeEntry, TreeNode, TreeNodeReference,
 };
 use crate::format::{
-    EncryptionContext, PackBuilder as FormatPackBuilder,
-    PackIndexShardBuilder as FormatPackIndexShardBuilder, encode_object_envelope_with_options,
-    encode_snapshot, encode_tree_node_with_id,
+    EncryptionContext, PackBuilder as FormatPackBuilder, PackIndexFormatError,
+    PackIndexShardBuilder as FormatPackIndexShardBuilder, VerifiedPackIndexShard,
+    encode_object_envelope_with_options, encode_snapshot, encode_tree_node_with_id,
 };
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -45,6 +49,7 @@ const TRANSFORM_MEMORY_OVERHEAD: usize = 16 * 1024;
 const INDEX_SPOOL_RECORD_BYTES: usize = PACK_INDEX_RECORD_LENGTH;
 const INDEX_MEMORY_SAFETY_MULTIPLIER: usize = 4;
 const INDEX_SPOOL_DIRECTORY_ATTEMPTS: usize = 16;
+const MAX_DEDUP_PACK_LENGTH_CACHE_ENTRIES: usize = 4_096;
 
 static NEXT_INDEX_SPOOL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -58,6 +63,7 @@ pub(crate) struct BackupRunRequest {
     pub(crate) chunking: ChunkingConfiguration,
     pub(crate) pack: PackConfiguration,
     pub(crate) index: PackIndexConfiguration,
+    pub(crate) deduplication: BackupDeduplicationConfiguration,
     pub(crate) transforms: ObjectTransformOptions,
 }
 
@@ -168,9 +174,26 @@ where
         }
     };
 
+    let catalog = match ExistingContentCatalog::discover(
+        Arc::clone(&storage),
+        request.deduplication,
+        Arc::clone(&memory),
+        Arc::clone(&network_requests),
+        Arc::clone(&file_descriptors),
+        control.clone(),
+    ) {
+        Ok(catalog) => Arc::new(catalog),
+        Err(error) => {
+            progress.close();
+            progress.join();
+            return Err(error);
+        }
+    };
+
     let (scan_tx, scan_rx) = sync_channel(request.budgets.queue_capacity());
     let (read_tx, read_rx) = sync_channel(request.budgets.queue_capacity());
     let (hash_tx, hash_rx) = sync_channel(request.budgets.queue_capacity());
+    let (transform_tx, transform_rx) = sync_channel(request.budgets.queue_capacity());
     let (tree_tx, tree_rx) = sync_channel(request.budgets.queue_capacity());
     let (pack_tx, pack_rx) = sync_channel(request.budgets.queue_capacity());
     let (upload_tx, upload_rx) = sync_channel(request.budgets.queue_capacity());
@@ -180,6 +203,7 @@ where
     let scan_rx = Arc::new(Mutex::new(scan_rx));
     let read_rx = Arc::new(Mutex::new(read_rx));
     let hash_rx = Arc::new(Mutex::new(hash_rx));
+    let transform_rx = Arc::new(Mutex::new(transform_rx));
     let tree_rx = Arc::new(Mutex::new(tree_rx));
     let pack_rx = Arc::new(Mutex::new(pack_rx));
     let upload_rx = Arc::new(Mutex::new(upload_rx));
@@ -224,6 +248,7 @@ where
         let storage = Arc::clone(&storage);
         let network_requests = Arc::clone(&network_requests);
         let file_descriptors = Arc::clone(&file_descriptors);
+        let catalog = Arc::clone(&catalog);
         let metrics = Arc::clone(&metrics);
         let progress = progress.clone();
         let worker = UploadWorker {
@@ -235,6 +260,7 @@ where
                 file_descriptors,
                 control: control.clone(),
             },
+            tree_catalog: catalog,
             metrics,
             progress,
         };
@@ -315,10 +341,46 @@ where
     }
 
     let transform_workers = plan.transform_workers;
+    {
+        let control = control.clone();
+        let worker_control = control.clone();
+        let dedup_storage = Arc::clone(&storage);
+        let hash_rx = Arc::clone(&hash_rx);
+        let transform_tx = transform_tx.clone();
+        let catalog = Arc::clone(&catalog);
+        let memory = Arc::clone(&memory);
+        let network_requests = Arc::clone(&network_requests);
+        let file_descriptors = Arc::clone(&file_descriptors);
+        let metrics = Arc::clone(&metrics);
+        let progress = progress.clone();
+        let deduplication = request.deduplication;
+        spawn_stage(
+            &mut handles,
+            "gib-backup-dedup",
+            BackupStage::Dedup,
+            move || {
+                run_dedup_worker(
+                    dedup_storage,
+                    hash_rx,
+                    transform_tx,
+                    catalog,
+                    memory,
+                    network_requests,
+                    file_descriptors,
+                    worker_control,
+                    metrics,
+                    progress,
+                    deduplication,
+                );
+            },
+            &control,
+        )?;
+    }
+
     for worker_id in 0..transform_workers {
         let control = control.clone();
         let worker_control = control.clone();
-        let hash_rx = Arc::clone(&hash_rx);
+        let transform_rx = Arc::clone(&transform_rx);
         let tree_tx = tree_tx.clone();
         let memory = Arc::clone(&memory);
         let cpu_workers = Arc::clone(&cpu_workers);
@@ -332,7 +394,7 @@ where
             BackupStage::Transform,
             move || {
                 run_transform_worker(
-                    hash_rx,
+                    transform_rx,
                     tree_tx,
                     memory,
                     cpu_workers,
@@ -445,6 +507,7 @@ where
 
     drop(read_tx);
     drop(hash_tx);
+    drop(transform_tx);
     drop(tree_tx);
     drop(pack_tx);
     drop(index_tx);
@@ -499,7 +562,9 @@ where
             stage: BackupStage::Publish,
         }
     })?;
-    snapshot = snapshot.with_parent(parent).with_root_tree(root_object);
+    snapshot = snapshot
+        .with_parent(parent)
+        .with_root_tree(root_object.clone());
     if let Some(author) = request.author {
         snapshot = snapshot
             .with_author(author)
@@ -537,12 +602,18 @@ where
         file_descriptors: Arc::clone(&file_descriptors),
         control: control.clone(),
     };
-    uploader.upload(
+    let snapshot_upload = uploader.upload(
         BackupStage::Publish,
         "snapshot",
         snapshot_reference.as_str(),
         &snapshot_bytes,
     )?;
+    if snapshot_upload.newly_stored {
+        metrics.uploaded_objects.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .new_stored_bytes
+            .fetch_add(snapshot_upload.stored_bytes, Ordering::Relaxed);
+    }
     drop(snapshot_memory);
     control.check()?;
 
@@ -568,7 +639,10 @@ where
     repository::publish_head(
         storage.as_ref(),
         &head,
-        &SnapshotPublication::new(snapshot_reference.clone()),
+        &SnapshotPublication::with_required_objects(
+            snapshot_reference.clone(),
+            [root_object.clone()],
+        ),
         Some(&cancelled),
     )
     .map_err(|error| map_repository_error(BackupStage::Publish, error))?;
@@ -776,6 +850,36 @@ impl ResourceBudget {
         }
     }
 
+    fn try_reserve(
+        self: &Arc<Self>,
+        amount: usize,
+        stage: BackupStage,
+    ) -> Result<MemoryPermit, BackupError> {
+        if amount > self.limit {
+            return Err(BackupError::Budget {
+                stage,
+                resource: BackupResource::Memory,
+                requested: amount,
+                limit: self.limit,
+            });
+        }
+        let mut state = lock_or_recover(&self.state);
+        if self.limit.saturating_sub(state.used) < amount {
+            return Err(BackupError::Budget {
+                stage,
+                resource: BackupResource::Memory,
+                requested: amount,
+                limit: self.limit,
+            });
+        }
+        state.used = state.used.saturating_add(amount);
+        update_peak(&self.peak, state.used);
+        Ok(MemoryPermit {
+            budget: Arc::clone(self),
+            amount,
+        })
+    }
+
     fn release(&self, amount: usize) {
         let mut state = lock_or_recover(&self.state);
         state.used = state.used.saturating_sub(amount);
@@ -881,6 +985,9 @@ struct MetricsState {
     packs: AtomicU64,
     index_shards: AtomicU64,
     uploaded_objects: AtomicU64,
+    logical_bytes: AtomicU64,
+    new_stored_bytes: AtomicU64,
+    reused_bytes: AtomicU64,
     hash_active: AtomicUsize,
     hash_peak: AtomicUsize,
     transform_active: AtomicUsize,
@@ -901,6 +1008,9 @@ impl MetricsState {
             self.directories.load(Ordering::Acquire),
             self.bytes_read.load(Ordering::Acquire),
             self.total_size.load(Ordering::Acquire),
+            self.logical_bytes.load(Ordering::Acquire),
+            self.new_stored_bytes.load(Ordering::Acquire),
+            self.reused_bytes.load(Ordering::Acquire),
             self.chunks.load(Ordering::Acquire),
             self.transformed_chunks.load(Ordering::Acquire),
             self.packs.load(Ordering::Acquire),
@@ -997,6 +1107,7 @@ enum ReadMessage {
         plaintext_length: u64,
         bytes: Vec<u8>,
         memory: MemoryPermit,
+        reused: bool,
     },
     FileEnd {
         sequence: u64,
@@ -1014,8 +1125,10 @@ enum TreeMessage {
     Chunk {
         sequence: u64,
         ordinal: u64,
-        entry: PackEntryInput,
-        memory: MemoryPermit,
+        id: ChunkId,
+        plaintext_length: u64,
+        entry: Option<PackEntryInput>,
+        memory: Option<MemoryPermit>,
     },
     FileEnd {
         sequence: u64,
@@ -1077,12 +1190,18 @@ struct DirectoryAccumulator {
 
 struct TreeSequenceState {
     entry: Option<EntryMessage>,
-    pending_chunks: BTreeMap<u64, (PackEntryInput, MemoryPermit)>,
+    pending_chunks: BTreeMap<u64, (ChunkCandidate, Option<MemoryPermit>)>,
     references: Vec<FileChunkReference>,
     reference_memory: Option<MemoryPermit>,
     next_ordinal: u64,
     file_end: Option<u64>,
     completed: bool,
+}
+
+struct ChunkCandidate {
+    id: ChunkId,
+    plaintext_length: u64,
+    entry: Option<PackEntryInput>,
 }
 
 impl TreeSequenceState {
@@ -1244,6 +1363,9 @@ fn run_scan_worker<F, C>(
             }
             FilesystemEntryKind::RegularFile => {
                 metrics.files.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .logical_bytes
+                    .fetch_add(entry.metadata().size(), Ordering::Relaxed);
                 metrics
                     .total_size
                     .fetch_add(entry.metadata().size(), Ordering::Relaxed);
@@ -1490,6 +1612,7 @@ fn run_read_worker<F, C>(
                             plaintext_length,
                             bytes,
                             memory: chunk_memory,
+                            reused: false,
                         },
                         &control,
                     )
@@ -1560,6 +1683,7 @@ fn run_hash_worker(
                 plaintext_length,
                 bytes,
                 memory,
+                reused,
             } => {
                 let calculated = {
                     let _cpu = match UnitPermit::acquire(
@@ -1597,6 +1721,7 @@ fn run_hash_worker(
                         plaintext_length,
                         bytes,
                         memory,
+                        reused,
                     },
                     &control,
                 )
@@ -1613,6 +1738,720 @@ fn run_hash_worker(
             }
         }
     }
+}
+
+struct ExistingContentCatalog {
+    index_keys: Vec<ObjectKey>,
+    tree_keys: HashSet<String>,
+    _memory: MemoryPermit,
+}
+
+enum CatalogListResult {
+    Unsupported,
+    Keys(Vec<ObjectKey>),
+}
+
+impl ExistingContentCatalog {
+    fn discover(
+        storage: Arc<dyn RepositoryStorage>,
+        configuration: BackupDeduplicationConfiguration,
+        memory: Arc<ResourceBudget>,
+        network_requests: Arc<ResourceBudget>,
+        file_descriptors: Arc<ResourceBudget>,
+        control: PipelineControl,
+    ) -> Result<Self, BackupError> {
+        let mut catalog_memory = memory.reserve(0, &control, BackupStage::Dedup)?;
+        let index_keys = match list_catalog_keys(
+            storage.as_ref(),
+            "indexes",
+            configuration.catalog_entries(),
+            &mut catalog_memory,
+            &network_requests,
+            &file_descriptors,
+            &control,
+            is_pack_index_key,
+        )? {
+            CatalogListResult::Unsupported => Vec::new(),
+            CatalogListResult::Keys(keys) => keys,
+        };
+        let tree_keys = match list_catalog_keys(
+            storage.as_ref(),
+            "trees",
+            configuration.catalog_entries(),
+            &mut catalog_memory,
+            &network_requests,
+            &file_descriptors,
+            &control,
+            is_tree_object_key,
+        )? {
+            CatalogListResult::Unsupported => HashSet::new(),
+            CatalogListResult::Keys(keys) => {
+                let mut tree_keys = HashSet::new();
+                let additional = keys.len().saturating_mul(
+                    std::mem::size_of::<String>()
+                        .saturating_add(std::mem::size_of::<usize>())
+                        .saturating_add(32),
+                );
+                catalog_memory.grow(additional, &control, BackupStage::Dedup)?;
+                if tree_keys.try_reserve(keys.len()).is_err() {
+                    return Err(BackupError::Format {
+                        stage: BackupStage::Dedup,
+                    });
+                }
+                for key in keys {
+                    tree_keys.insert(key.into_string());
+                }
+                tree_keys
+            }
+        };
+        Ok(Self {
+            index_keys,
+            tree_keys,
+            _memory: catalog_memory,
+        })
+    }
+
+    fn contains_tree(&self, key: &str) -> bool {
+        self.tree_keys.contains(key)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn list_catalog_keys(
+    storage: &dyn RepositoryStorage,
+    prefix: &str,
+    maximum: usize,
+    catalog_memory: &mut MemoryPermit,
+    network_requests: &Arc<ResourceBudget>,
+    file_descriptors: &Arc<ResourceBudget>,
+    control: &PipelineControl,
+    include: fn(&str) -> bool,
+) -> Result<CatalogListResult, BackupError> {
+    let prefix = ObjectPrefix::new(prefix.to_owned()).map_err(|_| BackupError::Invalid {
+        stage: BackupStage::Dedup,
+    })?;
+    let mut request = ObjectListRequest::new(prefix);
+    let mut keys = Vec::new();
+    loop {
+        control.check()?;
+        let page = {
+            let _network = UnitPermit::acquire(
+                network_requests,
+                control,
+                BackupStage::Dedup,
+                BackupResource::NetworkRequests,
+            )?;
+            let _descriptor = UnitPermit::acquire(
+                file_descriptors,
+                control,
+                BackupStage::Dedup,
+                BackupResource::FileDescriptors,
+            )?;
+            match storage.list_page(&request) {
+                Ok(page) => page,
+                Err(StorageError::UnsupportedCapability) => {
+                    return Ok(CatalogListResult::Unsupported);
+                }
+                Err(StorageError::NotFound) => return Ok(CatalogListResult::Keys(keys)),
+                Err(error) => {
+                    return Err(map_catalog_storage_error(error, "list_existing_objects"));
+                }
+            }
+        };
+        let (objects, next_cursor) = page.into_parts();
+        for object in objects {
+            let key = object.key().clone();
+            if !include(key.as_str()) {
+                continue;
+            }
+            if keys.len() >= maximum {
+                return Err(BackupError::Budget {
+                    stage: BackupStage::Dedup,
+                    resource: BackupResource::Memory,
+                    requested: keys.len().saturating_add(1),
+                    limit: maximum,
+                });
+            }
+            let additional = key
+                .as_str()
+                .len()
+                .saturating_add(std::mem::size_of::<ObjectKey>())
+                .saturating_add(64);
+            catalog_memory.grow(additional, control, BackupStage::Dedup)?;
+            if keys.try_reserve(1).is_err() {
+                return Err(BackupError::Format {
+                    stage: BackupStage::Dedup,
+                });
+            }
+            keys.push(key);
+        }
+        let Some(cursor) = next_cursor else {
+            return Ok(CatalogListResult::Keys(keys));
+        };
+        request = request.with_cursor(cursor);
+    }
+}
+
+fn is_pack_index_key(key: &str) -> bool {
+    let mut components = key.split('/');
+    match (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) {
+        (Some("indexes"), Some(id), None, None) => PackIndexId::from_hex(id).is_ok(),
+        (Some("indexes"), Some("pack-v1"), Some(shard), None) => {
+            shard.len() == 2 && shard.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }
+        _ => false,
+    }
+}
+
+fn is_tree_object_key(key: &str) -> bool {
+    key.strip_prefix("trees/")
+        .is_some_and(|id| ObjectId::from_hex(id).is_ok())
+}
+
+fn map_catalog_storage_error(error: StorageError, operation: &'static str) -> BackupError {
+    match error {
+        StorageError::UnsupportedCapability => BackupError::Repository {
+            stage: BackupStage::Dedup,
+            failure: BackupRepositoryFailure::UnsupportedCapability,
+        },
+        StorageError::NotFound => BackupError::Repository {
+            stage: BackupStage::Dedup,
+            failure: BackupRepositoryFailure::RequiredObjectMissing,
+        },
+        StorageError::Cancelled => BackupError::Cancelled,
+        other => BackupError::Storage {
+            stage: BackupStage::Dedup,
+            operation,
+            error: other,
+        },
+    }
+}
+
+struct DedupChunk {
+    sequence: u64,
+    ordinal: u64,
+    id: ChunkId,
+    plaintext_length: u64,
+    bytes: Vec<u8>,
+    memory: MemoryPermit,
+}
+
+struct CachedIndexShard {
+    shard: Arc<VerifiedPackIndexShard>,
+    _memory: MemoryPermit,
+    weight: usize,
+    last_used: u64,
+}
+
+struct LoadedIndexShard {
+    shard: Arc<VerifiedPackIndexShard>,
+    _transient_memory: Option<MemoryPermit>,
+}
+
+struct CachedPackLength {
+    length: u64,
+    last_used: u64,
+}
+
+struct ChunkDeduplicator {
+    storage: Arc<dyn RepositoryStorage>,
+    catalog: Arc<ExistingContentCatalog>,
+    configuration: BackupDeduplicationConfiguration,
+    memory: Arc<ResourceBudget>,
+    network_requests: Arc<ResourceBudget>,
+    file_descriptors: Arc<ResourceBudget>,
+    control: PipelineControl,
+    seen_chunks: HashSet<ChunkId>,
+    seen_memory: MemoryPermit,
+    index_cache: HashMap<ObjectKey, CachedIndexShard>,
+    index_cache_bytes: usize,
+    cache_clock: u64,
+    pack_lengths: HashMap<crate::domain::PackId, CachedPackLength>,
+}
+
+impl ChunkDeduplicator {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        storage: Arc<dyn RepositoryStorage>,
+        catalog: Arc<ExistingContentCatalog>,
+        configuration: BackupDeduplicationConfiguration,
+        memory: Arc<ResourceBudget>,
+        network_requests: Arc<ResourceBudget>,
+        file_descriptors: Arc<ResourceBudget>,
+        control: PipelineControl,
+    ) -> Result<Self, BackupError> {
+        let seen_memory = memory.reserve(0, &control, BackupStage::Dedup)?;
+        Ok(Self {
+            storage,
+            catalog,
+            configuration,
+            memory,
+            network_requests,
+            file_descriptors,
+            control,
+            seen_chunks: HashSet::new(),
+            seen_memory,
+            index_cache: HashMap::new(),
+            index_cache_bytes: 0,
+            cache_clock: 0,
+            pack_lengths: HashMap::new(),
+        })
+    }
+
+    fn lookup_batch(
+        &mut self,
+        chunk_ids: &[ChunkId],
+    ) -> Result<HashMap<ChunkId, PackIndexEntry>, BackupError> {
+        if chunk_ids.is_empty() || self.catalog.index_keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut by_shard: BTreeMap<PackIndexShardId, Vec<ChunkId>> = BTreeMap::new();
+        for chunk_id in chunk_ids {
+            by_shard
+                .entry(PackIndexShardId::from_chunk_id(*chunk_id))
+                .or_default()
+                .push(*chunk_id);
+        }
+        let wanted = chunk_ids.len();
+        let mut found = HashMap::new();
+        for index_position in 0..self.catalog.index_keys.len() {
+            let key = self.catalog.index_keys[index_position].clone();
+            let loaded = self.load_index_shard(&key)?;
+            let shard_id = loaded.shard.metadata().shard_id();
+            if let Some(ids) = by_shard.get(&shard_id) {
+                for chunk_id in ids {
+                    if found.contains_key(chunk_id) {
+                        continue;
+                    }
+                    if let Some(entry) = loaded.shard.lookup(*chunk_id) {
+                        found.insert(*chunk_id, entry);
+                    }
+                }
+            }
+            drop(loaded);
+            if found.len() == wanted {
+                break;
+            }
+        }
+        for entry in found.values() {
+            self.verify_existing_entry(*entry)?;
+        }
+        Ok(found)
+    }
+
+    fn mark_seen(&mut self, chunk_id: ChunkId) -> Result<bool, BackupError> {
+        if self.seen_chunks.contains(&chunk_id) {
+            return Ok(false);
+        }
+        self.seen_memory.grow(
+            std::mem::size_of::<ChunkId>().saturating_add(32),
+            &self.control,
+            BackupStage::Dedup,
+        )?;
+        if self.seen_chunks.try_reserve(1).is_err() {
+            return Err(BackupError::Format {
+                stage: BackupStage::Dedup,
+            });
+        }
+        self.seen_chunks.insert(chunk_id);
+        Ok(true)
+    }
+
+    fn load_index_shard(&mut self, key: &ObjectKey) -> Result<LoadedIndexShard, BackupError> {
+        if let Some(shard) = self.cached_index_shard(key) {
+            return Ok(LoadedIndexShard {
+                shard,
+                _transient_memory: None,
+            });
+        }
+        let (bytes, shard_memory) = self.read_index_shard(key)?;
+        let shard = VerifiedPackIndexShard::new(&bytes).map_err(map_index_format_error)?;
+        let shard = Arc::new(shard);
+        let weight = shard.estimated_memory().saturating_add(key.as_str().len());
+        if weight <= self.configuration.index_cache().max_bytes() {
+            match self.cache_index_shard(key.clone(), Arc::clone(&shard), shard_memory, weight) {
+                Ok(()) => {
+                    return Ok(LoadedIndexShard {
+                        shard,
+                        _transient_memory: None,
+                    });
+                }
+                Err(shard_memory) => {
+                    return Ok(LoadedIndexShard {
+                        shard,
+                        _transient_memory: Some(shard_memory),
+                    });
+                }
+            }
+        }
+        Ok(LoadedIndexShard {
+            shard,
+            _transient_memory: Some(shard_memory),
+        })
+    }
+
+    fn cached_index_shard(&mut self, key: &ObjectKey) -> Option<Arc<VerifiedPackIndexShard>> {
+        let last_used = self.next_cache_clock();
+        let cached = self.index_cache.get_mut(key)?;
+        cached.last_used = last_used;
+        Some(Arc::clone(&cached.shard))
+    }
+
+    fn cache_index_shard(
+        &mut self,
+        key: ObjectKey,
+        shard: Arc<VerifiedPackIndexShard>,
+        memory: MemoryPermit,
+        weight: usize,
+    ) -> Result<(), MemoryPermit> {
+        let configuration = self.configuration.index_cache();
+        while self.index_cache_bytes.saturating_add(weight) > configuration.max_bytes()
+            || self.index_cache.len() >= configuration.max_shards()
+        {
+            let Some(oldest) = self
+                .index_cache
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                return Err(memory);
+            };
+            if let Some(removed) = self.index_cache.remove(&oldest) {
+                self.index_cache_bytes = self.index_cache_bytes.saturating_sub(removed.weight);
+            }
+        }
+        let last_used = self.next_cache_clock();
+        self.index_cache_bytes = self.index_cache_bytes.saturating_add(weight);
+        self.index_cache.insert(
+            key,
+            CachedIndexShard {
+                shard,
+                _memory: memory,
+                weight,
+                last_used,
+            },
+        );
+        Ok(())
+    }
+
+    fn verify_existing_entry(&mut self, entry: PackIndexEntry) -> Result<(), BackupError> {
+        if entry.logical_length() == 0 {
+            return Err(BackupError::Repository {
+                stage: BackupStage::Dedup,
+                failure: BackupRepositoryFailure::Malformed,
+            });
+        }
+        let pack_id = entry.pack_id();
+        let length =
+            if let Some(length) = self.pack_lengths.get(&pack_id).map(|cached| cached.length) {
+                let last_used = self.next_cache_clock();
+                if let Some(cached) = self.pack_lengths.get_mut(&pack_id) {
+                    cached.last_used = last_used;
+                }
+                length
+            } else {
+                let key = ObjectKey::new(format!("packs/{}", pack_id.as_hex())).map_err(|_| {
+                    BackupError::Repository {
+                        stage: BackupStage::Dedup,
+                        failure: BackupRepositoryFailure::Malformed,
+                    }
+                })?;
+                let metadata = self.read_metadata(&key, "read_pack_metadata")?;
+                let length = metadata.size();
+                if entry.validate_against_pack_length(length).is_err() {
+                    return Err(BackupError::Repository {
+                        stage: BackupStage::Dedup,
+                        failure: BackupRepositoryFailure::Malformed,
+                    });
+                }
+                let last_used = self.next_cache_clock();
+                self.pack_lengths
+                    .insert(pack_id, CachedPackLength { length, last_used });
+                let limit = self
+                    .configuration
+                    .index_cache()
+                    .max_shards()
+                    .saturating_mul(4)
+                    .clamp(1, MAX_DEDUP_PACK_LENGTH_CACHE_ENTRIES);
+                while self.pack_lengths.len() > limit {
+                    let Some(oldest) = self
+                        .pack_lengths
+                        .iter()
+                        .min_by_key(|(_, cached)| cached.last_used)
+                        .map(|(id, _)| *id)
+                    else {
+                        break;
+                    };
+                    self.pack_lengths.remove(&oldest);
+                }
+                length
+            };
+        if entry.validate_against_pack_length(length).is_err() {
+            return Err(BackupError::Repository {
+                stage: BackupStage::Dedup,
+                failure: BackupRepositoryFailure::Malformed,
+            });
+        }
+        Ok(())
+    }
+
+    fn read_index_shard(&self, key: &ObjectKey) -> Result<(Vec<u8>, MemoryPermit), BackupError> {
+        let _network = UnitPermit::acquire(
+            &self.network_requests,
+            &self.control,
+            BackupStage::Dedup,
+            BackupResource::NetworkRequests,
+        )?;
+        let _descriptor = UnitPermit::acquire(
+            &self.file_descriptors,
+            &self.control,
+            BackupStage::Dedup,
+            BackupResource::FileDescriptors,
+        )?;
+        let mut object = self
+            .storage
+            .read_stream(key)
+            .map_err(|error| map_catalog_storage_error(error, "read_pack_index"))?;
+        let size = object.metadata().size();
+        if size > MAX_PACK_INDEX_SHARD_BYTES {
+            return Err(BackupError::Repository {
+                stage: BackupStage::Dedup,
+                failure: BackupRepositoryFailure::Malformed,
+            });
+        }
+        let size_usize = usize::try_from(size).map_err(|_| BackupError::Repository {
+            stage: BackupStage::Dedup,
+            failure: BackupRepositoryFailure::Malformed,
+        })?;
+        let reserve_size = size_usize
+            .saturating_mul(INDEX_MEMORY_SAFETY_MULTIPLIER)
+            .max(size_usize);
+        let shard_memory = self.memory.try_reserve(reserve_size, BackupStage::Dedup)?;
+        let bytes = read_stream_to_vec(object.reader(), Some(size))
+            .map_err(|error| map_catalog_storage_error(error, "read_pack_index"))?;
+        Ok((bytes, shard_memory))
+    }
+
+    fn read_metadata(
+        &self,
+        key: &ObjectKey,
+        operation: &'static str,
+    ) -> Result<crate::application::ports::ObjectMetadata, BackupError> {
+        let _network = UnitPermit::acquire(
+            &self.network_requests,
+            &self.control,
+            BackupStage::Dedup,
+            BackupResource::NetworkRequests,
+        )?;
+        let _descriptor = UnitPermit::acquire(
+            &self.file_descriptors,
+            &self.control,
+            BackupStage::Dedup,
+            BackupResource::FileDescriptors,
+        )?;
+        self.storage.metadata(key).map_err(|error| match error {
+            StorageError::NotFound => BackupError::Repository {
+                stage: BackupStage::Dedup,
+                failure: BackupRepositoryFailure::RequiredObjectMissing,
+            },
+            StorageError::UnsupportedCapability => BackupError::Repository {
+                stage: BackupStage::Dedup,
+                failure: BackupRepositoryFailure::UnsupportedCapability,
+            },
+            StorageError::Cancelled => BackupError::Cancelled,
+            other => BackupError::Storage {
+                stage: BackupStage::Dedup,
+                operation,
+                error: other,
+            },
+        })
+    }
+
+    fn next_cache_clock(&mut self) -> u64 {
+        self.cache_clock = self.cache_clock.saturating_add(1);
+        self.cache_clock
+    }
+}
+
+fn map_index_format_error(error: PackIndexFormatError) -> BackupError {
+    match error {
+        PackIndexFormatError::UnsupportedVersion { version } => BackupError::Repository {
+            stage: BackupStage::Dedup,
+            failure: BackupRepositoryFailure::UnsupportedVersion { version },
+        },
+        _ => BackupError::Repository {
+            stage: BackupStage::Dedup,
+            failure: BackupRepositoryFailure::Malformed,
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_dedup_worker(
+    storage: Arc<dyn RepositoryStorage>,
+    receiver: Arc<Mutex<Receiver<ReadMessage>>>,
+    sender: SyncSender<ReadMessage>,
+    catalog: Arc<ExistingContentCatalog>,
+    memory: Arc<ResourceBudget>,
+    network_requests: Arc<ResourceBudget>,
+    file_descriptors: Arc<ResourceBudget>,
+    control: PipelineControl,
+    metrics: Arc<MetricsState>,
+    progress: ProgressReporter,
+    configuration: BackupDeduplicationConfiguration,
+) {
+    let mut deduplicator = match ChunkDeduplicator::new(
+        storage,
+        catalog,
+        configuration,
+        memory,
+        network_requests,
+        file_descriptors,
+        control.clone(),
+    ) {
+        Ok(deduplicator) => deduplicator,
+        Err(error) => {
+            control.fail(error);
+            return;
+        }
+    };
+    loop {
+        let Some(message) = receive_message(&receiver, &control) else {
+            return;
+        };
+        match message {
+            ReadMessage::Chunk {
+                sequence,
+                ordinal,
+                id,
+                plaintext_length,
+                bytes,
+                memory,
+                ..
+            } => {
+                let mut batch = Vec::with_capacity(configuration.batch_size());
+                batch.push(DedupChunk {
+                    sequence,
+                    ordinal,
+                    id,
+                    plaintext_length,
+                    bytes,
+                    memory,
+                });
+                while batch.len() < configuration.batch_size() {
+                    let next = match try_receive_message(&receiver) {
+                        Ok(next) => next,
+                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                    };
+                    match next {
+                        ReadMessage::Chunk {
+                            sequence,
+                            ordinal,
+                            id,
+                            plaintext_length,
+                            bytes,
+                            memory,
+                            ..
+                        } => batch.push(DedupChunk {
+                            sequence,
+                            ordinal,
+                            id,
+                            plaintext_length,
+                            bytes,
+                            memory,
+                        }),
+                        other => {
+                            if send_message(&sender, other, &control).is_err() {
+                                return;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if process_dedup_batch(&mut deduplicator, batch, &sender, &metrics, &progress)
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            other => {
+                if send_message(&sender, other, &control).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn process_dedup_batch(
+    deduplicator: &mut ChunkDeduplicator,
+    batch: Vec<DedupChunk>,
+    sender: &SyncSender<ReadMessage>,
+    metrics: &MetricsState,
+    progress: &ProgressReporter,
+) -> Result<(), ()> {
+    let mut candidates = Vec::new();
+    let mut candidate_ids = HashSet::new();
+    for chunk in &batch {
+        if !deduplicator.seen_chunks.contains(&chunk.id) && candidate_ids.insert(chunk.id) {
+            candidates.push(chunk.id);
+        }
+    }
+    let known = match deduplicator.lookup_batch(&candidates) {
+        Ok(known) => known,
+        Err(error) => {
+            deduplicator.control.fail(error);
+            return Err(());
+        }
+    };
+    for chunk in batch {
+        let DedupChunk {
+            sequence,
+            ordinal,
+            id,
+            plaintext_length,
+            bytes: original_bytes,
+            memory,
+        } = chunk;
+        let first_occurrence = match deduplicator.mark_seen(id) {
+            Ok(first_occurrence) => first_occurrence,
+            Err(error) => {
+                deduplicator.control.fail(error);
+                return Err(());
+            }
+        };
+        let reused = !first_occurrence || known.contains_key(&id);
+        if reused {
+            metrics
+                .reused_bytes
+                .fetch_add(plaintext_length, Ordering::Relaxed);
+        }
+        let bytes = if reused { Vec::new() } else { original_bytes };
+        if send_message(
+            sender,
+            ReadMessage::Chunk {
+                sequence,
+                ordinal,
+                id,
+                plaintext_length,
+                bytes,
+                memory,
+                reused,
+            },
+            &deduplicator.control,
+        )
+        .is_err()
+        {
+            return Err(());
+        }
+        progress.emit(1);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1639,7 +2478,29 @@ fn run_transform_worker(
                 plaintext_length,
                 bytes,
                 memory: input_memory,
+                reused,
             } => {
+                if reused {
+                    drop(input_memory);
+                    if send_message(
+                        &sender,
+                        TreeMessage::Chunk {
+                            sequence,
+                            ordinal,
+                            id,
+                            plaintext_length,
+                            entry: None,
+                            memory: None,
+                        },
+                        &control,
+                    )
+                    .is_err()
+                    {
+                        return;
+                    }
+                    progress.emit(1);
+                    continue;
+                }
                 let output_bound = transform_bound(bytes.len(), transforms);
                 let mut output_memory =
                     match memory.reserve(output_bound, &control, BackupStage::Transform) {
@@ -1725,8 +2586,10 @@ fn run_transform_worker(
                     TreeMessage::Chunk {
                         sequence,
                         ordinal,
-                        entry,
-                        memory: output_memory,
+                        id,
+                        plaintext_length,
+                        entry: Some(entry),
+                        memory: Some(output_memory),
                     },
                     &control,
                 )
@@ -1971,6 +2834,8 @@ fn consume_tree_message(
         }
         TreeMessage::Chunk {
             ordinal,
+            id,
+            plaintext_length,
             entry,
             memory,
             ..
@@ -1987,7 +2852,17 @@ fn consume_tree_message(
             }
             if state
                 .pending_chunks
-                .insert(ordinal, (entry, memory))
+                .insert(
+                    ordinal,
+                    (
+                        ChunkCandidate {
+                            id,
+                            plaintext_length,
+                            entry,
+                        },
+                        memory,
+                    ),
+                )
                 .is_some()
             {
                 context.control.fail(BackupError::Invalid {
@@ -2031,10 +2906,10 @@ fn consume_tree_message(
 fn flush_tree_chunks(state: &mut TreeSequenceState, context: &TreeStageContext) -> Result<(), ()> {
     loop {
         let ordinal = state.next_ordinal;
-        let Some((entry, memory)) = state.pending_chunks.remove(&ordinal) else {
+        let Some((candidate, memory)) = state.pending_chunks.remove(&ordinal) else {
             break;
         };
-        let reference = match FileChunkReference::new(entry.chunk_id(), entry.plaintext_length()) {
+        let reference = match FileChunkReference::new(candidate.id, candidate.plaintext_length) {
             Ok(reference) => reference,
             Err(_) => {
                 context.control.fail(BackupError::Invalid {
@@ -2043,14 +2918,24 @@ fn flush_tree_chunks(state: &mut TreeSequenceState, context: &TreeStageContext) 
                 return Err(());
             }
         };
-        if send_message(
-            &context.pack_sender,
-            PackMessage { entry, memory },
-            &context.control,
-        )
-        .is_err()
-        {
-            return Err(());
+        if let Some(entry) = candidate.entry {
+            let Some(memory) = memory else {
+                context.control.fail(BackupError::Thread {
+                    stage: BackupStage::Pack,
+                });
+                return Err(());
+            };
+            if send_message(
+                &context.pack_sender,
+                PackMessage { entry, memory },
+                &context.control,
+            )
+            .is_err()
+            {
+                return Err(());
+            }
+        } else {
+            drop(memory);
         }
         if state.reference_memory.is_none() {
             let permit = match context
@@ -2753,6 +3638,11 @@ struct ImmutableObjectUploader {
     control: PipelineControl,
 }
 
+struct UploadOutcome {
+    newly_stored: bool,
+    stored_bytes: u64,
+}
+
 impl ImmutableObjectUploader {
     fn upload(
         &self,
@@ -2760,7 +3650,7 @@ impl ImmutableObjectUploader {
         operation: &'static str,
         key: &str,
         bytes: &[u8],
-    ) -> Result<(), BackupError> {
+    ) -> Result<UploadOutcome, BackupError> {
         let _network = UnitPermit::acquire(
             &self.network_requests,
             &self.control,
@@ -2786,7 +3676,14 @@ impl ImmutableObjectUploader {
             ObjectWriteOptions::if_absent().with_expected_size(bytes.len() as u64),
             &is_cancelled,
         ) {
-            Ok(_) | Err(StorageError::AlreadyExists) => Ok(()),
+            Ok(metadata) => Ok(UploadOutcome {
+                newly_stored: true,
+                stored_bytes: metadata.size(),
+            }),
+            Err(StorageError::AlreadyExists) => Ok(UploadOutcome {
+                newly_stored: false,
+                stored_bytes: 0,
+            }),
             Err(StorageError::Cancelled) => Err(BackupError::Cancelled),
             Err(error) => Err(BackupError::Storage {
                 stage,
@@ -2801,6 +3698,7 @@ struct UploadWorker {
     receiver: Arc<Mutex<Receiver<UploadWork>>>,
     index_sender: SyncSender<IndexMessage>,
     uploader: ImmutableObjectUploader,
+    tree_catalog: Arc<ExistingContentCatalog>,
     metrics: Arc<MetricsState>,
     progress: ProgressReporter,
 }
@@ -2810,6 +3708,7 @@ fn run_upload_worker(worker: UploadWorker) {
         receiver,
         index_sender,
         uploader,
+        tree_catalog,
         metrics,
         progress,
     } = worker;
@@ -2820,17 +3719,23 @@ fn run_upload_worker(worker: UploadWorker) {
         };
         match work {
             UploadWork::Tree { id, bytes, memory } => {
-                if let Err(error) = uploader.upload(
-                    BackupStage::Upload,
-                    "tree",
-                    &format!("trees/{}", id.as_str()),
-                    &bytes,
-                ) {
-                    drop(memory);
-                    control.fail(error);
-                    return;
+                let key = format!("trees/{}", id.as_str());
+                if !tree_catalog.contains_tree(&key) {
+                    match uploader.upload(BackupStage::Upload, "tree", &key, &bytes) {
+                        Ok(outcome) if outcome.newly_stored => {
+                            metrics.uploaded_objects.fetch_add(1, Ordering::Relaxed);
+                            metrics
+                                .new_stored_bytes
+                                .fetch_add(outcome.stored_bytes, Ordering::Relaxed);
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            drop(memory);
+                            control.fail(error);
+                            return;
+                        }
+                    }
                 }
-                metrics.uploaded_objects.fetch_add(1, Ordering::Relaxed);
                 progress.emit(1);
                 drop(memory);
             }
@@ -2840,17 +3745,25 @@ fn run_upload_worker(worker: UploadWorker) {
                 transform,
             } => {
                 let pack_id = pack.id();
-                if let Err(error) = uploader.upload(
+                let outcome = match uploader.upload(
                     BackupStage::Upload,
                     "pack",
                     &format!("packs/{}", pack_id.as_hex()),
                     pack.as_bytes(),
                 ) {
-                    drop(memory);
-                    control.fail(error);
-                    return;
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        drop(memory);
+                        control.fail(error);
+                        return;
+                    }
+                };
+                if outcome.newly_stored {
+                    metrics.uploaded_objects.fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .new_stored_bytes
+                        .fetch_add(outcome.stored_bytes, Ordering::Relaxed);
                 }
-                metrics.uploaded_objects.fetch_add(1, Ordering::Relaxed);
                 progress.emit(1);
                 for location in pack.entries() {
                     let entry = match PackIndexEntry::from_location(*location, transform) {
@@ -2877,14 +3790,21 @@ fn run_upload_worker(worker: UploadWorker) {
             }
             UploadWork::Index { shard, memory } => {
                 let key = format!("indexes/{}", shard.id().as_hex());
-                if let Err(error) =
-                    uploader.upload(BackupStage::Upload, "index", &key, shard.as_bytes())
-                {
-                    drop(memory);
-                    control.fail(error);
-                    return;
+                let outcome =
+                    match uploader.upload(BackupStage::Upload, "index", &key, shard.as_bytes()) {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            drop(memory);
+                            control.fail(error);
+                            return;
+                        }
+                    };
+                if outcome.newly_stored {
+                    metrics.uploaded_objects.fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .new_stored_bytes
+                        .fetch_add(outcome.stored_bytes, Ordering::Relaxed);
                 }
-                metrics.uploaded_objects.fetch_add(1, Ordering::Relaxed);
                 progress.emit(1);
                 drop(memory);
             }
@@ -3570,6 +4490,13 @@ fn receive_message<T>(receiver: &Arc<Mutex<Receiver<T>>>, control: &PipelineCont
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return None,
         }
+    }
+}
+
+fn try_receive_message<T>(receiver: &Arc<Mutex<Receiver<T>>>) -> Result<T, TryRecvError> {
+    match receiver.lock() {
+        Ok(guard) => guard.try_recv(),
+        Err(poisoned) => poisoned.into_inner().try_recv(),
     }
 }
 

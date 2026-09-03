@@ -12,9 +12,9 @@ use crate::application::backup::{
 };
 use crate::application::ports::{Filesystem, FilesystemClock};
 use crate::domain::{
-    BackupBudgets, BackupMetrics, BackupStage, ChunkingConfiguration, MAX_SNAPSHOT_AUTHOR_LENGTH,
-    MAX_SNAPSHOT_MESSAGE_LENGTH, ObjectTransformOptions, PackConfiguration, PackIndexConfiguration,
-    SnapshotReference,
+    BackupBudgets, BackupDeduplicationConfiguration, BackupMetrics, BackupStage,
+    ChunkingConfiguration, MAX_SNAPSHOT_AUTHOR_LENGTH, MAX_SNAPSHOT_MESSAGE_LENGTH,
+    ObjectTransformOptions, PackConfiguration, PackIndexConfiguration, SnapshotReference,
 };
 use std::fmt;
 use std::path::PathBuf;
@@ -37,6 +37,7 @@ pub struct BackupRequest {
     chunking: ChunkingConfiguration,
     pack: PackConfiguration,
     index: PackIndexConfiguration,
+    deduplication: BackupDeduplicationConfiguration,
     transforms: ObjectTransformOptions,
 }
 
@@ -52,6 +53,7 @@ impl BackupRequest {
             chunking: ChunkingConfiguration::default_policy(),
             pack: PackConfiguration::default_policy(),
             index: PackIndexConfiguration::default_policy(),
+            deduplication: BackupDeduplicationConfiguration::default_policy(),
             transforms: ObjectTransformOptions::new(
                 crate::domain::ObjectCodec::None,
                 crate::domain::ObjectEncryption::None,
@@ -120,6 +122,20 @@ impl BackupRequest {
         self.with_index_configuration(index)
     }
 
+    /// Replaces the bounded content-reuse policy.
+    pub const fn with_deduplication_configuration(
+        mut self,
+        deduplication: BackupDeduplicationConfiguration,
+    ) -> Self {
+        self.deduplication = deduplication;
+        self
+    }
+
+    /// Alias for [`Self::with_deduplication_configuration`].
+    pub const fn with_deduplication(self, deduplication: BackupDeduplicationConfiguration) -> Self {
+        self.with_deduplication_configuration(deduplication)
+    }
+
     /// Replaces compression and encryption policy for immutable objects.
     pub const fn with_transform_options(mut self, transforms: ObjectTransformOptions) -> Self {
         self.transforms = transforms;
@@ -171,6 +187,11 @@ impl BackupRequest {
         self.index
     }
 
+    /// Returns the bounded content-reuse policy.
+    pub const fn deduplication(&self) -> BackupDeduplicationConfiguration {
+        self.deduplication
+    }
+
     /// Returns the immutable-object transform policy.
     pub const fn transform_options(&self) -> ObjectTransformOptions {
         self.transforms
@@ -213,6 +234,7 @@ impl BackupRequest {
             chunking: self.chunking,
             pack: self.pack,
             index: self.index,
+            deduplication: self.deduplication,
             transforms: self.transforms,
         }
     }

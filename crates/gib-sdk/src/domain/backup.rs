@@ -1,6 +1,7 @@
 use std::fmt;
 
 use super::configuration::MAX_BACKUP_CONCURRENCY;
+use super::pack_index::PackIndexCacheConfiguration;
 
 /// The default request memory budget for a backup pipeline.
 pub const DEFAULT_BACKUP_MEMORY_BYTES: usize = 512 * 1024 * 1024;
@@ -17,6 +18,19 @@ pub const DEFAULT_BACKUP_NETWORK_REQUESTS: usize = 4;
 /// The default capacity of every inter-stage queue.
 pub const DEFAULT_BACKUP_QUEUE_CAPACITY: usize = 8;
 
+/// The default number of chunk IDs resolved by one pack-index query batch.
+pub const DEFAULT_BACKUP_DEDUP_BATCH_SIZE: usize = 128;
+
+/// The largest chunk-index query batch accepted by a backup request.
+pub const MAX_BACKUP_DEDUP_BATCH_SIZE: usize = 4_096;
+
+/// The default maximum number of index and tree keys retained by the
+/// preflight catalog.
+pub const DEFAULT_BACKUP_DEDUP_CATALOG_ENTRIES: usize = 65_536;
+
+/// The largest preflight catalog accepted by a backup request.
+pub const MAX_BACKUP_DEDUP_CATALOG_ENTRIES: usize = 1_000_000;
+
 /// The largest queue capacity accepted by a backup request.
 pub const MAX_BACKUP_QUEUE_CAPACITY: usize = 1_024;
 
@@ -28,6 +42,96 @@ pub const MIN_BACKUP_FILE_DESCRIPTORS: usize = 4;
 
 /// The minimum number of network requests required to upload immutable data.
 pub const MIN_BACKUP_NETWORK_REQUESTS: usize = 1;
+
+/// A bounded policy for discovering and reusing immutable repository content.
+///
+/// Index keys are discovered with paged listings. Chunk IDs are resolved in
+/// batches, while decoded shards are retained only within the configured
+/// pack-index cache. The catalog bound prevents repository listings from
+/// becoming an unbounded resident allocation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BackupDeduplicationConfiguration {
+    batch_size: usize,
+    catalog_entries: usize,
+    index_cache: PackIndexCacheConfiguration,
+}
+
+impl BackupDeduplicationConfiguration {
+    /// Creates an explicit content-reuse policy.
+    pub fn new(
+        batch_size: usize,
+        catalog_entries: usize,
+        index_cache: PackIndexCacheConfiguration,
+    ) -> Result<Self, BackupDeduplicationConfigurationError> {
+        if !(1..=MAX_BACKUP_DEDUP_BATCH_SIZE).contains(&batch_size) {
+            return Err(BackupDeduplicationConfigurationError::BatchSizeOutOfRange);
+        }
+        if !(1..=MAX_BACKUP_DEDUP_CATALOG_ENTRIES).contains(&catalog_entries) {
+            return Err(BackupDeduplicationConfigurationError::CatalogEntriesOutOfRange);
+        }
+        Ok(Self {
+            batch_size,
+            catalog_entries,
+            index_cache,
+        })
+    }
+
+    /// Returns the default content-reuse policy.
+    pub const fn default_policy() -> Self {
+        Self {
+            batch_size: DEFAULT_BACKUP_DEDUP_BATCH_SIZE,
+            catalog_entries: DEFAULT_BACKUP_DEDUP_CATALOG_ENTRIES,
+            index_cache: PackIndexCacheConfiguration::default_policy(),
+        }
+    }
+
+    /// Returns the maximum number of chunk IDs resolved by one batch.
+    pub const fn batch_size(self) -> usize {
+        self.batch_size
+    }
+
+    /// Returns the maximum number of keys retained by the preflight catalog.
+    pub const fn catalog_entries(self) -> usize {
+        self.catalog_entries
+    }
+
+    /// Returns the resident pack-index cache policy.
+    pub const fn index_cache(self) -> PackIndexCacheConfiguration {
+        self.index_cache
+    }
+}
+
+impl Default for BackupDeduplicationConfiguration {
+    fn default() -> Self {
+        Self::default_policy()
+    }
+}
+
+/// A validation failure for a backup content-reuse policy.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackupDeduplicationConfigurationError {
+    /// The query batch is outside the supported range.
+    BatchSizeOutOfRange,
+    /// The preflight catalog bound is outside the supported range.
+    CatalogEntriesOutOfRange,
+}
+
+impl fmt::Display for BackupDeduplicationConfigurationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::BatchSizeOutOfRange => {
+                "backup deduplication batch size is outside the supported range"
+            }
+            Self::CatalogEntriesOutOfRange => {
+                "backup deduplication catalog bound is outside the supported range"
+            }
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for BackupDeduplicationConfigurationError {}
 
 /// A bounded request-level resource policy for a backup.
 ///
@@ -246,6 +350,8 @@ pub enum BackupStage {
     Chunk,
     /// Plaintext content hashing and ID verification.
     Hash,
+    /// Batched lookup and reuse of existing immutable chunks.
+    Dedup,
     /// Compression and authenticated encryption.
     Transform,
     /// Ordered pack assembly.
@@ -267,6 +373,7 @@ impl fmt::Display for BackupStage {
             Self::Read => "read",
             Self::Chunk => "chunk",
             Self::Hash => "hash",
+            Self::Dedup => "dedup",
             Self::Transform => "transform",
             Self::Pack => "pack",
             Self::Index => "index",
@@ -320,6 +427,9 @@ pub struct BackupMetrics {
     directories: u64,
     bytes_read: u64,
     total_size: u64,
+    logical_bytes: u64,
+    new_stored_bytes: u64,
+    reused_bytes: u64,
     chunks: u64,
     transformed_chunks: u64,
     packs: u64,
@@ -357,6 +467,23 @@ impl BackupMetrics {
     /// Returns the total logical size represented by captured regular files.
     pub const fn total_size(self) -> u64 {
         self.total_size
+    }
+
+    /// Returns the logical bytes represented by this snapshot.
+    pub const fn logical_bytes(self) -> u64 {
+        self.logical_bytes
+    }
+
+    /// Returns the complete bytes of immutable objects newly stored by this
+    /// backup. Mutable HEAD and history records are excluded.
+    pub const fn new_stored_bytes(self) -> u64 {
+        self.new_stored_bytes
+    }
+
+    /// Returns logical chunk bytes served by existing or earlier-in-run
+    /// content rather than newly stored chunk payloads.
+    pub const fn reused_bytes(self) -> u64 {
+        self.reused_bytes
     }
 
     /// Returns the number of plaintext chunks assembled.
@@ -421,6 +548,9 @@ impl BackupMetrics {
         directories: u64,
         bytes_read: u64,
         total_size: u64,
+        logical_bytes: u64,
+        new_stored_bytes: u64,
+        reused_bytes: u64,
         chunks: u64,
         transformed_chunks: u64,
         packs: u64,
@@ -439,6 +569,9 @@ impl BackupMetrics {
             directories,
             bytes_read,
             total_size,
+            logical_bytes,
+            new_stored_bytes,
+            reused_bytes,
             chunks,
             transformed_chunks,
             packs,

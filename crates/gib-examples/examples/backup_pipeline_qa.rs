@@ -102,10 +102,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         Ok(result) => {
             let metrics = result.metrics();
             println!(
-                "backup completed snapshot={} files={} bytes={} chunks={} packs={} peak_memory={} peak_cpu={} peak_fds={} peak_network={} events={}",
+                "backup completed snapshot={} files={} bytes={} logical_bytes={} new_stored_bytes={} reused_bytes={} chunks={} packs={} peak_memory={} peak_cpu={} peak_fds={} peak_network={} events={}",
                 result.snapshot(),
                 metrics.files(),
                 metrics.total_size(),
+                metrics.logical_bytes(),
+                metrics.new_stored_bytes(),
+                metrics.reused_bytes(),
                 metrics.chunks(),
                 metrics.packs(),
                 metrics.peak_memory_bytes(),

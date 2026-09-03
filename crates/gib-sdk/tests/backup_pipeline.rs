@@ -1,7 +1,8 @@
 use gib::{
-    BackupBudgetError, BackupBudgets, BackupRequest, ChunkingConfiguration, Client, ErrorCode,
-    MAX_BACKUP_CONCURRENCY, MemoryStorage, MemoryStorageOperation, ObjectKey, ObjectRead,
-    ObjectWriteOptions, PackConfiguration, PackIndexConfiguration, RepositoryIdentity,
+    BackupBudgetError, BackupBudgets, BackupDeduplicationConfiguration, BackupRequest, BackupStage,
+    ChunkingConfiguration, Client, ErrorCode, MAX_BACKUP_CONCURRENCY, MemoryStorage,
+    MemoryStorageOperation, ObjectKey, ObjectRead, ObjectWriteOptions, PackConfiguration,
+    PackIndexCacheConfiguration, PackIndexConfiguration, PackReader, RepositoryIdentity,
     RepositoryInitRequest, RepositoryKey, RepositoryStorage, SdkError, StorageCapabilities,
     StorageError,
 };
@@ -75,6 +76,282 @@ fn repository(client: &Client, storage: &MemoryStorage) -> Result<gib::Repositor
             RepositoryKey::new("test")?,
         ),
     )?)
+}
+
+fn object_keys(storage: &MemoryStorage, prefix: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    Ok(storage
+        .objects()?
+        .into_iter()
+        .filter(|key| key.starts_with(prefix))
+        .collect())
+}
+
+fn immutable_object_bytes(storage: &MemoryStorage) -> Result<u64, Box<dyn Error>> {
+    object_keys(storage, "")?
+        .into_iter()
+        .filter(|key| {
+            key.starts_with("packs/")
+                || key.starts_with("indexes/")
+                || key.starts_with("trees/")
+                || key.starts_with("snapshots/")
+        })
+        .try_fold(0_u64, |total, key| {
+            let length = u64::try_from(storage.read_object(&key)?.len())?;
+            Ok(total.saturating_add(length))
+        })
+}
+
+fn immutable_object_count(storage: &MemoryStorage) -> Result<usize, Box<dyn Error>> {
+    Ok(storage
+        .objects()?
+        .into_iter()
+        .filter(|key| {
+            key.starts_with("packs/")
+                || key.starts_with("indexes/")
+                || key.starts_with("trees/")
+                || key.starts_with("snapshots/")
+        })
+        .count())
+}
+
+fn pack_entry_count(storage: &MemoryStorage) -> Result<usize, Box<dyn Error>> {
+    object_keys(storage, "packs/")?
+        .into_iter()
+        .try_fold(0_usize, |count, key| {
+            let bytes = storage.read_object(&key)?;
+            let pack = PackReader::new(&bytes)?;
+            Ok(count.saturating_add(pack.entries().len()))
+        })
+}
+
+fn deterministic_payload(length: usize) -> Vec<u8> {
+    (0..length)
+        .map(|index| {
+            let value = index
+                .wrapping_mul(37)
+                .wrapping_add(index / 97)
+                .wrapping_add(index / 4093);
+            (value % 251) as u8
+        })
+        .collect()
+}
+
+fn incremental_request(root: &Path) -> Result<BackupRequest, Box<dyn Error>> {
+    Ok(BackupRequest::new(root)
+        .with_budgets(BackupBudgets::with_queue_capacity(
+            32 * 1024 * 1024,
+            3,
+            8,
+            1,
+            2,
+        )?)
+        .with_chunking(ChunkingConfiguration::new(256, 512, 1024)?)
+        .with_pack_configuration(PackConfiguration::new(64 * 1024, 128 * 1024)?)
+        .with_index_configuration(PackIndexConfiguration::new(4096)?))
+}
+
+fn assert_dedup_error(error: SdkError, expected: ErrorCode) {
+    match error {
+        SdkError::BackupStageFailed { stage, source } => {
+            assert_eq!(stage, BackupStage::Dedup);
+            assert_eq!(source.code(), expected);
+        }
+        other => panic!("expected a deduplication stage failure, got {other:?}"),
+    }
+}
+
+#[test]
+fn identical_snapshot_reuses_content_and_writes_no_content_packs() -> Result<(), Box<dyn Error>> {
+    let source = TestDirectory::new()?;
+    fs::write(
+        source.path().join("payload.bin"),
+        deterministic_payload(96 * 1024),
+    )?;
+    let storage = MemoryStorage::new();
+    let client = Client::default();
+    let repository = repository(&client, &storage)?;
+    let request = incremental_request(source.path())?;
+
+    let first = client.backup(repository.clone(), request.clone())?;
+    let packs_after_first = object_keys(&storage, "packs/")?;
+    let bytes_after_first = immutable_object_bytes(&storage)?;
+    let objects_after_first = immutable_object_count(&storage)?;
+    assert_eq!(first.metrics().new_stored_bytes(), bytes_after_first);
+    assert_eq!(
+        first.metrics().uploaded_objects() as usize,
+        objects_after_first
+    );
+    let second = client.backup(repository, request)?;
+
+    assert!(first.metrics().new_stored_bytes() > 0);
+    assert_eq!(second.metrics().packs(), 0);
+    assert_eq!(second.metrics().index_shards(), 0);
+    assert_eq!(second.metrics().transformed_chunks(), 0);
+    assert_eq!(
+        second.metrics().logical_bytes(),
+        second.metrics().reused_bytes()
+    );
+    assert_eq!(object_keys(&storage, "packs/")?, packs_after_first);
+    assert_eq!(second.metrics().uploaded_objects(), 1);
+    assert_eq!(
+        second.metrics().new_stored_bytes(),
+        immutable_object_bytes(&storage)?.saturating_sub(bytes_after_first)
+    );
+    assert_eq!(
+        second.metrics().uploaded_objects() as usize,
+        immutable_object_count(&storage)?.saturating_sub(objects_after_first)
+    );
+    Ok(())
+}
+
+#[test]
+fn duplicate_files_reuse_chunks_within_one_snapshot() -> Result<(), Box<dyn Error>> {
+    let source = TestDirectory::new()?;
+    let payload = deterministic_payload(96 * 1024);
+    fs::write(source.path().join("one.bin"), &payload)?;
+    fs::write(source.path().join("two.bin"), &payload)?;
+    let storage = MemoryStorage::new();
+    let client = Client::default();
+    let repository = repository(&client, &storage)?;
+
+    let result = client.backup(repository, incremental_request(source.path())?)?;
+
+    assert_eq!(result.metrics().logical_bytes(), (payload.len() * 2) as u64);
+    assert!(result.metrics().reused_bytes() >= payload.len() as u64);
+    assert!(result.metrics().reused_bytes() < result.metrics().logical_bytes());
+    assert!(result.metrics().chunks() > 2);
+    assert!(pack_entry_count(&storage)? < result.metrics().chunks() as usize);
+    Ok(())
+}
+
+#[test]
+fn shifted_file_reuses_later_content_defined_chunks() -> Result<(), Box<dyn Error>> {
+    let source = TestDirectory::new()?;
+    let original = deterministic_payload(512 * 1024);
+    fs::write(source.path().join("payload.bin"), &original)?;
+    let storage = MemoryStorage::new();
+    let client = Client::default();
+    let repository = repository(&client, &storage)?;
+    let request = incremental_request(source.path())?;
+    client.backup(repository.clone(), request.clone())?;
+
+    let mut shifted = b"inserted near the beginning".to_vec();
+    shifted.extend_from_slice(&original);
+    fs::write(source.path().join("payload.bin"), shifted)?;
+    let result = client.backup(repository, request)?;
+
+    assert!(result.metrics().reused_bytes() > (original.len() as u64 / 2));
+    assert!(result.metrics().packs() > 0);
+    assert!(result.metrics().transformed_chunks() < result.metrics().chunks());
+    Ok(())
+}
+
+#[test]
+fn one_leaf_edit_reuses_unchanged_tree_subtrees() -> Result<(), Box<dyn Error>> {
+    let source = TestDirectory::new()?;
+    fs::create_dir(source.path().join("left"))?;
+    fs::create_dir(source.path().join("right"))?;
+    fs::write(source.path().join("left/a.txt"), b"left-a")?;
+    fs::write(source.path().join("left/b.txt"), b"left-b")?;
+    fs::write(source.path().join("right/c.txt"), b"right-c")?;
+    let storage = MemoryStorage::new();
+    let client = Client::default();
+    let repository = repository(&client, &storage)?;
+    let request = incremental_request(source.path())?;
+    client.backup(repository.clone(), request.clone())?;
+    let first_trees = object_keys(&storage, "trees/")?;
+
+    fs::write(source.path().join("left/a.txt"), b"left-a-edited")?;
+    let result = client.backup(repository, request)?;
+    let second_trees = object_keys(&storage, "trees/")?;
+    let new_trees = second_trees
+        .iter()
+        .filter(|key| !first_trees.contains(key))
+        .count();
+
+    assert!(result.metrics().reused_bytes() > 0);
+    assert!(new_trees < first_trees.len());
+    assert!(result.metrics().packs() > 0);
+    Ok(())
+}
+
+#[test]
+fn missing_referenced_pack_fails_closed_during_deduplication() -> Result<(), Box<dyn Error>> {
+    let source = TestDirectory::new()?;
+    fs::write(
+        source.path().join("payload.bin"),
+        deterministic_payload(96 * 1024),
+    )?;
+    let storage = MemoryStorage::new();
+    let client = Client::default();
+    let repository = repository(&client, &storage)?;
+    let request = incremental_request(source.path())?;
+    client.backup(repository.clone(), request.clone())?;
+    let pack = object_keys(&storage, "packs/")?
+        .into_iter()
+        .next()
+        .ok_or("first backup did not create a pack")?;
+    assert!(storage.remove_object(&pack)?);
+
+    let error = client
+        .backup(repository, request)
+        .expect_err("a missing indexed pack must not be treated as new content");
+    assert_dedup_error(error, ErrorCode::RepositoryRequiredObjectMissing);
+    Ok(())
+}
+
+#[test]
+fn corrupt_referenced_index_fails_closed_during_deduplication() -> Result<(), Box<dyn Error>> {
+    let source = TestDirectory::new()?;
+    fs::write(
+        source.path().join("payload.bin"),
+        deterministic_payload(96 * 1024),
+    )?;
+    let storage = MemoryStorage::new();
+    let client = Client::default();
+    let repository = repository(&client, &storage)?;
+    let request = incremental_request(source.path())?;
+    client.backup(repository.clone(), request.clone())?;
+    let index = object_keys(&storage, "indexes/")?
+        .into_iter()
+        .find(|key| !key.contains("/pack-v1/"))
+        .ok_or("first backup did not create an immutable index")?;
+    let mut bytes = storage.read_object(&index)?;
+    let first = bytes.first_mut().ok_or("index object is empty")?;
+    *first ^= 0xff;
+    storage.replace_object(&index, bytes)?;
+
+    let error = client
+        .backup(repository, request)
+        .expect_err("a corrupt referenced index must not be ignored");
+    assert_dedup_error(error, ErrorCode::RepositoryMalformed);
+    Ok(())
+}
+
+#[test]
+fn deduplication_respects_a_one_shard_index_cache() -> Result<(), Box<dyn Error>> {
+    let source = TestDirectory::new()?;
+    fs::write(
+        source.path().join("payload.bin"),
+        deterministic_payload(128 * 1024),
+    )?;
+    let storage = MemoryStorage::new();
+    let client = Client::default();
+    let repository = repository(&client, &storage)?;
+    let cache = PackIndexCacheConfiguration::new(32 * 1024, 1)?;
+    let dedup = BackupDeduplicationConfiguration::new(8, 65_536, cache)?;
+    let request = incremental_request(source.path())?.with_deduplication(dedup);
+    client.backup(repository.clone(), request.clone())?;
+
+    fs::write(
+        source.path().join("payload.bin"),
+        deterministic_payload(128 * 1024 + 17),
+    )?;
+    let result = client.backup(repository, request)?;
+
+    assert!(result.metrics().reused_bytes() > 0);
+    assert!(result.metrics().packs() > 0);
+    Ok(())
 }
 
 #[test]

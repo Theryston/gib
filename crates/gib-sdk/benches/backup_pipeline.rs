@@ -81,12 +81,15 @@ fn main() {
         }
     };
     println!(
-        "backup pipeline benchmark files={file_count} file_kib={file_kib} source_mib={:.2} runs={runs} memory_mib={memory_mib}",
+        "backup pipeline benchmark files={file_count} file_kib={file_kib} source_mib={:.2} runs={runs} memory_mib={memory_mib} modes=cold,warm",
         source_bytes as f64 / (1024.0 * 1024.0)
     );
     for run in 0..runs {
         match run_once(dataset.path(), file_count, source_bytes, memory_mib) {
-            Ok((elapsed, metrics)) => report(run + 1, source_bytes, elapsed, metrics),
+            Ok((cold_elapsed, cold_metrics, warm_elapsed, warm_metrics)) => {
+                report(run + 1, source_bytes, "cold", cold_elapsed, cold_metrics);
+                report(run + 1, source_bytes, "warm", warm_elapsed, warm_metrics);
+            }
             Err(error) => {
                 eprintln!("backup pipeline benchmark run={} failed: {error}", run + 1);
                 return;
@@ -100,7 +103,15 @@ fn run_once(
     file_count: usize,
     source_bytes: usize,
     memory_mib: usize,
-) -> Result<(std::time::Duration, BackupMetrics), Box<dyn Error>> {
+) -> Result<
+    (
+        std::time::Duration,
+        BackupMetrics,
+        std::time::Duration,
+        BackupMetrics,
+    ),
+    Box<dyn Error>,
+> {
     let storage = MemoryStorage::new();
     let client = Client::default();
     let repository = client.initialize_repository(
@@ -126,28 +137,44 @@ fn run_once(
         .with_pack_configuration(PackConfiguration::new(8 * 1024 * 1024, 16 * 1024 * 1024)?)
         .with_index_configuration(PackIndexConfiguration::new(1024 * 1024)?);
     let started = Instant::now();
-    let result = client.backup(repository, request)?;
-    let elapsed = started.elapsed();
-    if result.metrics().files() != file_count as u64
-        || result.metrics().total_size() != source_bytes as u64
+    let cold = client.backup(repository.clone(), request.clone())?;
+    let cold_elapsed = started.elapsed();
+    let warm_started = Instant::now();
+    let warm = client.backup(repository, request)?;
+    let warm_elapsed = warm_started.elapsed();
+    if cold.metrics().files() != file_count as u64
+        || cold.metrics().total_size() != source_bytes as u64
+        || warm.metrics().files() != file_count as u64
+        || warm.metrics().total_size() != source_bytes as u64
     {
         return Err(Box::new(gib::SdkError::InvalidRequest {
             field: "backup.benchmark_dataset",
             reason: "captured statistics do not match the generated dataset",
         }));
     }
-    Ok((elapsed, result.metrics()))
+    Ok((cold_elapsed, cold.metrics(), warm_elapsed, warm.metrics()))
 }
 
-fn report(run: usize, source_bytes: usize, elapsed: std::time::Duration, metrics: BackupMetrics) {
+fn report(
+    run: usize,
+    source_bytes: usize,
+    mode: &str,
+    elapsed: std::time::Duration,
+    metrics: BackupMetrics,
+) {
     let seconds = elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
     let throughput = source_bytes as f64 / (1024.0 * 1024.0) / seconds;
     println!(
-        "run={run} bytes={} chunks={} packs={} index_shards={} elapsed_ms={:.2} throughput_mib_s={throughput:.2} peak_memory_bytes={} peak_cpu={} peak_fds={} peak_network={}",
+        "run={run} mode={mode} bytes={} logical_bytes={} new_stored_bytes={} reused_bytes={} chunks={} transformed_chunks={} packs={} index_shards={} uploaded_objects={} elapsed_ms={:.2} throughput_mib_s={throughput:.2} peak_memory_bytes={} peak_cpu={} peak_fds={} peak_network={}",
         black_box(source_bytes),
+        black_box(metrics.logical_bytes()),
+        black_box(metrics.new_stored_bytes()),
+        black_box(metrics.reused_bytes()),
         black_box(metrics.chunks()),
+        black_box(metrics.transformed_chunks()),
         black_box(metrics.packs()),
         black_box(metrics.index_shards()),
+        black_box(metrics.uploaded_objects()),
         elapsed.as_secs_f64() * 1000.0,
         black_box(metrics.peak_memory_bytes()),
         black_box(metrics.peak_cpu_workers()),
