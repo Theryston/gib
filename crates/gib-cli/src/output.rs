@@ -7,8 +7,12 @@ use gib::{
 };
 use serde::Serialize;
 use std::path::Path;
+use time::{OffsetDateTime, format_description::BorrowedFormatItem};
 
 const CLI_OUTPUT_SCHEMA_VERSION: u16 = 1;
+const HISTORY_TABLE_HEADERS: [&str; 5] = ["SNAPSHOT", "SIZE", "AUTHOR", "TIME", "MESSAGE"];
+const HISTORY_TIMESTAMP_FORMAT: &[BorrowedFormatItem<'static>] =
+    time::macros::format_description!("[month repr:short] [day], [year] [hour]:[minute] UTC");
 
 #[derive(Serialize)]
 struct OutputEnvelope<'a, T: Serialize> {
@@ -141,19 +145,6 @@ pub fn render_history_start(repository: &Path, page_size: usize, mode: OutputMod
         ],
     );
     println!();
-    println!(
-        "  {}  {}  {}  {}  {}",
-        dialoguer::console::style("TIME").black().bright(),
-        dialoguer::console::style("SIZE").black().bright(),
-        dialoguer::console::style("SNAPSHOT").black().bright(),
-        dialoguer::console::style("AUTHOR").black().bright(),
-        dialoguer::console::style("MESSAGE").black().bright()
-    );
-    println!(
-        "  {}",
-        dialoguer::console::style("────────────────────────────────────────────────────────")
-            .cyan()
-    );
 }
 
 pub fn render_history(page: &SnapshotSummaryPage, mode: OutputMode) {
@@ -178,23 +169,26 @@ pub fn render_history(page: &SnapshotSummaryPage, mode: OutputMode) {
         return;
     }
 
-    for summary in page.summaries() {
-        let timestamp = summary
-            .timestamp()
-            .map_or_else(|| String::from("-"), |value| value.to_string());
-        let size = summary
-            .size()
-            .map_or_else(|| String::from("-"), format_size);
-        let snapshot = shorten(summary.id().as_ref(), 16);
-        let author = summary
-            .author()
-            .map_or_else(|| String::from("-"), |value| shorten(value, 18));
-        let message = one_line(summary.message(), 42);
-        println!(
-            "  {:<20} {:>10}  {:<16}  {:<18}  {}",
-            timestamp, size, snapshot, author, message
-        );
-    }
+    let rows = page
+        .summaries()
+        .iter()
+        .map(|summary| {
+            vec![
+                shorten(summary.id().as_ref(), 16),
+                summary
+                    .size()
+                    .map_or_else(|| String::from("-"), format_size),
+                summary
+                    .author()
+                    .map_or_else(|| String::from("-"), |value| shorten(value, 18)),
+                summary
+                    .timestamp()
+                    .map_or_else(|| String::from("-"), format_timestamp),
+                shorten(summary.message(), 42),
+            ]
+        })
+        .collect::<Vec<_>>();
+    interactive::table(&HISTORY_TABLE_HEADERS, &rows);
 }
 
 pub fn render_history_complete(count: usize, mode: OutputMode) {
@@ -728,6 +722,18 @@ fn format_size(size: u64) -> String {
     }
 }
 
+fn format_timestamp(timestamp: u64) -> String {
+    let Ok(timestamp) = i64::try_from(timestamp) else {
+        return String::from("-");
+    };
+    let Ok(date_time) = OffsetDateTime::from_unix_timestamp(timestamp) else {
+        return String::from("-");
+    };
+    date_time
+        .format(HISTORY_TIMESTAMP_FORMAT)
+        .unwrap_or_else(|_| String::from("-"))
+}
+
 fn shorten(value: &str, max_chars: usize) -> String {
     let value = value
         .chars()
@@ -766,7 +772,7 @@ fn one_line(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::platform_credential_store_guidance;
+    use super::{format_timestamp, platform_credential_store_guidance};
 
     #[test]
     fn credential_store_failure_has_platform_guidance() {
@@ -782,5 +788,11 @@ mod tests {
                         .any(|command| command.contains("libsecret-tools"))
                 })
         }));
+    }
+
+    #[test]
+    fn history_timestamp_is_human_readable_and_uses_utc() {
+        assert_eq!(format_timestamp(0), "Jan 01, 1970 00:00 UTC");
+        assert_eq!(format_timestamp(u64::MAX), "-");
     }
 }
