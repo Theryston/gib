@@ -779,6 +779,58 @@ fn read_bounded_object(
         .map_err(|error| map_bounded_storage_error(error, missing, operation))
 }
 
+pub(crate) fn read_snapshot(
+    storage: &dyn RepositoryStorage,
+    reference: &SnapshotReference,
+) -> Result<Snapshot, RepositoryError> {
+    let bytes = read_bounded_object(
+        storage,
+        reference.as_str(),
+        MAX_SNAPSHOT_BYTES as u64,
+        RepositoryError::SnapshotMissing,
+        "read_snapshot",
+    )?;
+    let snapshot = decode_snapshot(&bytes).map_err(map_format_error)?;
+    validate_snapshot_identity(reference, &snapshot)?;
+    Ok(snapshot)
+}
+
+pub(crate) fn snapshot_root_tree_reference(
+    snapshot: &Snapshot,
+) -> Result<TreeNodeReference, RepositoryError> {
+    let root = snapshot.root_tree().ok_or(RepositoryError::Incompatible {
+        reason: "parent snapshot does not contain a root tree",
+    })?;
+    root_tree_reference(root)
+}
+
+pub(crate) fn read_tree_node(
+    storage: &dyn RepositoryStorage,
+    reference: &TreeNodeReference,
+) -> Result<TreeNode, RepositoryError> {
+    let object_reference =
+        reference
+            .object_reference()
+            .map_err(|_| RepositoryError::Malformed {
+                reason: "tree reference cannot be converted to a storage object",
+            })?;
+    let bytes = read_bounded_object(
+        storage,
+        object_reference.as_str(),
+        MAX_IMMUTABLE_OBJECT_BYTES as u64,
+        RepositoryError::RequiredObjectMissing,
+        "read_tree",
+    )?;
+    let node = decode_tree_node(&bytes).map_err(map_format_error)?;
+    let actual_id = tree_node_id(&node).map_err(map_format_error)?;
+    if node.kind() != reference.kind() || actual_id != *reference.id() {
+        return Err(RepositoryError::Malformed {
+            reason: "tree object identity or kind does not match its reference",
+        });
+    }
+    Ok(node)
+}
+
 fn map_bounded_storage_error(
     error: StorageError,
     missing: RepositoryError,

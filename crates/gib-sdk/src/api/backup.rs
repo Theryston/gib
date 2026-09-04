@@ -12,9 +12,10 @@ use crate::application::backup::{
 };
 use crate::application::ports::{Filesystem, FilesystemClock};
 use crate::domain::{
-    BackupBudgets, BackupDeduplicationConfiguration, BackupMetrics, BackupStage,
+    BackupBudgets, BackupDeduplicationConfiguration, BackupMetrics, BackupReference, BackupStage,
     ChunkingConfiguration, MAX_SNAPSHOT_AUTHOR_LENGTH, MAX_SNAPSHOT_MESSAGE_LENGTH,
     ObjectTransformOptions, PackConfiguration, PackIndexConfiguration, SnapshotReference,
+    SnapshotSelector,
 };
 use std::fmt;
 use std::path::PathBuf;
@@ -39,6 +40,8 @@ pub struct BackupRequest {
     index: PackIndexConfiguration,
     deduplication: BackupDeduplicationConfiguration,
     transforms: ObjectTransformOptions,
+    parent: Option<SnapshotSelector>,
+    parent_disabled: bool,
 }
 
 impl BackupRequest {
@@ -58,7 +61,44 @@ impl BackupRequest {
                 crate::domain::ObjectCodec::None,
                 crate::domain::ObjectEncryption::None,
             ),
+            parent: None,
+            parent_disabled: false,
         }
+    }
+
+    /// Selects a snapshot as the immutable parent used to derive this backup.
+    ///
+    /// The selector is resolved against repository state when the operation
+    /// starts. Use [`Self::with_parent_latest`] for the `latest` alias or
+    /// [`Self::with_parent_reference`] when the selector is still text.
+    pub fn with_parent(mut self, parent: impl Into<BackupReference>) -> Self {
+        let parent = parent.into();
+        self.parent = Some(parent);
+        self.parent_disabled = false;
+        self
+    }
+
+    /// Selects repository HEAD as the parent at operation start.
+    pub fn with_parent_latest(self) -> Self {
+        self.with_parent(SnapshotSelector::latest())
+    }
+
+    /// Parses and selects a full snapshot ID, unique prefix, or `latest` as
+    /// the immutable parent.
+    pub fn with_parent_reference(self, reference: impl AsRef<str>) -> SdkResult<Self> {
+        let selector =
+            SnapshotSelector::parse(reference.as_ref().to_owned()).map_err(SdkError::from)?;
+        Ok(self.with_parent(selector))
+    }
+
+    /// Explicitly requests a parentless snapshot.
+    ///
+    /// This is distinct from the default automatic HEAD behavior retained for
+    /// compatibility with existing callers.
+    pub fn without_parent(mut self) -> Self {
+        self.parent = None;
+        self.parent_disabled = true;
+        self
     }
 
     /// Replaces the human-readable snapshot message.
@@ -197,6 +237,11 @@ impl BackupRequest {
         self.transforms
     }
 
+    /// Returns the explicitly selected parent selector, if one was supplied.
+    pub fn parent(&self) -> Option<&BackupReference> {
+        self.parent.as_ref()
+    }
+
     /// Validates request values before an operation is allocated.
     pub fn validate(&self) -> SdkResult<()> {
         if self.root.as_os_str().is_empty() {
@@ -236,6 +281,8 @@ impl BackupRequest {
             index: self.index,
             deduplication: self.deduplication,
             transforms: self.transforms,
+            parent: self.parent,
+            parent_disabled: self.parent_disabled,
         }
     }
 }
@@ -644,7 +691,10 @@ fn map_repository_failure(failure: BackupRepositoryFailure) -> SdkError {
         BackupRepositoryFailure::UnsupportedCapability => SdkError::StorageCapabilityUnsupported,
         BackupRepositoryFailure::Cancelled => SdkError::OperationCancelled { operation_id: None },
         BackupRepositoryFailure::NoSnapshots => SdkError::RepositoryNoSnapshots,
-        BackupRepositoryFailure::SnapshotReference => SdkError::SnapshotReferenceMalformed,
+        BackupRepositoryFailure::SnapshotReferenceEmpty => SdkError::SnapshotReferenceEmpty,
+        BackupRepositoryFailure::SnapshotReferenceMalformed => SdkError::SnapshotReferenceMalformed,
+        BackupRepositoryFailure::SnapshotReferenceNotFound => SdkError::SnapshotReferenceNotFound,
+        BackupRepositoryFailure::SnapshotReferenceAmbiguous => SdkError::SnapshotReferenceAmbiguous,
         BackupRepositoryFailure::Storage => SdkError::StorageFailure {
             operation: "repository",
         },

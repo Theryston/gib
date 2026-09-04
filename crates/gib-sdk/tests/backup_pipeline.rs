@@ -1,13 +1,13 @@
 use gib::{
     BackupBudgetError, BackupBudgets, BackupDeduplicationConfiguration, BackupRequest, BackupStage,
-    ChunkingConfiguration, Client, ErrorCode, MAX_BACKUP_CONCURRENCY, MemoryStorage,
-    MemoryStorageOperation, ObjectId, ObjectKey, ObjectListPage, ObjectListRequest, ObjectRange,
-    ObjectRead, ObjectWriteOptions, PackConfiguration, PackIndexCacheConfiguration,
+    ChunkingConfiguration, Client, DirectoryNode, EntryName, ErrorCode, MAX_BACKUP_CONCURRENCY,
+    MemoryStorage, MemoryStorageOperation, ObjectId, ObjectKey, ObjectListPage, ObjectListRequest,
+    ObjectRange, ObjectRead, ObjectWriteOptions, PackConfiguration, PackIndexCacheConfiguration,
     PackIndexConfiguration, PackIndexReader, PackReader, RepositoryIdentity, RepositoryInitRequest,
     RepositoryKey, RepositoryStorage, SdkError, Snapshot, StorageCapabilities, StorageError,
     StorageVersion, TreeNode, TreeNodeKind, decode_tree_node_object, tree_node_object_id,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fs;
 use std::io::Read;
@@ -274,6 +274,268 @@ fn one_leaf_edit_reuses_unchanged_tree_subtrees() -> Result<(), Box<dyn Error>> 
     assert!(result.metrics().reused_bytes() > 0);
     assert!(new_trees < first_trees.len());
     assert!(result.metrics().packs() > 0);
+    Ok(())
+}
+
+#[test]
+fn explicit_parent_derives_deletions_renames_type_changes_and_shared_nodes()
+-> Result<(), Box<dyn Error>> {
+    let source = TestDirectory::new()?;
+    fs::create_dir(source.path().join("stable"))?;
+    fs::write(source.path().join("stable/unchanged.txt"), b"unchanged")?;
+    fs::write(source.path().join("remove.txt"), b"remove")?;
+    fs::write(source.path().join("rename.txt"), b"rename")?;
+    fs::write(source.path().join("switch"), b"old type")?;
+
+    let storage = MemoryStorage::new();
+    let client = Client::default();
+    let repository = repository(&client, &storage)?;
+    let base = client.backup(
+        repository.clone(),
+        incremental_request(source.path())?.with_created_at(100),
+    )?;
+    let base_snapshot = Snapshot::from_bytes(&storage.read_object(base.snapshot().as_str())?)?;
+    let (_, base_root) = snapshot_root(&storage, &base_snapshot)?;
+    let (base_stable, _) = tree_child(&storage, &base_root, "stable")?;
+    let (base_rename, _) = tree_child(&storage, &base_root, "rename.txt")?;
+    let (base_switch, _) = tree_child(&storage, &base_root, "switch")?;
+
+    fs::remove_file(source.path().join("remove.txt"))?;
+    fs::rename(
+        source.path().join("rename.txt"),
+        source.path().join("renamed.txt"),
+    )?;
+    fs::remove_file(source.path().join("switch"))?;
+    fs::create_dir(source.path().join("switch"))?;
+    fs::write(source.path().join("switch/child.txt"), b"new type")?;
+    fs::write(source.path().join("added.txt"), b"added")?;
+
+    let parent_id = base.snapshot().snapshot_id()?;
+    let child_request = incremental_request(source.path())?
+        .with_parent(&parent_id)
+        .with_created_at(101);
+    let child = client.backup(repository.clone(), child_request)?;
+    let child_snapshot = Snapshot::from_bytes(&storage.read_object(child.snapshot().as_str())?)?;
+    assert_eq!(child_snapshot.parent(), Some(&parent_id));
+
+    let (_, child_root) = snapshot_root(&storage, &child_snapshot)?;
+    assert!(child_root.entry(&EntryName::new("remove.txt")?).is_none());
+    assert_eq!(
+        child_root
+            .entry(&EntryName::new("stable")?)
+            .ok_or("stable entry is missing")?
+            .reference(),
+        &base_stable
+    );
+    assert_eq!(
+        child_root
+            .entry(&EntryName::new("renamed.txt")?)
+            .ok_or("renamed entry is missing")?
+            .reference(),
+        &base_rename
+    );
+    assert!(child_root.entry(&EntryName::new("added.txt")?).is_some());
+    let switch = child_root
+        .entry(&EntryName::new("switch")?)
+        .ok_or("replacement directory is missing")?;
+    assert_eq!(switch.kind(), TreeNodeKind::Directory);
+    assert_ne!(switch.reference(), &base_switch);
+    let (_, switch_node) = tree_child(&storage, &child_root, "switch")?;
+    assert!(switch_node.as_directory().is_some());
+    assert_ne!(child_snapshot.root_tree(), base_snapshot.root_tree());
+    Ok(())
+}
+
+#[test]
+fn latest_prefix_and_parentless_selection_are_recorded_in_snapshot_metadata()
+-> Result<(), Box<dyn Error>> {
+    let source = TestDirectory::new()?;
+    fs::write(source.path().join("state.txt"), b"base")?;
+    let storage = MemoryStorage::new();
+    let client = Client::default();
+    let repository = repository(&client, &storage)?;
+
+    let base = client.backup(
+        repository.clone(),
+        incremental_request(source.path())?.with_created_at(200),
+    )?;
+    fs::write(source.path().join("state.txt"), b"latest")?;
+    let latest = client.backup(
+        repository.clone(),
+        incremental_request(source.path())?
+            .with_parent_latest()
+            .with_created_at(201),
+    )?;
+    let latest_snapshot = Snapshot::from_bytes(&storage.read_object(latest.snapshot().as_str())?)?;
+    let base_id = base.snapshot().snapshot_id()?;
+    assert_eq!(latest_snapshot.parent(), Some(&base_id));
+
+    fs::write(source.path().join("state.txt"), b"prefix")?;
+    let latest_id = latest.snapshot().snapshot_id()?;
+    let prefix = latest_id.as_str()[..8].to_owned();
+    let prefix_result = client.backup(
+        repository.clone(),
+        incremental_request(source.path())?
+            .with_parent_reference(prefix)?
+            .with_created_at(202),
+    )?;
+    let prefix_snapshot =
+        Snapshot::from_bytes(&storage.read_object(prefix_result.snapshot().as_str())?)?;
+    assert_eq!(prefix_snapshot.parent(), Some(&latest_id));
+
+    let parentless = client.backup(
+        repository,
+        incremental_request(source.path())?
+            .without_parent()
+            .with_created_at(203),
+    )?;
+    let parentless_snapshot =
+        Snapshot::from_bytes(&storage.read_object(parentless.snapshot().as_str())?)?;
+    assert_eq!(parentless_snapshot.parent(), None);
+    Ok(())
+}
+
+#[test]
+fn invalid_and_ambiguous_parent_selection_does_not_publish() -> Result<(), Box<dyn Error>> {
+    let source = TestDirectory::new()?;
+    fs::write(source.path().join("state.txt"), b"state")?;
+    let storage = MemoryStorage::new();
+    let client = Client::default();
+    let repository = repository(&client, &storage)?;
+    let empty_head = repository.read_head()?;
+    let empty_objects = immutable_object_count(&storage)?;
+    let empty_parent = client
+        .backup(
+            repository.clone(),
+            incremental_request(source.path())?
+                .with_parent_latest()
+                .with_created_at(299),
+        )
+        .expect_err("latest must fail when the repository has no snapshots");
+    assert!(matches!(
+        empty_parent,
+        SdkError::BackupStageFailed { stage: BackupStage::Publish, source }
+            if source.code() == ErrorCode::RepositoryNoSnapshots
+    ));
+    assert_eq!(repository.read_head()?, empty_head);
+    assert_eq!(immutable_object_count(&storage)?, empty_objects);
+
+    let base = client.backup(
+        repository.clone(),
+        incremental_request(source.path())?.with_created_at(300),
+    )?;
+
+    let before_head = repository.read_head()?;
+    let before_objects = immutable_object_count(&storage)?;
+    let missing = client
+        .backup(
+            repository.clone(),
+            incremental_request(source.path())?
+                .with_parent_reference("missing-parent")?
+                .with_created_at(301),
+        )
+        .expect_err("a missing parent must fail before publication");
+    assert!(matches!(
+        missing,
+        SdkError::BackupStageFailed { stage: BackupStage::Publish, source }
+            if source.code() == ErrorCode::SnapshotReferenceNotFound
+    ));
+    assert_eq!(repository.read_head()?, before_head);
+    assert_eq!(immutable_object_count(&storage)?, before_objects);
+
+    let mut first_by_prefix = BTreeMap::new();
+    let mut ambiguous_prefix = None;
+    for index in 0..17_u64 {
+        fs::write(source.path().join("state.txt"), index.to_be_bytes())?;
+        let result = client.backup(
+            repository.clone(),
+            incremental_request(source.path())?.with_created_at(400 + index),
+        )?;
+        let id = result.snapshot().snapshot_id()?;
+        let prefix = id.as_str().chars().next().ok_or("snapshot ID is empty")?;
+        if first_by_prefix.insert(prefix, id.clone()).is_some() {
+            ambiguous_prefix = Some(prefix.to_string());
+            break;
+        }
+    }
+    let ambiguous_prefix = ambiguous_prefix.ok_or("did not produce an ambiguous prefix")?;
+    let before_ambiguous_head = repository.read_head()?;
+    let before_ambiguous_objects = immutable_object_count(&storage)?;
+    let ambiguous = client
+        .backup(
+            repository.clone(),
+            incremental_request(source.path())?
+                .with_parent_reference(ambiguous_prefix)?
+                .with_created_at(500),
+        )
+        .expect_err("an ambiguous parent must fail before publication");
+    assert!(matches!(
+        ambiguous,
+        SdkError::BackupStageFailed { stage: BackupStage::Publish, source }
+            if source.code() == ErrorCode::SnapshotReferenceAmbiguous
+    ));
+    assert_eq!(repository.read_head()?, before_ambiguous_head);
+    assert_eq!(immutable_object_count(&storage)?, before_ambiguous_objects);
+    assert!(base.snapshot().as_str().starts_with("snapshots/"));
+    Ok(())
+}
+
+#[test]
+fn missing_or_incompatible_parent_is_rejected_without_publication() -> Result<(), Box<dyn Error>> {
+    let source = TestDirectory::new()?;
+    fs::write(source.path().join("state.txt"), b"state")?;
+    let storage = MemoryStorage::new();
+    let client = Client::default();
+    let repository = repository(&client, &storage)?;
+    let base = client.backup(
+        repository.clone(),
+        incremental_request(source.path())?.with_created_at(600),
+    )?;
+    let base_snapshot = Snapshot::from_bytes(&storage.read_object(base.snapshot().as_str())?)?;
+    let root = base_snapshot
+        .root_tree()
+        .ok_or("base snapshot has no root tree")?
+        .as_str()
+        .to_owned();
+    let root_bytes = storage.read_object(&root)?;
+    assert!(storage.remove_object(&root)?);
+    let before_head = repository.read_head()?;
+    let missing = client
+        .backup(
+            repository.clone(),
+            incremental_request(source.path())?
+                .with_parent_reference(base.snapshot().snapshot_id()?)?
+                .with_created_at(601),
+        )
+        .expect_err("a missing parent root must fail before publication");
+    assert!(matches!(
+        missing,
+        SdkError::BackupStageFailed { stage: BackupStage::Pack, source }
+            if source.code() == ErrorCode::RepositoryRequiredObjectMissing
+    ));
+    assert_eq!(repository.read_head()?, before_head);
+
+    storage.put(&root, &root_bytes)?;
+    let incompatible_id = gib::SnapshotId::new("incompatible-parent")?;
+    let incompatible = Snapshot::new(incompatible_id.clone(), "incompatible", 602)?;
+    let incompatible_reference = incompatible.reference()?;
+    storage.put(incompatible_reference.as_str(), &incompatible.to_bytes()?)?;
+    assert!(storage.remove_object("refs/history/00000000000000000001")?);
+    let before_incompatible_head = repository.read_head()?;
+    let incompatible_error = client
+        .backup(
+            repository.clone(),
+            incremental_request(source.path())?
+                .with_parent_reference(incompatible_id.as_str())?
+                .with_created_at(603),
+        )
+        .expect_err("a parent without a root tree must be rejected");
+    assert!(matches!(
+        incompatible_error,
+        SdkError::BackupStageFailed { stage: BackupStage::Publish, source }
+            if source.code() == ErrorCode::RepositoryIncompatible
+    ));
+    assert_eq!(repository.read_head()?, before_incompatible_head);
     Ok(())
 }
 
@@ -625,6 +887,38 @@ fn assert_published_graph(
         assert_eq!(range_bytes, pack.payload(location)?);
     }
     Ok(())
+}
+
+fn snapshot_root(
+    storage: &MemoryStorage,
+    snapshot: &Snapshot,
+) -> Result<(gib::TreeNodeReference, DirectoryNode), Box<dyn Error>> {
+    let root = snapshot.root_tree().ok_or("snapshot has no root tree")?;
+    let id = ObjectId::from_hex(
+        root.as_str()
+            .strip_prefix("trees/")
+            .ok_or("snapshot root is not a tree object")?,
+    )?;
+    let reference = gib::TreeNodeReference::directory(id);
+    let node = decode_tree_node_object(&storage.read_object(root.as_str())?)?;
+    let directory = node
+        .as_directory()
+        .ok_or("snapshot root is not a directory")?;
+    Ok((reference, directory.clone()))
+}
+
+fn tree_child(
+    storage: &MemoryStorage,
+    directory: &DirectoryNode,
+    name: &str,
+) -> Result<(gib::TreeNodeReference, TreeNode), Box<dyn Error>> {
+    let entry = directory
+        .entry(&EntryName::new(name)?)
+        .ok_or_else(|| format!("tree entry is missing: {name}"))?;
+    let node = decode_tree_node_object(
+        &storage.read_object(&format!("trees/{}", entry.reference().id()))?,
+    )?;
+    Ok((entry.reference().clone(), node))
 }
 
 #[test]

@@ -59,6 +59,30 @@ corrupted root cannot be committed.
 content. `uploaded_objects` counts only successful new immutable object
 creates; conditional `AlreadyExists` results are not counted.
 
+## Parent-based incremental snapshots
+
+`BackupRequest::with_parent` accepts a validated full snapshot ID or selector.
+`with_parent_latest` selects the current HEAD, while `without_parent` explicitly
+requests a parentless snapshot. Textual selectors can be validated with
+`with_parent_reference`, and the shared repository resolver accepts `latest`, a
+full ID, or a unique ID prefix. Resolution and the parent snapshot's root
+validation happen before the backup can publish a new snapshot.
+
+The tree stage compares each source entry with the direct entry at the same
+path in the selected parent. File and link nodes are reused only when their
+content-addressed node reference, kind, and portable metadata match. Directory
+nodes are rebuilt only when their canonical metadata or child references differ;
+otherwise the old reference is retained. Parent directories are loaded lazily
+along source paths, so parent-only deleted subtrees are not walked. A deleted
+source entry is therefore absent from the new directory, while a rename is a
+removed old name plus a new name that may still reuse the same leaf node. Type
+changes always carry the new typed reference.
+
+The selected parent ID is included in the new snapshot identity and recorded in
+the snapshot header. The parent remains immutable. Final publication still
+validates the complete new graph and its parent chain, so missing or corrupt
+parent objects fail closed without advancing HEAD.
+
 The filesystem scanner retains one directory enumerator per active path
 component. Because that adapter owns its private directory-frame collection,
 the backup worker conservatively reserves its configured maximum directory
@@ -120,12 +144,14 @@ Focused pipeline tests cover authoritative metadata, complete graph traversal,
 observed resource peaks, cancellation, typed injected storage failures before
 and after upload, slow storage, slow events, idempotent retry after a HEAD
 conflict, history-index failure, identical snapshots, duplicate files, shifted
-content, one-leaf tree edits, missing packs, corrupt indexes, and a one-shard
-deduplication cache. Repository tests also cover concurrent CAS publication and
-typed expected/current HEAD conflict context.
+content, explicit/latest/prefix and parentless selection, deletions, renames,
+type changes, missing or incompatible parents, one-leaf tree edits, missing
+packs, corrupt indexes, and a one-shard deduplication cache. Repository tests
+also cover concurrent CAS publication and typed expected/current HEAD conflict
+context.
 The one-million-entry stress test is opt-in because it creates a large
 temporary dataset. The standalone benchmark performs and reports a cold first
-backup and a warm unchanged incremental backup against the same repository per
+backup and a parent-based incremental backup against the same repository per
 run. Dataset size and run count are controlled by environment variables.
 
 Useful commands from the workspace root:
@@ -143,6 +169,13 @@ and repository directories separate:
 cargo run -p gib-examples --example backup_pipeline_qa -- \
   /path/to/source /tmp/gib-qa-repository \
   --memory-mib 64 --cpu 2 --fds 16 --network 1 --queue 1
+```
+
+The QA example accepts `--parent VALUE`; omitting `VALUE` selects `latest`:
+
+```bash
+cargo run -p gib-examples --example backup_pipeline_qa -- \
+  /path/to/source /tmp/gib-qa-repository --parent latest
 ```
 
 See the repository completion report for the exact full-workspace validation

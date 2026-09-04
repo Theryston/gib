@@ -15,9 +15,10 @@ use crate::domain::{
     ObjectEncryption, ObjectId, ObjectKind, ObjectTransformOptions, PACK_ALIGNMENT,
     PACK_ENTRY_HEADER_LENGTH, PACK_FOOTER_LENGTH, PACK_HEADER_LENGTH, PACK_INDEX_RECORD_LENGTH,
     PackConfiguration, PackEntryInput, PackIndexConfiguration, PackIndexEntry, PackIndexId,
-    PackIndexShardId, PackIndexTransform, PortableMetadata, RegularFileNode, RepositoryHead,
-    SealedPack, SealedPackIndexShard, Snapshot, SnapshotId, SnapshotPublication, SnapshotReference,
-    SnapshotSummary, SymbolicLinkNode, TreeEntry, TreeNode, TreeNodeReference,
+    PackIndexShardId, PackIndexTransform, PortableMetadata, RegularFileNode, SealedPack,
+    SealedPackIndexShard, Snapshot, SnapshotId, SnapshotPublication, SnapshotReference,
+    SnapshotSelector, SnapshotSummary, SymbolicLinkNode, TreeEntry, TreeNode, TreeNodeKind,
+    TreeNodeReference,
 };
 use crate::format::{
     EncryptionContext, PackBuilder as FormatPackBuilder, PackIndexFormatError,
@@ -65,6 +66,8 @@ pub(crate) struct BackupRunRequest {
     pub(crate) index: PackIndexConfiguration,
     pub(crate) deduplication: BackupDeduplicationConfiguration,
     pub(crate) transforms: ObjectTransformOptions,
+    pub(crate) parent: Option<SnapshotSelector>,
+    pub(crate) parent_disabled: bool,
 }
 
 /// The application result returned after HEAD publication succeeds.
@@ -88,7 +91,10 @@ pub(crate) enum BackupRepositoryFailure {
     UnsupportedCapability,
     Cancelled,
     NoSnapshots,
-    SnapshotReference,
+    SnapshotReferenceEmpty,
+    SnapshotReferenceMalformed,
+    SnapshotReferenceNotFound,
+    SnapshotReferenceAmbiguous,
     Storage,
 }
 
@@ -178,6 +184,25 @@ where
             return Err(error);
         }
     };
+
+    let parent = match resolve_backup_parent(
+        Arc::clone(&storage),
+        &head,
+        &request,
+        &memory,
+        &cpu_workers,
+        &file_descriptors,
+        &network_requests,
+        &control,
+    ) {
+        Ok(parent) => parent,
+        Err(error) => {
+            progress.close();
+            progress.join();
+            return Err(error);
+        }
+    };
+    let parent_id = parent.as_ref().map(|parent| parent.snapshot_id.clone());
 
     let catalog = match ExistingContentCatalog::discover(
         Arc::clone(&storage),
@@ -287,6 +312,9 @@ where
         let metrics = Arc::clone(&metrics);
         let progress = progress.clone();
         let chunking = request.chunking;
+        let parent = parent;
+        let file_descriptors = Arc::clone(&file_descriptors);
+        let network_requests = Arc::clone(&network_requests);
         spawn_stage(
             &mut handles,
             "gib-backup-tree",
@@ -303,6 +331,9 @@ where
                     metrics,
                     progress,
                     chunking,
+                    parent,
+                    file_descriptors,
+                    network_requests,
                 );
             },
             &control,
@@ -541,10 +572,6 @@ where
     };
 
     let created_at = request.created_at.unwrap_or_else(current_unix_seconds);
-    let parent = head
-        .head
-        .snapshot()
-        .and_then(|reference| SnapshotId::from_reference(reference).ok());
     let snapshot_id = {
         let _cpu = UnitPermit::acquire(
             &cpu_workers,
@@ -552,7 +579,7 @@ where
             BackupStage::Publish,
             BackupResource::CpuWorkers,
         )?;
-        snapshot_id_for(&tree_result.root, &request, &head.head, created_at)
+        snapshot_id_for(&tree_result.root, &request, parent_id.as_ref(), created_at)
     }?;
     let root_object = tree_result
         .root
@@ -566,7 +593,7 @@ where
         }
     })?;
     snapshot = snapshot
-        .with_parent(parent)
+        .with_parent(parent_id)
         .with_root_tree(root_object.clone());
     if let Some(author) = request.author {
         snapshot = snapshot
@@ -670,6 +697,131 @@ where
         snapshot: snapshot_reference,
         metrics: metrics.snapshot(&memory, &cpu_workers, &file_descriptors, &network_requests),
     })
+}
+
+struct ResolvedParent {
+    snapshot_id: SnapshotId,
+    root: TreeNodeReference,
+    root_node: DirectoryNode,
+    root_memory: MemoryPermit,
+    storage: Arc<dyn RepositoryStorage>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_backup_parent(
+    storage: Arc<dyn RepositoryStorage>,
+    head: &HeadRead,
+    request: &BackupRunRequest,
+    memory: &Arc<ResourceBudget>,
+    cpu_workers: &Arc<ResourceBudget>,
+    file_descriptors: &Arc<ResourceBudget>,
+    network_requests: &Arc<ResourceBudget>,
+    control: &PipelineControl,
+) -> Result<Option<ResolvedParent>, BackupError> {
+    let reference = if request.parent_disabled {
+        None
+    } else if let Some(selector) = request.parent.as_ref() {
+        let reference = {
+            let _memory = memory.reserve(4 * 1024, control, BackupStage::Publish)?;
+            let _network = UnitPermit::acquire(
+                network_requests,
+                control,
+                BackupStage::Publish,
+                BackupResource::NetworkRequests,
+            )?;
+            let _descriptor = UnitPermit::acquire(
+                file_descriptors,
+                control,
+                BackupStage::Publish,
+                BackupResource::FileDescriptors,
+            )?;
+            let _cpu = UnitPermit::acquire(
+                cpu_workers,
+                control,
+                BackupStage::Publish,
+                BackupResource::CpuWorkers,
+            )?;
+            repository::resolve_snapshot_reference(storage.as_ref(), selector.as_str())
+                .map_err(|error| map_repository_error(BackupStage::Publish, error))?
+        };
+        Some(reference)
+    } else {
+        head.head.snapshot().cloned()
+    };
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+
+    let snapshot = {
+        let _memory = memory.reserve(4 * 1024, control, BackupStage::Publish)?;
+        let _network = UnitPermit::acquire(
+            network_requests,
+            control,
+            BackupStage::Publish,
+            BackupResource::NetworkRequests,
+        )?;
+        let _descriptor = UnitPermit::acquire(
+            file_descriptors,
+            control,
+            BackupStage::Publish,
+            BackupResource::FileDescriptors,
+        )?;
+        let _cpu = UnitPermit::acquire(
+            cpu_workers,
+            control,
+            BackupStage::Publish,
+            BackupResource::CpuWorkers,
+        )?;
+        repository::read_snapshot(storage.as_ref(), &reference)
+            .map_err(|error| map_repository_error(BackupStage::Publish, error))?
+    };
+    let root = repository::snapshot_root_tree_reference(&snapshot)
+        .map_err(|error| map_repository_error(BackupStage::Publish, error))?;
+    let root_node = {
+        let _network = UnitPermit::acquire(
+            network_requests,
+            control,
+            BackupStage::Pack,
+            BackupResource::NetworkRequests,
+        )?;
+        let _descriptor = UnitPermit::acquire(
+            file_descriptors,
+            control,
+            BackupStage::Pack,
+            BackupResource::FileDescriptors,
+        )?;
+        let _cpu = UnitPermit::acquire(
+            cpu_workers,
+            control,
+            BackupStage::Pack,
+            BackupResource::CpuWorkers,
+        )?;
+        repository::read_tree_node(storage.as_ref(), &root)
+            .map_err(|error| map_repository_error(BackupStage::Pack, error))?
+    };
+    let root_node = match root_node {
+        TreeNode::Directory(directory) => directory,
+        TreeNode::RegularFile(_) | TreeNode::SymbolicLink(_) => {
+            return Err(map_repository_error(
+                BackupStage::Publish,
+                RepositoryError::Malformed {
+                    reason: "snapshot root tree does not contain a directory node",
+                },
+            ));
+        }
+    };
+    let root_memory = memory.try_reserve(
+        tree_node_estimate(&TreeNode::Directory(root_node.clone())),
+        BackupStage::Pack,
+    )?;
+
+    Ok(Some(ResolvedParent {
+        snapshot_id: snapshot.id().clone(),
+        root,
+        root_node,
+        root_memory,
+        storage,
+    }))
 }
 
 fn validate_request(
@@ -1199,11 +1351,21 @@ struct OpenDirectory {
     memory: MemoryPermit,
 }
 
+struct ParentTreeState {
+    root: TreeNodeReference,
+    root_node: DirectoryNode,
+    _root_memory: MemoryPermit,
+    storage: Arc<dyn RepositoryStorage>,
+}
+
 struct DirectoryAccumulator {
     path: crate::domain::RelativePath,
     metadata: PortableMetadata,
     entries: Vec<TreeEntry>,
     memory: MemoryPermit,
+    parent_reference: Option<TreeNodeReference>,
+    parent_node: Option<DirectoryNode>,
+    parent_memory: Option<MemoryPermit>,
 }
 
 struct TreeSequenceState {
@@ -1242,17 +1404,118 @@ struct TreeBuildState {
     files: u64,
     directory_count: u64,
     total_size: u64,
+    parent: Option<ParentTreeState>,
 }
 
 impl TreeBuildState {
-    fn new() -> Self {
+    fn new(parent: Option<ResolvedParent>) -> Self {
+        let parent = parent.map(|parent| ParentTreeState {
+            root: parent.root,
+            root_node: parent.root_node,
+            _root_memory: parent.root_memory,
+            storage: parent.storage,
+        });
         Self {
             directories: Vec::new(),
             root: None,
             files: 0,
             directory_count: 0,
             total_size: 0,
+            parent,
         }
+    }
+
+    fn parent_reference_for(&self, name: Option<&EntryName>) -> Option<TreeNodeReference> {
+        let name = name?;
+        self.directories
+            .last()
+            .and_then(|directory| directory.parent_node.as_ref())
+            .and_then(|directory| directory.child(name).cloned())
+    }
+
+    fn parent_root(&self) -> Option<(TreeNodeReference, DirectoryNode)> {
+        self.parent
+            .as_ref()
+            .map(|parent| (parent.root.clone(), parent.root_node.clone()))
+    }
+
+    fn load_parent_directory(
+        &self,
+        reference: &TreeNodeReference,
+        context: &TreeStageContext,
+    ) -> Result<(DirectoryNode, MemoryPermit), ()> {
+        let Some(parent) = self.parent.as_ref() else {
+            context.control.fail(BackupError::Invalid {
+                stage: BackupStage::Pack,
+            });
+            return Err(());
+        };
+        let node = {
+            let _network = match UnitPermit::acquire(
+                &context.network_requests,
+                &context.control,
+                BackupStage::Pack,
+                BackupResource::NetworkRequests,
+            ) {
+                Ok(permit) => permit,
+                Err(error) => {
+                    context.control.fail(error);
+                    return Err(());
+                }
+            };
+            let _descriptor = match UnitPermit::acquire(
+                &context.file_descriptors,
+                &context.control,
+                BackupStage::Pack,
+                BackupResource::FileDescriptors,
+            ) {
+                Ok(permit) => permit,
+                Err(error) => {
+                    context.control.fail(error);
+                    return Err(());
+                }
+            };
+            let _cpu = match UnitPermit::acquire(
+                &context.cpu_workers,
+                &context.control,
+                BackupStage::Pack,
+                BackupResource::CpuWorkers,
+            ) {
+                Ok(permit) => permit,
+                Err(error) => {
+                    context.control.fail(error);
+                    return Err(());
+                }
+            };
+            match repository::read_tree_node(parent.storage.as_ref(), reference) {
+                Ok(node) => node,
+                Err(error) => {
+                    context
+                        .control
+                        .fail(map_repository_error(BackupStage::Pack, error));
+                    return Err(());
+                }
+            }
+        };
+        let estimate = tree_node_estimate(&node);
+        let node_memory =
+            match context
+                .memory
+                .reserve(estimate, &context.control, BackupStage::Pack)
+            {
+                Ok(memory) => memory,
+                Err(error) => {
+                    context.control.fail(error);
+                    return Err(());
+                }
+            };
+        let Some(directory) = node.as_directory().cloned() else {
+            context.control.fail(BackupError::Invalid {
+                stage: BackupStage::Pack,
+            });
+            return Err(());
+        };
+        Ok((directory, node_memory))
     }
 }
 
@@ -1261,6 +1524,8 @@ struct TreeStageContext {
     upload_sender: SyncSender<UploadWork>,
     memory: Arc<ResourceBudget>,
     cpu_workers: Arc<ResourceBudget>,
+    file_descriptors: Arc<ResourceBudget>,
+    network_requests: Arc<ResourceBudget>,
     control: PipelineControl,
     progress: ProgressReporter,
 }
@@ -2633,16 +2898,21 @@ fn run_tree_worker(
     _metrics: Arc<MetricsState>,
     progress: ProgressReporter,
     _chunking: ChunkingConfiguration,
+    parent: Option<ResolvedParent>,
+    file_descriptors: Arc<ResourceBudget>,
+    network_requests: Arc<ResourceBudget>,
 ) {
     let mut pending: BTreeMap<u64, Vec<TreeMessage>> = BTreeMap::new();
     let mut current = None;
     let mut next_sequence = 0_u64;
-    let mut tree = TreeBuildState::new();
+    let mut tree = TreeBuildState::new(parent);
     let context = TreeStageContext {
         pack_sender,
         upload_sender,
         memory,
         cpu_workers,
+        file_descriptors,
+        network_requests,
         control,
         progress,
     };
@@ -3005,6 +3275,8 @@ fn finish_tree_file_if_ready(
         memory: entry_memory,
         ..
     } = entry_message;
+    let name = filesystem_entry.name();
+    let existing = tree.parent_reference_for(name.as_ref());
     let metadata = portable_metadata(filesystem_entry.metadata());
     let references = std::mem::take(&mut state.references);
     let reference_memory = state.reference_memory.take();
@@ -3025,9 +3297,10 @@ fn finish_tree_file_if_ready(
         &context.memory,
         &context.cpu_workers,
         &context.control,
+        existing,
     )?;
     drop(reference_memory);
-    add_tree_reference(tree, filesystem_entry.name(), reference, context)?;
+    add_tree_reference(tree, name, reference, context)?;
     tree.files = tree.files.saturating_add(1);
     tree.total_size = tree
         .total_size
@@ -3048,6 +3321,29 @@ fn process_tree_non_file(
         ..
     } = message;
     let name = filesystem_entry.name();
+    let (parent_reference, parent_node, parent_memory) = if filesystem_entry.is_root() {
+        match tree.parent_root() {
+            Some((reference, node)) => (Some(reference), Some(node), None),
+            None => (None, None, None),
+        }
+    } else {
+        let reference = tree.parent_reference_for(name.as_ref());
+        if reference
+            .as_ref()
+            .is_some_and(|reference| reference.kind().is_directory())
+        {
+            let Some(reference) = reference.as_ref() else {
+                context.control.fail(BackupError::Thread {
+                    stage: BackupStage::Pack,
+                });
+                return Err(());
+            };
+            let (node, memory) = tree.load_parent_directory(reference, context)?;
+            (Some(reference.clone()), Some(node), Some(memory))
+        } else {
+            (reference, None, None)
+        }
+    };
     let metadata = portable_metadata(filesystem_entry.metadata());
     match filesystem_entry.kind() {
         FilesystemEntryKind::Directory => {
@@ -3056,6 +3352,9 @@ fn process_tree_non_file(
                 metadata,
                 entries: Vec::new(),
                 memory: entry_memory,
+                parent_reference,
+                parent_node,
+                parent_memory,
             });
             Ok(())
         }
@@ -3074,6 +3373,7 @@ fn process_tree_non_file(
                 &context.memory,
                 &context.cpu_workers,
                 &context.control,
+                parent_reference,
             )?;
             add_tree_reference(tree, name, reference, context)
         }
@@ -3118,6 +3418,9 @@ fn process_tree_directory_end(
         metadata: directory_metadata,
         entries: directory_entries,
         memory: directory_memory,
+        parent_reference,
+        parent_node,
+        parent_memory,
     } = directory;
     if directory_path != path {
         context.control.fail(BackupError::Invalid {
@@ -3141,7 +3444,7 @@ fn process_tree_directory_end(
                 return Err(());
             }
         };
-    let (kind, encoded) = {
+    let (directory_node, encoded) = {
         let _cpu = match UnitPermit::acquire(
             &context.cpu_workers,
             &context.control,
@@ -3154,8 +3457,8 @@ fn process_tree_directory_end(
                 return Err(());
             }
         };
-        let node = match DirectoryNode::new(directory_metadata, directory_entries) {
-            Ok(node) => TreeNode::Directory(node),
+        let directory_node = match DirectoryNode::new(directory_metadata, directory_entries) {
+            Ok(node) => node,
             Err(_) => {
                 context.control.fail(BackupError::Invalid {
                     stage: BackupStage::Pack,
@@ -3163,9 +3466,9 @@ fn process_tree_directory_end(
                 return Err(());
             }
         };
-        let kind = node.kind();
+        let node = TreeNode::Directory(directory_node.clone());
         let encoded = encode_tree_node_with_id(&node);
-        (kind, encoded)
+        (directory_node, encoded)
     };
     let (id, bytes) = match encoded {
         Ok(value) => value,
@@ -3194,23 +3497,31 @@ fn process_tree_directory_end(
         });
         return Err(());
     }
-    let reference_id = id.clone();
+    let reference = TreeNodeReference::new(id, TreeNodeKind::Directory);
+    let unchanged = parent_reference.as_ref() == Some(&reference)
+        && parent_node
+            .as_ref()
+            .is_some_and(|parent_node| parent_node == &directory_node);
     drop(directory_memory);
     drop(end_memory);
-    if send_message(
-        &context.upload_sender,
-        UploadWork::Tree {
-            id,
-            bytes,
-            memory: node_memory,
-        },
-        &context.control,
-    )
-    .is_err()
-    {
-        return Err(());
+    drop(parent_memory);
+    if unchanged {
+        drop(node_memory);
+    } else {
+        if send_message(
+            &context.upload_sender,
+            UploadWork::Tree {
+                id: reference.id().clone(),
+                bytes,
+                memory: node_memory,
+            },
+            &context.control,
+        )
+        .is_err()
+        {
+            return Err(());
+        }
     }
-    let reference = TreeNodeReference::new(reference_id, kind);
     if let Some(parent) = tree.directories.last_mut() {
         add_directory_entry(
             parent,
@@ -3238,6 +3549,7 @@ fn emit_tree_node(
     memory: &Arc<ResourceBudget>,
     cpu_workers: &Arc<ResourceBudget>,
     control: &PipelineControl,
+    existing: Option<TreeNodeReference>,
 ) -> Result<TreeNodeReference, ()> {
     let estimate = tree_node_estimate(&node);
     let mut node_memory = match memory.reserve(estimate, control, BackupStage::Pack) {
@@ -3286,6 +3598,11 @@ fn emit_tree_node(
         return Err(());
     }
     let reference = TreeNodeReference::new(id.clone(), node.kind());
+    if existing.as_ref() == Some(&reference) {
+        drop(node_memory);
+        drop(input_memory);
+        return Ok(reference);
+    }
     if send_message(
         upload_sender,
         UploadWork::Tree {
@@ -4339,13 +4656,19 @@ fn map_repository_error(stage: BackupStage, error: RepositoryError) -> BackupErr
         RepositoryError::UnsupportedCapability => BackupRepositoryFailure::UnsupportedCapability,
         RepositoryError::Cancelled => BackupRepositoryFailure::Cancelled,
         RepositoryError::NoSnapshots => BackupRepositoryFailure::NoSnapshots,
-        RepositoryError::SnapshotReferenceEmpty
-        | RepositoryError::SnapshotReferenceMalformed
-        | RepositoryError::SnapshotReferenceNotFound
-        | RepositoryError::SnapshotReferenceAmbiguous
-        | RepositoryError::SnapshotHistoryRequestInvalid
+        RepositoryError::SnapshotReferenceEmpty => BackupRepositoryFailure::SnapshotReferenceEmpty,
+        RepositoryError::SnapshotReferenceMalformed => {
+            BackupRepositoryFailure::SnapshotReferenceMalformed
+        }
+        RepositoryError::SnapshotReferenceNotFound => {
+            BackupRepositoryFailure::SnapshotReferenceNotFound
+        }
+        RepositoryError::SnapshotReferenceAmbiguous => {
+            BackupRepositoryFailure::SnapshotReferenceAmbiguous
+        }
+        RepositoryError::SnapshotHistoryRequestInvalid
         | RepositoryError::SnapshotHistoryCursorInvalid => {
-            BackupRepositoryFailure::SnapshotReference
+            BackupRepositoryFailure::SnapshotReferenceMalformed
         }
         RepositoryError::Storage { .. } => BackupRepositoryFailure::Storage,
     };
@@ -4448,7 +4771,7 @@ fn pack_index_transform(
 fn snapshot_id_for(
     root: &TreeNodeReference,
     request: &BackupRunRequest,
-    head: &RepositoryHead,
+    parent: Option<&SnapshotId>,
     created_at: u64,
 ) -> Result<SnapshotId, BackupError> {
     let mut hasher = Sha256::new();
@@ -4459,7 +4782,7 @@ fn snapshot_id_for(
     if let Some(author) = &request.author {
         hasher.update(author.as_bytes());
     }
-    if let Some(parent) = head.snapshot() {
+    if let Some(parent) = parent {
         hasher.update(parent.as_str().as_bytes());
     }
     let digest = hasher.finalize();

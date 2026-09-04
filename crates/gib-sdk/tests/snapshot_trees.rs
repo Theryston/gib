@@ -281,6 +281,67 @@ fn one_leaf_change_rewrites_only_its_ancestor_chain() -> Result<(), Box<dyn Erro
 }
 
 #[test]
+fn incremental_update_supports_add_delete_and_type_replacement() -> Result<(), Box<dyn Error>> {
+    let (tree, _) = fixture()?;
+    let storage = MemoryStorage::new();
+    publish(&tree, &storage)?;
+    let store = RepositoryTreeStore::new(storage.clone());
+    let builder = IncrementalTreeBuilder::new(store.clone());
+
+    let deleted = builder.update(tree.root().clone(), &RelativePath::new("readme")?, None)?;
+    assert_eq!(deleted.objects().len(), 1);
+    publish(&deleted, &storage)?;
+    let deleted_tree = LazyTree::new(deleted.root_id().clone(), store.clone());
+    assert!(
+        deleted_tree
+            .lookup(&RelativePath::new("readme")?)?
+            .is_none()
+    );
+
+    let added = builder.update(
+        tree.root().clone(),
+        &RelativePath::new("added")?,
+        Some(&file_node(b"added content", 0o644)?),
+    )?;
+    assert_eq!(added.objects().len(), 2);
+    publish(&added, &storage)?;
+    assert!(
+        LazyTree::new(added.root_id().clone(), store.clone())
+            .lookup(&RelativePath::new("added")?)?
+            .is_some()
+    );
+
+    let replaced = builder.update(
+        tree.root().clone(),
+        &RelativePath::new("empty")?,
+        Some(&file_node(b"directory became a file", 0o644)?),
+    )?;
+    publish(&replaced, &storage)?;
+    let node = LazyTree::new(replaced.root_id().clone(), store.clone())
+        .lookup(&RelativePath::new("empty")?)?
+        .ok_or("replaced node is missing")?;
+    assert_eq!(node.kind(), TreeNodeKind::RegularFile);
+    assert_eq!(replaced.objects().len(), 2);
+
+    let replacement_link = TreeNode::SymbolicLink(SymbolicLinkNode::new(
+        SymlinkTarget::new(b"../replacement")?,
+        metadata(0o777)?,
+    ));
+    let link_replaced = builder.update(
+        tree.root().clone(),
+        &RelativePath::new("link")?,
+        Some(&replacement_link),
+    )?;
+    publish(&link_replaced, &storage)?;
+    let node = LazyTree::new(link_replaced.root_id().clone(), store)
+        .lookup(&RelativePath::new("link")?)?
+        .ok_or("replaced link is missing")?;
+    assert_eq!(node.kind(), TreeNodeKind::SymbolicLink);
+    assert_eq!(link_replaced.objects().len(), 2);
+    Ok(())
+}
+
+#[test]
 fn lazy_lookup_and_walk_materialize_only_the_current_path() -> Result<(), Box<dyn Error>> {
     let (tree, _) = fixture()?;
     let store = map_store(&tree)?;

@@ -423,6 +423,49 @@ where
         path: &RelativePath,
         replacement: &TreeNode,
     ) -> SdkResult<BuiltTree> {
+        let components: Vec<_> = path.components().collect();
+        if path.is_root() || components.is_empty() {
+            return Err(SdkError::InvalidRequest {
+                field: "path",
+                reason: "incremental leaf replacement requires a non-root path",
+            });
+        }
+        let mut current = root.clone();
+        for (index, component) in components.iter().enumerate() {
+            let node = self.store.load(&current)?;
+            let directory = node.as_directory().ok_or(SdkError::RepositoryMalformed {
+                reason: "tree path descends through a non-directory node",
+            })?;
+            let entry = directory.entry(component).ok_or(SdkError::InvalidRequest {
+                field: "path",
+                reason: "incremental leaf path does not exist",
+            })?;
+            let child = entry.reference().clone();
+            if index + 1 == components.len() && child.kind().is_directory() {
+                return Err(SdkError::InvalidRequest {
+                    field: "path",
+                    reason: "incremental leaf replacement requires a non-directory target",
+                });
+            }
+            if index + 1 < components.len() && !child.kind().is_directory() {
+                return Err(SdkError::RepositoryMalformed {
+                    reason: "tree path descends through a non-directory reference",
+                });
+            }
+            current = child;
+        }
+        self.update(root, path, Some(replacement))
+    }
+
+    /// Adds, replaces, or removes a path while retaining unrelated subtree
+    /// references. A `None` replacement deletes the final path component; an
+    /// absent path is a no-op for deletion.
+    pub fn update(
+        &self,
+        root: TreeNodeReference,
+        path: &RelativePath,
+        replacement: Option<&TreeNode>,
+    ) -> SdkResult<BuiltTree> {
         if !root.kind().is_directory() {
             return Err(SdkError::RepositoryMalformed {
                 reason: "tree root reference is not a directory",
@@ -443,46 +486,77 @@ where
             let directory = node.as_directory().ok_or(SdkError::RepositoryMalformed {
                 reason: "tree path descends through a non-directory node",
             })?;
-            let entry = directory.entry(component).ok_or(SdkError::InvalidRequest {
-                field: "path",
-                reason: "incremental leaf path does not exist",
-            })?;
-            let child = entry.reference().clone();
-            ancestors.push((directory.clone(), component.clone()));
-            if index + 1 < components.len() && !child.kind().is_directory() {
-                return Err(SdkError::RepositoryMalformed {
-                    reason: "tree path descends through a non-directory reference",
-                });
-            }
-            current = child;
-        }
-
-        if current.kind().is_directory() {
-            return Err(SdkError::InvalidRequest {
-                field: "path",
-                reason: "incremental leaf replacement requires a non-directory target",
-            });
-        }
-        let replacement_reference = replacement.reference()?;
-        if replacement_reference == current {
-            return TreeBuilder::new().finish(root);
-        }
-
-        let mut builder = TreeBuilder::new();
-        let mut child = builder.add_node(replacement)?;
-        for (directory, name) in ancestors.into_iter().rev() {
-            let mut entries = directory.entries().to_vec();
-            let index = entries
-                .binary_search_by(|entry| entry.name().cmp(&name))
-                .map_err(|_| SdkError::RepositoryMalformed {
-                    reason: "tree directory changed while rebuilding its ancestor chain",
+            let entry = directory.entry(component);
+            if index + 1 < components.len() {
+                let child = entry.ok_or(SdkError::InvalidRequest {
+                    field: "path",
+                    reason: "incremental path ancestor does not exist",
                 })?;
-            entries[index] = TreeEntry::new(name, child).map_err(map_tree_validation_error)?;
+                let child = child.reference().clone();
+                if !child.kind().is_directory() {
+                    return Err(SdkError::RepositoryMalformed {
+                        reason: "tree path descends through a non-directory reference",
+                    });
+                }
+                ancestors.push((directory.clone(), component.clone()));
+                current = child;
+                continue;
+            }
+
+            let replacement_reference = replacement.map(TreeNode::reference).transpose()?;
+            let Some(existing) = entry else {
+                let Some(replacement) = replacement else {
+                    return TreeBuilder::new().finish(root);
+                };
+                let mut builder = TreeBuilder::new();
+                let replacement_reference = builder.add_node(replacement)?;
+                let mut entries = directory.entries().to_vec();
+                entries.push(
+                    TreeEntry::new(component.clone(), replacement_reference)
+                        .map_err(map_tree_validation_error)?,
+                );
+                let directory = DirectoryNode::new(directory.metadata().clone(), entries)
+                    .map_err(map_tree_validation_error)?;
+                let child = builder.add_node(&TreeNode::Directory(directory))?;
+                return rebuild_ancestor_chain(builder, child, ancestors);
+            };
+
+            let old_reference = existing.reference().clone();
+            if replacement_reference.as_ref() == Some(&old_reference) {
+                return TreeBuilder::new().finish(root);
+            }
+
+            let mut builder = TreeBuilder::new();
+            let mut entries = directory.entries().to_vec();
+            match replacement {
+                Some(replacement) => {
+                    let replacement_reference = builder.add_node(replacement)?;
+                    let index = entries
+                        .binary_search_by(|entry| entry.name().cmp(component))
+                        .map_err(|_| SdkError::RepositoryMalformed {
+                            reason: "tree directory changed while rebuilding its ancestor chain",
+                        })?;
+                    entries[index] = TreeEntry::new(component.clone(), replacement_reference)
+                        .map_err(map_tree_validation_error)?;
+                }
+                None => {
+                    let index = entries
+                        .binary_search_by(|entry| entry.name().cmp(component))
+                        .map_err(|_| SdkError::RepositoryMalformed {
+                            reason: "tree directory changed while rebuilding its ancestor chain",
+                        })?;
+                    entries.remove(index);
+                }
+            }
             let directory = DirectoryNode::new(directory.metadata().clone(), entries)
                 .map_err(map_tree_validation_error)?;
-            child = builder.add_node(&TreeNode::Directory(directory))?;
+            let child = builder.add_node(&TreeNode::Directory(directory))?;
+            return rebuild_ancestor_chain(builder, child, ancestors);
         }
-        builder.finish(child)
+        Err(SdkError::InvalidRequest {
+            field: "path",
+            reason: "incremental path has no final component",
+        })
     }
 
     /// Alias for [`Self::replace_leaf`].
@@ -494,6 +568,26 @@ where
     ) -> SdkResult<BuiltTree> {
         self.replace_leaf(root, path, replacement)
     }
+}
+
+fn rebuild_ancestor_chain(
+    mut builder: TreeBuilder,
+    mut child: TreeNodeReference,
+    ancestors: Vec<(DirectoryNode, EntryName)>,
+) -> SdkResult<BuiltTree> {
+    for (ancestor, name) in ancestors.into_iter().rev() {
+        let mut entries = ancestor.entries().to_vec();
+        let index = entries
+            .binary_search_by(|entry| entry.name().cmp(&name))
+            .map_err(|_| SdkError::RepositoryMalformed {
+                reason: "tree directory changed while rebuilding its ancestor chain",
+            })?;
+        entries[index] = TreeEntry::new(name, child).map_err(map_tree_validation_error)?;
+        let ancestor = DirectoryNode::new(ancestor.metadata().clone(), entries)
+            .map_err(map_tree_validation_error)?;
+        child = builder.add_node(&TreeNode::Directory(ancestor))?;
+    }
+    builder.finish(child)
 }
 
 fn map_tree_validation_error(error: crate::domain::TreeValidationError) -> SdkError {

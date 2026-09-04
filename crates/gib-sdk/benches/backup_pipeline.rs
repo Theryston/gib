@@ -81,14 +81,20 @@ fn main() {
         }
     };
     println!(
-        "backup pipeline benchmark files={file_count} file_kib={file_kib} source_mib={:.2} runs={runs} memory_mib={memory_mib} modes=cold,warm",
+        "backup pipeline benchmark files={file_count} file_kib={file_kib} source_mib={:.2} runs={runs} memory_mib={memory_mib} modes=cold,parent-incremental",
         source_bytes as f64 / (1024.0 * 1024.0)
     );
     for run in 0..runs {
         match run_once(dataset.path(), file_count, source_bytes, memory_mib) {
             Ok((cold_elapsed, cold_metrics, warm_elapsed, warm_metrics)) => {
                 report(run + 1, source_bytes, "cold", cold_elapsed, cold_metrics);
-                report(run + 1, source_bytes, "warm", warm_elapsed, warm_metrics);
+                report(
+                    run + 1,
+                    source_bytes,
+                    "parent-incremental",
+                    warm_elapsed,
+                    warm_metrics,
+                );
             }
             Err(error) => {
                 eprintln!("backup pipeline benchmark run={} failed: {error}", run + 1);
@@ -137,10 +143,10 @@ fn run_once(
         .with_pack_configuration(PackConfiguration::new(8 * 1024 * 1024, 16 * 1024 * 1024)?)
         .with_index_configuration(PackIndexConfiguration::new(1024 * 1024)?);
     let started = Instant::now();
-    let cold = client.backup(repository.clone(), request.clone())?;
+    let cold = client.backup(repository.clone(), request.clone().without_parent())?;
     let cold_elapsed = started.elapsed();
     let warm_started = Instant::now();
-    let warm = client.backup(repository, request)?;
+    let warm = client.backup(repository, request.with_parent_latest())?;
     let warm_elapsed = warm_started.elapsed();
     if cold.metrics().files() != file_count as u64
         || cold.metrics().total_size() != source_bytes as u64

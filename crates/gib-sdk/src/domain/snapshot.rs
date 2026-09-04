@@ -225,6 +225,14 @@ impl From<SnapshotId> for SnapshotSelector {
     }
 }
 
+impl From<&SnapshotId> for SnapshotSelector {
+    fn from(value: &SnapshotId) -> Self {
+        Self {
+            id: Some(value.as_str().to_owned()),
+        }
+    }
+}
+
 impl From<SnapshotSelector> for String {
     fn from(value: SnapshotSelector) -> Self {
         value.as_str().to_owned()

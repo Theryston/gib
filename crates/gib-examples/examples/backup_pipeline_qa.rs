@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut arguments = std::env::args().skip(1);
+    let mut arguments = std::env::args().skip(1).peekable();
     let source = arguments
         .next()
         .map(PathBuf::from)
@@ -37,6 +37,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 options.cancel_after_ms = Some(parse_next(&mut arguments, "cancellation delay")?)
             }
             "--message" => options.message = arguments.next().ok_or("missing message")?,
+            "--parent" => {
+                options.parent = Some(
+                    arguments
+                        .next_if(|value| !value.starts_with("--"))
+                        .unwrap_or_else(|| String::from("latest")),
+                )
+            }
             _ => return Err(format!("unknown argument {argument}").into()),
         }
     }
@@ -76,7 +83,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         options.network_requests,
         options.queue_capacity,
     )?;
-    let request = BackupRequest::new(&source)
+    let mut request = BackupRequest::new(&source)
         .with_message(options.message)
         .with_budgets(budgets)
         .with_chunking(ChunkingConfiguration::new(
@@ -86,6 +93,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?)
         .with_pack_configuration(PackConfiguration::new(8 * 1024 * 1024, 16 * 1024 * 1024)?)
         .with_index_configuration(PackIndexConfiguration::new(1024 * 1024)?);
+    if let Some(parent) = options.parent {
+        request = request.with_parent_reference(parent)?;
+    }
     let handle = client.start_backup(repository, request)?;
     let cancellation = options.cancel_after_ms.map(|delay| {
         let cancellation = handle.cancellation_handle();
@@ -132,6 +142,7 @@ struct QaOptions {
     slow_events_ms: u64,
     cancel_after_ms: Option<u64>,
     message: String,
+    parent: Option<String>,
 }
 
 impl QaOptions {
@@ -145,6 +156,7 @@ impl QaOptions {
             slow_events_ms: 0,
             cancel_after_ms: None,
             message: String::from("manual bounded backup"),
+            parent: None,
         }
     }
 }
