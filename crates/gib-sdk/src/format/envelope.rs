@@ -266,6 +266,45 @@ pub(crate) fn encode_object_envelope_with_options(
     )
 }
 
+/// Encodes a transformed immutable object with a nonce derived from its
+/// immutable identity. Backup resume uses this variant so that rebuilding a
+/// pack from the same verified plaintext produces the same stored bytes; the
+/// ordinary public encoder continues to use fresh random nonces.
+pub(crate) fn encode_object_envelope_with_options_deterministic(
+    kind: ObjectKind,
+    object_version: u16,
+    options: ObjectTransformOptions,
+    encryption_context: Option<&EncryptionContext>,
+    canonical_plaintext: &[u8],
+) -> Result<Vec<u8>, FormatError> {
+    if options.encryption() != ObjectEncryption::XChaCha20Poly1305 {
+        return encode_object_envelope_with_options(
+            kind,
+            object_version,
+            options,
+            encryption_context,
+            canonical_plaintext,
+        );
+    }
+    let object_id = calculate_object_id(kind, object_version, canonical_plaintext);
+    let mut nonce_digest = Sha256::new();
+    nonce_digest.update(b"GIB backup deterministic nonce\0");
+    nonce_digest.update(kind.as_str().as_bytes());
+    nonce_digest.update(object_version.to_be_bytes());
+    nonce_digest.update(object_id.as_digest());
+    let digest = nonce_digest.finalize();
+    let mut nonce = [0_u8; XCHACHA20_POLY1305_NONCE_LENGTH];
+    nonce.copy_from_slice(&digest[..XCHACHA20_POLY1305_NONCE_LENGTH]);
+    encode_object_envelope_with_options_and_nonce(
+        kind,
+        object_version,
+        options,
+        encryption_context,
+        canonical_plaintext,
+        Some(nonce),
+    )
+}
+
 pub(crate) fn encode_object_envelope_with_encryption(
     kind: ObjectKind,
     object_version: u16,

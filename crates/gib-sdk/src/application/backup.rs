@@ -1,4 +1,5 @@
 use super::filesystem::FilesystemScanner;
+use super::journal::{JournalError, JournalRuntime, LoadedOperationJournal, create_journal};
 use super::ports::{
     ObjectKey, ObjectListRequest, ObjectPrefix, ObjectWriteOptions, RepositoryStorage,
     StorageError, read_stream_to_vec,
@@ -21,16 +22,17 @@ use crate::domain::{
     TreeNodeReference,
 };
 use crate::format::{
-    EncryptionContext, PackBuilder as FormatPackBuilder, PackIndexFormatError,
+    EncryptionContext, OperationJournalCheckpoint, OperationJournalData, OperationJournalState,
+    PackBuilder as FormatPackBuilder, PackIndexFormatError,
     PackIndexShardBuilder as FormatPackIndexShardBuilder, VerifiedPackIndexShard,
-    encode_object_envelope_with_options, encode_snapshot, encode_tree_node_with_id,
+    encode_object_envelope_with_options_deterministic, encode_snapshot, encode_tree_node_with_id,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
@@ -56,6 +58,11 @@ static NEXT_INDEX_SPOOL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The application-owned request passed by the public API after validation.
 pub(crate) struct BackupRunRequest {
+    pub(crate) operation_id: u64,
+    pub(crate) journal_key: String,
+    pub(crate) repository_format_version: u16,
+    pub(crate) repository_identity: String,
+    pub(crate) resume_journal: Option<LoadedOperationJournal>,
     pub(crate) root: PathBuf,
     pub(crate) message: String,
     pub(crate) author: Option<String>,
@@ -128,6 +135,10 @@ pub(crate) enum BackupError {
         stage: BackupStage,
         failure: BackupRepositoryFailure,
     },
+    Journal {
+        stage: BackupStage,
+        error: JournalError,
+    },
     PublicationConflict {
         stage: BackupStage,
         expected: Box<HeadRead>,
@@ -148,7 +159,7 @@ impl BackupError {
 pub(crate) fn run_backup<F, C>(
     storage: Arc<dyn RepositoryStorage>,
     scanner: FilesystemScanner<F, C>,
-    request: BackupRunRequest,
+    mut request: BackupRunRequest,
     is_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
     progress: Arc<dyn Fn(u64) + Send + Sync>,
     encryption: Option<EncryptionContext>,
@@ -169,6 +180,8 @@ where
     let metrics = Arc::new(MetricsState::default());
     let progress = ProgressReporter::new(request.budgets.queue_capacity(), progress);
 
+    let request_fingerprint = backup_request_fingerprint(&request);
+
     let head = match read_current_head(
         storage.as_ref(),
         &network_requests,
@@ -184,6 +197,75 @@ where
             return Err(error);
         }
     };
+
+    let journal = match prepare_journal(
+        Arc::clone(&storage),
+        &mut request,
+        &head,
+        request_fingerprint,
+        encryption.clone(),
+        &control,
+    ) {
+        Ok(journal) => journal,
+        Err(error) => {
+            progress.close();
+            progress.join();
+            return Err(error);
+        }
+    };
+    let source_fingerprint =
+        match calculate_source_fingerprint(&scanner, &request.root, &control, plan) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                progress.close();
+                progress.join();
+                return Err(error);
+            }
+        };
+    let source_root = request.root.to_string_lossy();
+    let persisted_source = journal.data();
+    if persisted_source.source_fingerprint_ready {
+        if persisted_source.source_root != source_root
+            || persisted_source.source_fingerprint != source_fingerprint
+        {
+            progress.close();
+            progress.join();
+            return Err(journal_backup_error(
+                BackupStage::Scan,
+                JournalError::SourceChanged,
+            ));
+        }
+    } else if let Err(error) =
+        journal.set_source_fingerprint(&source_root, source_fingerprint, &|| control.is_cancelled())
+    {
+        progress.close();
+        progress.join();
+        return Err(journal_backup_error(BackupStage::Scan, error));
+    }
+    if let Err(error) = journal.verify_completed(&|| control.is_cancelled()) {
+        progress.close();
+        progress.join();
+        return Err(journal_backup_error(BackupStage::Upload, error));
+    }
+    if let Some(target_snapshot) = journal.data().target_snapshot.clone() {
+        let result = resume_published_snapshot(
+            Arc::clone(&storage),
+            &request,
+            &head,
+            &journal,
+            &target_snapshot,
+            &memory,
+            &cpu_workers,
+            &file_descriptors,
+            &network_requests,
+            &control,
+            &metrics,
+        );
+        progress.close();
+        progress.join();
+        return result;
+    }
+    let journal_for_workers = Arc::clone(&journal);
 
     let parent = match resolve_backup_parent(
         Arc::clone(&storage),
@@ -280,6 +362,7 @@ where
         let file_descriptors = Arc::clone(&file_descriptors);
         let metrics = Arc::clone(&metrics);
         let progress = progress.clone();
+        let journal = Arc::clone(&journal_for_workers);
         let worker = UploadWorker {
             receiver: upload_rx,
             index_sender: index_tx,
@@ -288,6 +371,7 @@ where
                 network_requests,
                 file_descriptors,
                 control: control.clone(),
+                journal,
             },
             metrics,
             progress,
@@ -571,7 +655,9 @@ where
         }
     };
 
-    let created_at = request.created_at.unwrap_or_else(current_unix_seconds);
+    let created_at = request
+        .created_at
+        .unwrap_or_else(|| journal.data().snapshot_created_at);
     let snapshot_id = {
         let _cpu = UnitPermit::acquire(
             &cpu_workers,
@@ -631,6 +717,7 @@ where
         network_requests: Arc::clone(&network_requests),
         file_descriptors: Arc::clone(&file_descriptors),
         control: control.clone(),
+        journal: Arc::clone(&journal),
     };
     let snapshot_upload = uploader.upload(
         BackupStage::Publish,
@@ -644,6 +731,9 @@ where
             .new_stored_bytes
             .fetch_add(snapshot_upload.stored_bytes, Ordering::Relaxed);
     }
+    journal
+        .set_target_snapshot(snapshot_reference.as_str(), &|| control.is_cancelled())
+        .map_err(|error| journal_backup_error(BackupStage::Publish, error))?;
     drop(snapshot_memory);
     control.check()?;
 
@@ -691,11 +781,178 @@ where
         }
         Err(error) => return Err(map_repository_error(BackupStage::Publish, error)),
     }
+    journal
+        .complete()
+        .map_err(|error| journal_backup_error(BackupStage::Publish, error))?;
     progress.emit(1);
 
     Ok(BackupRunResult {
         snapshot: snapshot_reference,
         metrics: metrics.snapshot(&memory, &cpu_workers, &file_descriptors, &network_requests),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resume_published_snapshot(
+    storage: Arc<dyn RepositoryStorage>,
+    request: &BackupRunRequest,
+    head: &HeadRead,
+    journal: &Arc<JournalRuntime>,
+    target_snapshot: &str,
+    memory: &Arc<ResourceBudget>,
+    cpu_workers: &Arc<ResourceBudget>,
+    file_descriptors: &Arc<ResourceBudget>,
+    network_requests: &Arc<ResourceBudget>,
+    control: &PipelineControl,
+    metrics: &Arc<MetricsState>,
+) -> Result<BackupRunResult, BackupError> {
+    let target_reference = SnapshotReference::new(target_snapshot.to_owned())
+        .map_err(|_| journal_backup_error(BackupStage::Publish, JournalError::Malformed))?;
+    let snapshot = {
+        let _memory = memory.reserve(4 * 1024, control, BackupStage::Publish)?;
+        let _network = UnitPermit::acquire(
+            network_requests,
+            control,
+            BackupStage::Publish,
+            BackupResource::NetworkRequests,
+        )?;
+        let _descriptor = UnitPermit::acquire(
+            file_descriptors,
+            control,
+            BackupStage::Publish,
+            BackupResource::FileDescriptors,
+        )?;
+        let _cpu = UnitPermit::acquire(
+            cpu_workers,
+            control,
+            BackupStage::Publish,
+            BackupResource::CpuWorkers,
+        )?;
+        repository::read_snapshot(storage.as_ref(), &target_reference)
+            .map_err(|error| map_repository_error(BackupStage::Publish, error))?
+    };
+    let parent = resolve_backup_parent(
+        Arc::clone(&storage),
+        head,
+        request,
+        memory,
+        cpu_workers,
+        file_descriptors,
+        network_requests,
+        control,
+    )?;
+    let expected_parent = parent.map(|parent| {
+        let snapshot_id = parent.snapshot_id.clone();
+        drop(parent);
+        snapshot_id
+    });
+    let journal_data = journal.data();
+    if snapshot.created_at() != journal_data.snapshot_created_at
+        || snapshot.message() != request.message.as_str()
+        || snapshot.author() != request.author.as_deref()
+        || snapshot.parent() != expected_parent.as_ref()
+    {
+        return Err(journal_backup_error(
+            BackupStage::Publish,
+            JournalError::Incompatible,
+        ));
+    }
+    let root_object = snapshot.root_tree().cloned().ok_or(BackupError::Invalid {
+        stage: BackupStage::Publish,
+    })?;
+    let summary = SnapshotSummary::from_snapshot(&snapshot).map_err(|_| BackupError::Invalid {
+        stage: BackupStage::Publish,
+    })?;
+    let publication = SnapshotPublication::with_required_objects_and_summary(
+        target_reference.clone(),
+        [root_object],
+        summary,
+    )
+    .map_err(|_| BackupError::Invalid {
+        stage: BackupStage::Publish,
+    })?
+    .require_reachability_validation()
+    .with_conflict_context();
+    let cancelled = || control.is_cancelled();
+    let _publish_network = UnitPermit::acquire(
+        network_requests,
+        control,
+        BackupStage::Publish,
+        BackupResource::NetworkRequests,
+    )?;
+    let _publish_descriptor = UnitPermit::acquire(
+        file_descriptors,
+        control,
+        BackupStage::Publish,
+        BackupResource::FileDescriptors,
+    )?;
+    let _publish_cpu = UnitPermit::acquire(
+        cpu_workers,
+        control,
+        BackupStage::Publish,
+        BackupResource::CpuWorkers,
+    )?;
+    match repository::publish_head(storage.as_ref(), head, &publication, Some(&cancelled)) {
+        Ok(_) => {}
+        Err(RepositoryError::PublicationConflict) if publication.wants_conflict_context() => {
+            let current = repository::read_head(storage.as_ref()).ok().map(Box::new);
+            return Err(BackupError::PublicationConflict {
+                stage: BackupStage::Publish,
+                expected: Box::new(head.clone()),
+                current,
+            });
+        }
+        Err(error) => return Err(map_repository_error(BackupStage::Publish, error)),
+    }
+    journal
+        .complete()
+        .map_err(|error| journal_backup_error(BackupStage::Publish, error))?;
+
+    metrics.scanned_entries.store(
+        snapshot
+            .file_count()
+            .saturating_add(snapshot.directory_count()),
+        Ordering::Relaxed,
+    );
+    metrics
+        .files
+        .store(snapshot.file_count(), Ordering::Relaxed);
+    metrics
+        .directories
+        .store(snapshot.directory_count(), Ordering::Relaxed);
+    metrics
+        .total_size
+        .store(snapshot.total_size(), Ordering::Relaxed);
+    metrics
+        .logical_bytes
+        .store(snapshot.total_size(), Ordering::Relaxed);
+    metrics
+        .reused_bytes
+        .store(snapshot.total_size(), Ordering::Relaxed);
+    metrics.packs.store(
+        journal_data
+            .completed_objects
+            .iter()
+            .filter(|object| object.key.starts_with("packs/"))
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    metrics.index_shards.store(
+        journal_data
+            .completed_objects
+            .iter()
+            .filter(|object| object.key.starts_with("indexes/"))
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+
+    Ok(BackupRunResult {
+        snapshot: target_reference,
+        metrics: metrics.snapshot(memory, cpu_workers, file_descriptors, network_requests),
     })
 }
 
@@ -877,6 +1134,380 @@ fn validate_request(
         });
     }
     Ok(())
+}
+
+fn prepare_journal(
+    storage: Arc<dyn RepositoryStorage>,
+    request: &mut BackupRunRequest,
+    head: &HeadRead,
+    request_fingerprint: [u8; 32],
+    encryption: Option<EncryptionContext>,
+    control: &PipelineControl,
+) -> Result<Arc<JournalRuntime>, BackupError> {
+    let is_cancelled = || control.is_cancelled();
+    if let Some(loaded) = request.resume_journal.take() {
+        let data = loaded.data.clone();
+        if data.operation_id != request.operation_id
+            || data.repository_format_version != request.repository_format_version
+            || data.repository_identity != request.repository_identity
+            || data.request_fingerprint != request_fingerprint
+        {
+            return Err(journal_backup_error(
+                BackupStage::Coordinator,
+                JournalError::Incompatible,
+            ));
+        }
+        let journal = JournalRuntime::from_loaded(storage, loaded, encryption)
+            .map_err(|error| journal_backup_error(BackupStage::Coordinator, error))?;
+        if data.state == OperationJournalState::Complete
+            || data.target_snapshot.as_deref().is_some_and(|target| {
+                head.head
+                    .snapshot()
+                    .is_some_and(|snapshot| snapshot.as_str() == target)
+            })
+        {
+            let _ = journal.complete();
+            return Err(journal_backup_error(
+                BackupStage::Publish,
+                JournalError::AlreadyPublished,
+            ));
+        }
+        let current_snapshot = head.head.snapshot().map(|snapshot| snapshot.as_str());
+        let current_version = head
+            .version
+            .as_ref()
+            .map(|version| version.as_bytes().to_vec());
+        if data.base_generation != head.head.generation()
+            || data.base_snapshot.as_deref() != current_snapshot
+            || data.base_storage_version != current_version
+        {
+            return Err(journal_backup_error(
+                BackupStage::Publish,
+                JournalError::Stale,
+            ));
+        }
+        let source_root = request.root.to_string_lossy();
+        if data.source_root != source_root {
+            return Err(journal_backup_error(
+                BackupStage::Scan,
+                JournalError::Incompatible,
+            ));
+        }
+        Ok(journal)
+    } else {
+        let now = current_unix_seconds();
+        let snapshot_created_at = request.created_at.unwrap_or(now);
+        let data = OperationJournalData {
+            journal_version: crate::format::CURRENT_OPERATION_JOURNAL_VERSION,
+            operation_id: request.operation_id,
+            repository_format_version: request.repository_format_version,
+            repository_identity: request.repository_identity.clone(),
+            base_generation: head.head.generation(),
+            base_snapshot: head
+                .head
+                .snapshot()
+                .map(|snapshot| snapshot.as_str().to_owned()),
+            base_storage_version: head
+                .version
+                .as_ref()
+                .map(|version| version.as_bytes().to_vec()),
+            request_fingerprint,
+            source_fingerprint: [0; 32],
+            source_fingerprint_ready: false,
+            source_root: request.root.to_string_lossy().into_owned(),
+            checkpoint: OperationJournalCheckpoint {
+                stage: journal_stage_code(BackupStage::Scan),
+                sequence: 0,
+            },
+            completed_objects: Vec::new(),
+            target_snapshot: None,
+            snapshot_created_at,
+            created_at: now,
+            updated_at: now,
+            state: OperationJournalState::Active,
+        };
+        create_journal(
+            storage,
+            request.journal_key.clone(),
+            data,
+            encryption,
+            &is_cancelled,
+        )
+        .map_err(|error| journal_backup_error(BackupStage::Coordinator, error))
+    }
+}
+
+fn backup_request_fingerprint(request: &BackupRunRequest) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"GIB backup request fingerprint\0");
+    fingerprint_string(&mut digest, &request.root.to_string_lossy());
+    fingerprint_string(&mut digest, &request.message);
+    fingerprint_optional_string(&mut digest, request.author.as_deref());
+    fingerprint_optional_u64(&mut digest, request.created_at);
+    fingerprint_u64(&mut digest, request.budgets.memory_bytes() as u64);
+    fingerprint_u64(&mut digest, request.budgets.cpu_workers() as u64);
+    fingerprint_u64(&mut digest, request.budgets.file_descriptors() as u64);
+    fingerprint_u64(&mut digest, request.budgets.network_requests() as u64);
+    fingerprint_u64(&mut digest, request.budgets.queue_capacity() as u64);
+    fingerprint_bytes(&mut digest, &request.chunking.canonical_policy_bytes());
+    fingerprint_u16(&mut digest, request.pack.version());
+    fingerprint_u64(&mut digest, request.pack.target_size());
+    fingerprint_u64(&mut digest, request.pack.max_size());
+    fingerprint_u16(&mut digest, request.index.version());
+    fingerprint_u64(&mut digest, request.index.shard_prefix_bytes() as u64);
+    fingerprint_u64(&mut digest, request.index.max_shard_bytes());
+    fingerprint_u64(&mut digest, request.deduplication.batch_size() as u64);
+    fingerprint_u64(&mut digest, request.deduplication.catalog_entries() as u64);
+    let cache = request.deduplication.index_cache();
+    fingerprint_u64(&mut digest, cache.max_bytes() as u64);
+    fingerprint_u64(&mut digest, cache.max_shards() as u64);
+    fingerprint_string(&mut digest, request.transforms.codec().as_str());
+    fingerprint_i32(&mut digest, request.transforms.compression_level().value());
+    fingerprint_string(&mut digest, request.transforms.encryption().as_str());
+    fingerprint_optional_string(
+        &mut digest,
+        request.parent.as_ref().map(|parent| parent.as_str()),
+    );
+    fingerprint_bool(&mut digest, request.parent_disabled);
+    digest.finalize().into()
+}
+
+fn calculate_source_fingerprint<F, C>(
+    scanner: &FilesystemScanner<F, C>,
+    root: &Path,
+    control: &PipelineControl,
+    plan: WorkerPlan,
+) -> Result<[u8; 32], BackupError>
+where
+    F: super::ports::Filesystem + 'static,
+    C: super::ports::FilesystemClock + 'static,
+{
+    let scanner = scanner.clone().with_options(
+        scanner
+            .options()
+            .with_max_open_directories(plan.scanner_directories),
+    );
+    let mut scan = scanner
+        .scan(root)
+        .map_err(|error| filesystem_error(BackupStage::Scan, &error))?;
+    let mut fingerprint = SourceFingerprintAccumulator::new();
+    fingerprint.update_bytes(b"GIB backup source fingerprint\0");
+    fingerprint_string(
+        fingerprint.policy_mut(),
+        &scanner.options().permission_policy().to_string(),
+    );
+    fingerprint_bool(
+        fingerprint.policy_mut(),
+        scanner.ignore_policy().ignores_git(),
+    );
+    for pattern in scanner.ignore_policy().pattern_strings() {
+        fingerprint_string(fingerprint.policy_mut(), pattern);
+    }
+    let mut buffer = [0_u8; 64 * 1024];
+    while let Some(result) = scan.next() {
+        control.check()?;
+        let entry = result.map_err(|error| filesystem_error(BackupStage::Scan, &error))?;
+        let mut entry_digest = Sha256::new();
+        fingerprint_string(&mut entry_digest, entry.path().as_str());
+        fingerprint_string(&mut entry_digest, entry.kind().as_str());
+        let metadata = entry.metadata();
+        fingerprint_u64(&mut entry_digest, metadata.size());
+        match metadata.permissions() {
+            Some(permissions) => {
+                fingerprint_bool(&mut entry_digest, true);
+                fingerprint_u32(&mut entry_digest, permissions.mode());
+            }
+            None => fingerprint_bool(&mut entry_digest, false),
+        }
+        fingerprint_optional_i64(&mut entry_digest, metadata.modified_at());
+        fingerprint_optional_i64(&mut entry_digest, metadata.created_at());
+        let identity = metadata.identity();
+        fingerprint_optional_u64(&mut entry_digest, identity.volume_id());
+        fingerprint_optional_u64(&mut entry_digest, identity.file_id());
+        match entry.symlink_target() {
+            Some(target) => {
+                fingerprint_bool(&mut entry_digest, true);
+                fingerprint_bytes(&mut entry_digest, target.as_bytes());
+            }
+            None => fingerprint_bool(&mut entry_digest, false),
+        }
+        if entry.kind().is_regular_file() {
+            fingerprint_u64(&mut entry_digest, metadata.size());
+            let mut reader = scan
+                .open_file(&entry)
+                .map_err(|error| filesystem_error(BackupStage::Read, &error))?;
+            loop {
+                control.check()?;
+                let read = reader
+                    .read(&mut buffer)
+                    .map_err(|error| filesystem_io_error(BackupStage::Read, &error))?;
+                if read == 0 {
+                    break;
+                }
+                entry_digest.update(&buffer[..read]);
+            }
+            reader
+                .finish()
+                .map_err(|error| filesystem_error(BackupStage::Read, &error))?;
+        }
+        fingerprint.add_entry(entry_digest.finalize().into());
+    }
+    Ok(fingerprint.finish())
+}
+
+struct SourceFingerprintAccumulator {
+    policy: Sha256,
+    entry_count: u64,
+    xor: [u8; 32],
+    sum: [u8; 32],
+}
+
+impl SourceFingerprintAccumulator {
+    fn new() -> Self {
+        Self {
+            policy: Sha256::new(),
+            entry_count: 0,
+            xor: [0; 32],
+            sum: [0; 32],
+        }
+    }
+
+    fn policy_mut(&mut self) -> &mut Sha256 {
+        &mut self.policy
+    }
+
+    fn update_bytes(&mut self, value: &[u8]) {
+        self.policy.update(value);
+    }
+
+    // Directory enumeration order is backend-dependent; commutative
+    // accumulators keep an unchanged source fingerprint stable without
+    // retaining every entry in memory.
+    fn add_entry(&mut self, entry: [u8; 32]) {
+        self.entry_count = self.entry_count.saturating_add(1);
+        for (left, right) in self.xor.iter_mut().zip(entry) {
+            *left ^= right;
+        }
+        let mut carry = 0_u16;
+        for (left, right) in self.sum.iter_mut().rev().zip(entry.iter().rev()) {
+            let total = u16::from(*left) + u16::from(*right) + carry;
+            *left = total as u8;
+            carry = total >> 8;
+        }
+    }
+
+    fn finish(mut self) -> [u8; 32] {
+        fingerprint_u64(&mut self.policy, self.entry_count);
+        fingerprint_bytes(&mut self.policy, &self.xor);
+        fingerprint_bytes(&mut self.policy, &self.sum);
+        self.policy.finalize().into()
+    }
+}
+
+fn fingerprint_bytes(digest: &mut Sha256, value: &[u8]) {
+    fingerprint_u64(digest, value.len() as u64);
+    digest.update(value);
+}
+
+fn fingerprint_string(digest: &mut Sha256, value: &str) {
+    fingerprint_bytes(digest, value.as_bytes());
+}
+
+fn fingerprint_optional_string(digest: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            fingerprint_bool(digest, true);
+            fingerprint_string(digest, value);
+        }
+        None => fingerprint_bool(digest, false),
+    }
+}
+
+fn fingerprint_optional_i64(digest: &mut Sha256, value: Option<i64>) {
+    match value {
+        Some(value) => {
+            fingerprint_bool(digest, true);
+            fingerprint_i64(digest, value);
+        }
+        None => fingerprint_bool(digest, false),
+    }
+}
+
+fn fingerprint_optional_u64(digest: &mut Sha256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            fingerprint_bool(digest, true);
+            fingerprint_u64(digest, value);
+        }
+        None => fingerprint_bool(digest, false),
+    }
+}
+
+fn fingerprint_bool(digest: &mut Sha256, value: bool) {
+    digest.update([u8::from(value)]);
+}
+
+fn fingerprint_u16(digest: &mut Sha256, value: u16) {
+    digest.update(value.to_be_bytes());
+}
+
+fn fingerprint_u32(digest: &mut Sha256, value: u32) {
+    digest.update(value.to_be_bytes());
+}
+
+fn fingerprint_i32(digest: &mut Sha256, value: i32) {
+    digest.update(value.to_be_bytes());
+}
+
+fn fingerprint_i64(digest: &mut Sha256, value: i64) {
+    digest.update(value.to_be_bytes());
+}
+
+fn fingerprint_u64(digest: &mut Sha256, value: u64) {
+    digest.update(value.to_be_bytes());
+}
+
+fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn journal_stage_code(stage: BackupStage) -> u8 {
+    match stage {
+        BackupStage::Scan => 0,
+        BackupStage::Read => 1,
+        BackupStage::Chunk => 2,
+        BackupStage::Hash => 3,
+        BackupStage::Dedup => 4,
+        BackupStage::Transform => 5,
+        BackupStage::Pack => 6,
+        BackupStage::Index => 7,
+        BackupStage::Upload => 8,
+        BackupStage::Publish => 9,
+        BackupStage::Coordinator => 10,
+    }
+}
+
+fn journal_backup_error(stage: BackupStage, error: JournalError) -> BackupError {
+    if error == JournalError::Cancelled {
+        BackupError::Cancelled
+    } else {
+        BackupError::Journal { stage, error }
+    }
+}
+
+fn filesystem_io_error(stage: BackupStage, error: &io::Error) -> BackupError {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<crate::domain::FilesystemScanError>())
+        .map_or(
+            BackupError::Filesystem {
+                stage,
+                operation: Some(FilesystemOperation::ReadFile),
+                kind: Some(FilesystemErrorKind::Other),
+                race: false,
+            },
+            |scan_error| filesystem_error(stage, scan_error),
+        )
 }
 
 #[derive(Clone, Copy)]
@@ -2770,7 +3401,7 @@ fn run_transform_worker(
                     };
                     let active = metrics.transform_active.fetch_add(1, Ordering::AcqRel) + 1;
                     update_peak(&metrics.transform_peak, active);
-                    let result = encode_object_envelope_with_options(
+                    let result = encode_object_envelope_with_options_deterministic(
                         ObjectKind::Pack,
                         CURRENT_PACK_OBJECT_VERSION,
                         transforms,
@@ -3930,6 +4561,7 @@ struct ImmutableObjectUploader {
     network_requests: Arc<ResourceBudget>,
     file_descriptors: Arc<ResourceBudget>,
     control: PipelineControl,
+    journal: Arc<JournalRuntime>,
 }
 
 struct UploadOutcome {
@@ -3962,12 +4594,28 @@ impl ImmutableObjectUploader {
             operation,
             error: StorageError::InvalidObjectKey,
         })?;
-        let mut source = Cursor::new(bytes);
+        let size = u64::try_from(bytes.len()).map_err(|_| BackupError::Storage {
+            stage,
+            operation,
+            error: StorageError::InvalidRequest,
+        })?;
+        let digest = digest_bytes(bytes);
         let is_cancelled = || self.control.is_cancelled();
-        match self.storage.write_stream_with_cancellation(
+        if self
+            .journal
+            .is_verified_completed(key, size, digest, &is_cancelled)
+            .map_err(|error| journal_backup_error(stage, error))?
+        {
+            return Ok(UploadOutcome {
+                newly_stored: false,
+                stored_bytes: 0,
+            });
+        }
+        let mut source = Cursor::new(bytes);
+        let outcome = match self.storage.write_stream_with_cancellation(
             &object_key,
             &mut source,
-            ObjectWriteOptions::if_absent().with_expected_size(bytes.len() as u64),
+            ObjectWriteOptions::if_absent().with_expected_size(size),
             &is_cancelled,
         ) {
             Ok(metadata) => Ok(UploadOutcome {
@@ -3983,7 +4631,11 @@ impl ImmutableObjectUploader {
                 operation,
                 error,
             }),
-        }
+        }?;
+        self.journal
+            .record_completed(journal_stage_code(stage), key, size, digest, &is_cancelled)
+            .map_err(|error| journal_backup_error(stage, error))?;
+        Ok(outcome)
     }
 
     fn verify_existing(

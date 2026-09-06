@@ -10,7 +10,16 @@ use super::repository::{HeadState, Repository, RepositoryEncryption};
 use crate::application::backup::{
     BackupError, BackupRepositoryFailure, BackupRunRequest, BackupRunResult, run_backup,
 };
-use crate::application::ports::{Filesystem, FilesystemClock};
+use crate::application::journal::{
+    JournalError, LoadedOperationJournal, PendingOperationInfo as ApplicationPendingOperationInfo,
+    PendingOperationPage as ApplicationPendingOperationPage,
+    PendingOperationStatus as ApplicationPendingOperationStatus, list_pending_operations,
+    load_journal, new_journal_identifier,
+};
+use crate::application::ports::{
+    DEFAULT_OBJECT_LIST_PAGE_SIZE, Filesystem, FilesystemClock, MAX_OBJECT_LIST_PAGE_SIZE,
+    ObjectCursor, ObjectListRequest, ObjectPrefix,
+};
 use crate::domain::{
     BackupBudgets, BackupDeduplicationConfiguration, BackupMetrics, BackupReference, BackupStage,
     ChunkingConfiguration, MAX_SNAPSHOT_AUTHOR_LENGTH, MAX_SNAPSHOT_MESSAGE_LENGTH,
@@ -269,8 +278,19 @@ impl BackupRequest {
         Ok(())
     }
 
-    pub(crate) fn into_run_request(self) -> BackupRunRequest {
+    pub(crate) fn into_run_request(
+        self,
+        operation_id: u64,
+        journal_key: String,
+        repository: &Repository,
+        resume_journal: Option<LoadedOperationJournal>,
+    ) -> BackupRunRequest {
         BackupRunRequest {
+            operation_id,
+            journal_key,
+            repository_format_version: repository.format_version(),
+            repository_identity: repository.identity().as_str().to_owned(),
+            resume_journal,
             root: self.root,
             message: self.message,
             author: self.author,
@@ -284,6 +304,323 @@ impl BackupRequest {
             parent: self.parent,
             parent_disabled: self.parent_disabled,
         }
+    }
+}
+
+/// The parse state shown for one pending operation journal.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PendingOperationStatus {
+    /// The journal is valid and can be considered for resumption.
+    Active,
+    /// The journal failed integrity or structural validation.
+    Corrupt,
+    /// The journal version is newer than this SDK understands.
+    UnsupportedVersion,
+    /// The journal is authenticated and needs repository encryption material.
+    Encrypted,
+    /// The journal exceeded a bounded loader or record limit.
+    TooLarge,
+}
+
+impl PendingOperationStatus {
+    /// Returns the stable display value for this status.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Corrupt => "corrupt",
+            Self::UnsupportedVersion => "unsupported_version",
+            Self::Encrypted => "encrypted",
+            Self::TooLarge => "too_large",
+        }
+    }
+}
+
+impl fmt::Display for PendingOperationStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A bounded request for pending backup journals.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingOperationListRequest {
+    limit: usize,
+    after: Option<ObjectCursor>,
+}
+
+impl PendingOperationListRequest {
+    /// Creates a request using the default bounded page size.
+    pub const fn new() -> Self {
+        Self {
+            limit: DEFAULT_OBJECT_LIST_PAGE_SIZE,
+            after: None,
+        }
+    }
+
+    /// Sets the maximum number of journal rows to inspect in one page.
+    pub const fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Sets the opaque cursor returned by the previous page.
+    pub fn with_cursor(mut self, cursor: ObjectCursor) -> Self {
+        self.after = Some(cursor);
+        self
+    }
+
+    /// Returns the requested page size.
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Returns the exclusive continuation cursor, when present.
+    pub const fn cursor(&self) -> Option<&ObjectCursor> {
+        self.after.as_ref()
+    }
+
+    pub(crate) fn into_application(self) -> SdkResult<ObjectListRequest> {
+        if !(1..=MAX_OBJECT_LIST_PAGE_SIZE).contains(&self.limit) {
+            return Err(SdkError::InvalidRequest {
+                field: "pending_operations.limit",
+                reason: "must be within the supported object-list page limit",
+            });
+        }
+        let prefix = ObjectPrefix::new("operations").map_err(|_| SdkError::InvalidRequest {
+            field: "pending_operations.prefix",
+            reason: "the operation journal prefix is invalid",
+        })?;
+        let request = ObjectListRequest::new(prefix).with_limit(self.limit);
+        Ok(match self.after {
+            Some(cursor) => request.with_cursor(cursor),
+            None => request,
+        })
+    }
+}
+
+impl Default for PendingOperationListRequest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Safe metadata projected from one operation journal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingOperation {
+    identifier: String,
+    operation_id: Option<OperationId>,
+    status: PendingOperationStatus,
+    object_size: u64,
+    repository_format_version: Option<u16>,
+    base_generation: Option<u64>,
+    base_snapshot: Option<SnapshotReference>,
+    source_root: Option<PathBuf>,
+    checkpoint: Option<BackupStage>,
+    checkpoint_sequence: Option<u64>,
+    completed_objects: usize,
+    created_at: Option<u64>,
+    updated_at: Option<u64>,
+    target_snapshot: Option<SnapshotReference>,
+}
+
+impl PendingOperation {
+    /// Returns the stable journal identifier accepted by resume APIs.
+    pub fn identifier(&self) -> &str {
+        &self.identifier
+    }
+
+    /// Returns the persisted operation number, when the journal is valid.
+    pub const fn operation_id(&self) -> Option<OperationId> {
+        self.operation_id
+    }
+
+    /// Returns the parse status.
+    pub const fn status(&self) -> PendingOperationStatus {
+        self.status
+    }
+
+    /// Returns the stored journal object size.
+    pub const fn object_size(&self) -> u64 {
+        self.object_size
+    }
+
+    /// Returns the repository format version captured by the journal.
+    pub const fn repository_format_version(&self) -> Option<u16> {
+        self.repository_format_version
+    }
+
+    /// Returns the HEAD generation captured before the backup started.
+    pub const fn base_generation(&self) -> Option<u64> {
+        self.base_generation
+    }
+
+    /// Returns the captured base snapshot, when one existed.
+    pub fn base_snapshot(&self) -> Option<&SnapshotReference> {
+        self.base_snapshot.as_ref()
+    }
+
+    /// Returns the source root captured by the journal.
+    pub fn source_root(&self) -> Option<&std::path::Path> {
+        self.source_root.as_deref()
+    }
+
+    /// Returns the last durable pipeline stage.
+    pub const fn checkpoint(&self) -> Option<BackupStage> {
+        self.checkpoint
+    }
+
+    /// Returns the monotonic checkpoint sequence.
+    pub const fn checkpoint_sequence(&self) -> Option<u64> {
+        self.checkpoint_sequence
+    }
+
+    /// Returns the number of immutable object completion records.
+    pub const fn completed_objects(&self) -> usize {
+        self.completed_objects
+    }
+
+    /// Returns the journal creation timestamp in Unix seconds.
+    pub const fn created_at(&self) -> Option<u64> {
+        self.created_at
+    }
+
+    /// Returns the journal update timestamp in Unix seconds.
+    pub const fn updated_at(&self) -> Option<u64> {
+        self.updated_at
+    }
+
+    /// Returns the target snapshot, when publication preparation reached it.
+    pub fn target_snapshot(&self) -> Option<&SnapshotReference> {
+        self.target_snapshot.as_ref()
+    }
+}
+
+/// One bounded page of pending backup journals.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingOperationPage {
+    operations: Vec<PendingOperation>,
+    next_cursor: Option<ObjectCursor>,
+}
+
+impl PendingOperationPage {
+    /// Returns the rows in lexical journal-key order.
+    pub fn operations(&self) -> &[PendingOperation] {
+        &self.operations
+    }
+
+    /// Returns the cursor for the next bounded page.
+    pub const fn next_cursor(&self) -> Option<&ObjectCursor> {
+        self.next_cursor.as_ref()
+    }
+
+    /// Consumes the page into its rows and cursor.
+    pub fn into_parts(self) -> (Vec<PendingOperation>, Option<ObjectCursor>) {
+        (self.operations, self.next_cursor)
+    }
+}
+
+pub(crate) fn pending_page_from_application(
+    page: ApplicationPendingOperationPage,
+) -> SdkResult<PendingOperationPage> {
+    let mut operations = Vec::new();
+    operations
+        .try_reserve(page.operations.len())
+        .map_err(|_| SdkError::OperationJournalTooLarge)?;
+    for operation in page.operations {
+        operations.push(pending_operation_from_application(operation)?);
+    }
+    Ok(PendingOperationPage {
+        operations,
+        next_cursor: page.next_cursor,
+    })
+}
+
+fn pending_operation_from_application(
+    operation: ApplicationPendingOperationInfo,
+) -> SdkResult<PendingOperation> {
+    let status = map_pending_status(operation.status);
+    let Some(operation_id) = operation.operation_id else {
+        return Ok(PendingOperation {
+            identifier: operation.identifier,
+            operation_id: None,
+            status,
+            object_size: operation.object_size,
+            repository_format_version: operation.repository_format_version,
+            base_generation: operation.base_generation,
+            base_snapshot: None,
+            source_root: operation.source_root.map(PathBuf::from),
+            checkpoint: None,
+            checkpoint_sequence: None,
+            completed_objects: operation.completed_objects,
+            created_at: operation.created_at,
+            updated_at: operation.updated_at,
+            target_snapshot: None,
+        });
+    };
+    let operation_id =
+        OperationId::from_u64(operation_id).ok_or(SdkError::OperationJournalMalformed)?;
+    let base_snapshot = operation
+        .base_snapshot
+        .as_deref()
+        .map(SnapshotReference::new)
+        .transpose()
+        .map_err(|_| SdkError::OperationJournalMalformed)?;
+    let target_snapshot = operation
+        .target_snapshot
+        .as_deref()
+        .map(SnapshotReference::new)
+        .transpose()
+        .map_err(|_| SdkError::OperationJournalMalformed)?;
+    let checkpoint_data = operation
+        .checkpoint
+        .ok_or(SdkError::OperationJournalMalformed)?;
+    let checkpoint =
+        backup_stage_from_code(checkpoint_data.stage).ok_or(SdkError::OperationJournalMalformed)?;
+    Ok(PendingOperation {
+        identifier: operation.identifier,
+        operation_id: Some(operation_id),
+        status,
+        object_size: operation.object_size,
+        repository_format_version: operation.repository_format_version,
+        base_generation: operation.base_generation,
+        base_snapshot,
+        source_root: operation.source_root.map(PathBuf::from),
+        checkpoint: Some(checkpoint),
+        checkpoint_sequence: Some(checkpoint_data.sequence),
+        completed_objects: operation.completed_objects,
+        created_at: operation.created_at,
+        updated_at: operation.updated_at,
+        target_snapshot,
+    })
+}
+
+fn map_pending_status(status: ApplicationPendingOperationStatus) -> PendingOperationStatus {
+    match status {
+        ApplicationPendingOperationStatus::Active => PendingOperationStatus::Active,
+        ApplicationPendingOperationStatus::Corrupt => PendingOperationStatus::Corrupt,
+        ApplicationPendingOperationStatus::UnsupportedVersion => {
+            PendingOperationStatus::UnsupportedVersion
+        }
+        ApplicationPendingOperationStatus::Encrypted => PendingOperationStatus::Encrypted,
+        ApplicationPendingOperationStatus::TooLarge => PendingOperationStatus::TooLarge,
+    }
+}
+
+fn backup_stage_from_code(value: u8) -> Option<BackupStage> {
+    match value {
+        0 => Some(BackupStage::Scan),
+        1 => Some(BackupStage::Read),
+        2 => Some(BackupStage::Chunk),
+        3 => Some(BackupStage::Hash),
+        4 => Some(BackupStage::Dedup),
+        5 => Some(BackupStage::Transform),
+        6 => Some(BackupStage::Pack),
+        7 => Some(BackupStage::Index),
+        8 => Some(BackupStage::Upload),
+        9 => Some(BackupStage::Publish),
+        10 => Some(BackupStage::Coordinator),
+        _ => None,
     }
 }
 
@@ -398,6 +735,85 @@ where
             self.events.clone(),
             OperationRequest::new(OperationKind::Backup),
         )?;
+        let journal_key = match new_journal_identifier(operation.id().as_u64()) {
+            Ok(key) => key,
+            Err(error) => {
+                let error = map_journal_error(error);
+                let _ = operation.fail(error.clone());
+                return Err(error);
+            }
+        };
+        let pending_identifier = pending_identifier(&journal_key);
+        let run_request =
+            request.into_run_request(operation.id().as_u64(), journal_key, &self.repository, None);
+        self.spawn_run(operation, run_request, pending_identifier)
+    }
+
+    /// Resumes a compatible interrupted backup identified by its journal ID.
+    ///
+    /// The journal is loaded and authenticated before a worker is started. A
+    /// new lifecycle operation is used for the resumed invocation, while the
+    /// persisted operation identity remains the one recorded in the journal.
+    pub fn resume(
+        &self,
+        identifier: impl AsRef<str>,
+        request: BackupRequest,
+    ) -> SdkResult<BackupHandle> {
+        request.validate()?;
+        if self.events.is_closed() {
+            return Err(SdkError::EventDispatcherClosed);
+        }
+        let storage = self.repository.storage().as_arc();
+        let encryption = self
+            .encryption
+            .as_ref()
+            .map(|encryption| encryption.context().clone());
+        let loaded = load_journal(Arc::clone(&storage), identifier.as_ref(), encryption)
+            .map_err(map_journal_error)?;
+        let pending_identifier = pending_identifier(&loaded.key);
+        let operation = OperationHandle::start(
+            self.events.clone(),
+            OperationRequest::new(OperationKind::Backup),
+        )?;
+        let run_request = request.into_run_request(
+            loaded.data.operation_id,
+            loaded.key.clone(),
+            &self.repository,
+            Some(loaded),
+        );
+        self.spawn_run(operation, run_request, pending_identifier)
+    }
+
+    /// Alias for [`Self::resume`] using the command-line terminology.
+    pub fn continue_backup(
+        &self,
+        identifier: impl AsRef<str>,
+        request: BackupRequest,
+    ) -> SdkResult<BackupHandle> {
+        self.resume(identifier, request)
+    }
+
+    /// Lists active operation journals using a bounded prefix listing.
+    pub fn list_pending_operations(
+        &self,
+        request: impl Into<PendingOperationListRequest>,
+    ) -> SdkResult<PendingOperationPage> {
+        let request = request.into().into_application()?;
+        let encryption = self
+            .encryption
+            .as_ref()
+            .map(|encryption| encryption.context());
+        list_pending_operations(self.repository.storage().as_storage(), &request, encryption)
+            .map_err(map_journal_error)
+            .and_then(pending_page_from_application)
+    }
+
+    fn spawn_run(
+        &self,
+        operation: OperationHandle,
+        run_request: BackupRunRequest,
+        pending_identifier: String,
+    ) -> SdkResult<BackupHandle> {
         let worker_operation = operation.clone();
         let cancellation = operation.cancellation_handle();
         let progress_operation = operation.clone();
@@ -410,7 +826,6 @@ where
             .encryption
             .as_ref()
             .map(|encryption| encryption.context().clone());
-        let run_request = request.into_run_request();
         let join = thread::Builder::new()
             .name(String::from("gib-backup-coordinator"))
             .spawn(move || {
@@ -438,6 +853,7 @@ where
         Ok(BackupHandle {
             operation,
             join: Some(join),
+            pending_identifier,
         })
     }
 
@@ -452,6 +868,7 @@ where
 pub struct BackupHandle {
     operation: OperationHandle,
     join: Option<JoinHandle<SdkResult<BackupResult>>>,
+    pending_identifier: String,
 }
 
 impl BackupHandle {
@@ -463,6 +880,11 @@ impl BackupHandle {
     /// Returns the operation identifier.
     pub fn id(&self) -> OperationId {
         self.operation.id()
+    }
+
+    /// Returns the journal identifier used to resume this operation.
+    pub fn pending_identifier(&self) -> &str {
+        &self.pending_identifier
     }
 
     /// Returns the current lifecycle status.
@@ -625,6 +1047,14 @@ fn map_backup_error(error: BackupError) -> SdkError {
                 backup_stage_error(stage, source)
             }
         }
+        BackupError::Journal { stage, error } => {
+            let source = map_journal_error(error);
+            if matches!(source, SdkError::OperationCancelled { .. }) {
+                source
+            } else {
+                backup_stage_error(stage, source)
+            }
+        }
         BackupError::PublicationConflict {
             stage,
             expected,
@@ -701,6 +1131,35 @@ fn map_repository_failure(failure: BackupRepositoryFailure) -> SdkError {
     }
 }
 
+pub(crate) fn map_journal_error(error: JournalError) -> SdkError {
+    match error {
+        JournalError::NotFound => SdkError::OperationJournalNotFound,
+        JournalError::AlreadyExists => SdkError::OperationJournalAlreadyExists,
+        JournalError::Malformed => SdkError::OperationJournalMalformed,
+        JournalError::UnsupportedVersion { version } => {
+            SdkError::OperationJournalUnsupportedVersion { version }
+        }
+        JournalError::Incompatible => SdkError::OperationJournalIncompatible {
+            reason: "journal metadata or storage capabilities are incompatible",
+        },
+        JournalError::Stale => SdkError::OperationJournalStale {
+            reason: "repository HEAD no longer matches the journal base",
+        },
+        JournalError::AlreadyPublished => SdkError::OperationJournalAlreadyPublished,
+        JournalError::SourceChanged => SdkError::OperationJournalSourceChanged,
+        JournalError::TooLarge => SdkError::OperationJournalTooLarge,
+        JournalError::EncryptionKeyRequired => SdkError::OperationJournalEncryptionRequired,
+        JournalError::Cancelled => SdkError::OperationCancelled { operation_id: None },
+        JournalError::Storage { operation } => {
+            SdkError::OperationJournalStorageFailure { operation }
+        }
+    }
+}
+
+fn pending_identifier(key: &str) -> String {
+    key.strip_prefix("operations/").unwrap_or(key).to_owned()
+}
+
 /// A convenient client entry point that uses the local filesystem scanner.
 impl super::client::Client {
     /// Starts a bounded backup using the local filesystem scanner.
@@ -719,5 +1178,36 @@ impl super::client::Client {
         request: BackupRequest,
     ) -> SdkResult<BackupResult> {
         self.start_backup(repository, request)?.join()
+    }
+
+    /// Resumes a bounded backup using the local filesystem scanner.
+    pub fn resume_backup(
+        &self,
+        repository: Repository,
+        identifier: impl AsRef<str>,
+        request: BackupRequest,
+    ) -> SdkResult<BackupHandle> {
+        BackupPipeline::new(repository, local_filesystem_scanner(), self.events())
+            .resume(identifier, request)
+    }
+
+    /// Continues a bounded backup using the local filesystem scanner.
+    pub fn continue_backup(
+        &self,
+        repository: Repository,
+        identifier: impl AsRef<str>,
+        request: BackupRequest,
+    ) -> SdkResult<BackupHandle> {
+        self.resume_backup(repository, identifier, request)
+    }
+
+    /// Lists pending backup journals using the local client event context.
+    pub fn list_pending_operations(
+        &self,
+        repository: Repository,
+        request: impl Into<PendingOperationListRequest>,
+    ) -> SdkResult<PendingOperationPage> {
+        BackupPipeline::new(repository, local_filesystem_scanner(), self.events())
+            .list_pending_operations(request)
     }
 }

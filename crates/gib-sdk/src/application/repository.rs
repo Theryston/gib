@@ -1,5 +1,5 @@
 use super::ports::{
-    ObjectKey, ObjectRange, RepositoryStorage, StorageError, StorageVersion, read_stream_to_vec,
+    ObjectKey, RepositoryStorage, StorageError, StorageVersion, read_stream_to_vec,
 };
 use crate::domain::{
     ChunkId, FORMAT_OBJECT_KEY, HEAD_OBJECT_KEY, MAX_IMMUTABLE_OBJECT_BYTES,
@@ -659,7 +659,7 @@ fn validate_pack_entries(
     })?;
     for entry in entries {
         check_cancelled(is_cancelled)?;
-        let range = entry
+        entry
             .validate_against_pack_length(pack_length)
             .map_err(|_| RepositoryError::Malformed {
                 reason: "pack-index range is outside its pack",
@@ -683,48 +683,10 @@ fn validate_pack_entries(
                 reason: "pack-index logical length does not match its pack",
             });
         }
-        let range_key =
-            ObjectKey::new(pack_key.clone()).map_err(|_| RepositoryError::Malformed {
-                reason: "pack object reference is invalid",
+        pack.payload(location)
+            .map_err(|_| RepositoryError::Malformed {
+                reason: "pack-index payload range is not present in the pack",
             })?;
-        let mut range_object = storage
-            .read_range(
-                &range_key,
-                ObjectRange::new(range.offset(), range.length()).map_err(|_| {
-                    RepositoryError::Malformed {
-                        reason: "pack-index range cannot be represented by storage",
-                    }
-                })?,
-            )
-            .map_err(|error| {
-                map_bounded_storage_error(
-                    error,
-                    RepositoryError::RequiredObjectMissing,
-                    "validate_pack_range",
-                )
-            })?;
-        let reader = range_object.reader();
-        let range_bytes = read_stream_to_vec(reader, Some(range.length())).map_err(|error| {
-            map_bounded_storage_error(
-                error,
-                RepositoryError::RequiredObjectMissing,
-                "validate_pack_range",
-            )
-        })?;
-        let start = usize::try_from(range.offset()).map_err(|_| RepositoryError::Malformed {
-            reason: "pack-index range offset cannot be represented",
-        })?;
-        let end = usize::try_from(range.end()).map_err(|_| RepositoryError::Malformed {
-            reason: "pack-index range end cannot be represented",
-        })?;
-        let expected = bytes.get(start..end).ok_or(RepositoryError::Malformed {
-            reason: "pack-index range is not present in the pack",
-        })?;
-        if range_bytes != expected {
-            return Err(RepositoryError::Malformed {
-                reason: "pack range bytes do not match the complete pack",
-            });
-        }
     }
     Ok(())
 }

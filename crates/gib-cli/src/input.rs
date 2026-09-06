@@ -1,7 +1,7 @@
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use gib::{
     ConfigurationOverrides, ConfigurationResolutionRequest, ConfigurationSelection,
-    DEFAULT_SNAPSHOT_PAGE_SIZE, SnapshotCursor,
+    DEFAULT_OBJECT_LIST_PAGE_SIZE, DEFAULT_SNAPSHOT_PAGE_SIZE, ObjectCursor, SnapshotCursor,
 };
 #[cfg(test)]
 use std::ffi::OsString;
@@ -209,6 +209,8 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    #[command(about = "Create, list, or resume repository backups.")]
+    Backup(BackupCommand),
     #[command(about = "Configure the global author identity.")]
     Config(ConfigRequest),
     #[command(about = "List snapshot history in deterministic newest-first order.")]
@@ -220,6 +222,68 @@ pub enum Command {
     #[command(about = "Manage named storage configurations.")]
     #[command(subcommand)]
     Storage(Box<StorageCommand>),
+}
+
+#[derive(Debug, Args)]
+pub struct BackupCommand {
+    #[arg(
+        value_name = "REPOSITORY",
+        help = "The local repository root. Defaults to the current directory.",
+        conflicts_with = "repository_option",
+        global = true
+    )]
+    pub repository: Option<PathBuf>,
+    #[arg(
+        long = "repository",
+        visible_alias = "repo",
+        value_name = "PATH",
+        help = "The local repository root (the `--repo` alias is retained for scripts).",
+        conflicts_with = "repository",
+        global = true
+    )]
+    pub repository_option: Option<PathBuf>,
+    #[arg(
+        long = "continue",
+        value_name = "ID",
+        help = "Resume a compatible pending backup journal."
+    )]
+    pub continue_id: Option<String>,
+    #[command(subcommand)]
+    pub action: Option<BackupAction>,
+}
+
+impl BackupCommand {
+    pub fn repository_path(&self) -> &Path {
+        self.repository_option
+            .as_deref()
+            .or(self.repository.as_deref())
+            .unwrap_or(Path::new("."))
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BackupAction {
+    #[command(about = "List resumable backup journals without scanning objects.")]
+    Pending(BackupPendingCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct BackupPendingCommand {
+    #[arg(
+        long = "limit",
+        short = 'n',
+        default_value_t = DEFAULT_OBJECT_LIST_PAGE_SIZE,
+        value_name = "N",
+        help = "The number of journal entries requested from each page."
+    )]
+    pub page_size: usize,
+    #[arg(
+        long,
+        value_name = "CURSOR",
+        help = "Continue after an operation-list cursor.",
+        value_parser = parse_object_cursor
+    )]
+    pub after: Option<ObjectCursor>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -446,6 +510,10 @@ fn parse_cursor(value: &str) -> Result<SnapshotCursor, String> {
     SnapshotCursor::new(value.to_owned()).map_err(|error| error.to_string())
 }
 
+fn parse_object_cursor(value: &str) -> Result<ObjectCursor, String> {
+    ObjectCursor::new(value.to_owned()).map_err(|error| error.to_string())
+}
+
 pub fn parse() -> Cli {
     Cli::parse()
 }
@@ -542,6 +610,7 @@ mod tests {
         assert!(help.contains("resolve"));
         assert!(help.contains("config"));
         assert!(help.contains("whoami"));
+        assert!(help.contains("backup"));
     }
 
     #[test]
@@ -568,6 +637,50 @@ mod tests {
             .expect("valid interactive whoami input");
         assert_eq!(cli.mode, OutputMode::Interactive);
         assert!(matches!(cli.command, Some(Command::Whoami(_))));
+    }
+
+    #[test]
+    fn parses_backup_pending_and_continue_arguments() {
+        let cli = parse_from(arguments(&[
+            "gib",
+            "--no-config",
+            "backup",
+            "pending",
+            "--limit",
+            "3",
+            "--after",
+            "operations/op-7-abc",
+            "/tmp/repository",
+        ]))
+        .expect("valid pending backup input");
+        let Some(Command::Backup(command)) = cli.command else {
+            panic!("expected backup command");
+        };
+        assert_eq!(command.repository_path(), Path::new("/tmp/repository"));
+        let Some(BackupAction::Pending(request)) = command.action else {
+            panic!("expected pending action");
+        };
+        assert_eq!(request.page_size, 3);
+        assert_eq!(
+            request.after.as_ref().map(ObjectCursor::as_str),
+            Some("operations/op-7-abc")
+        );
+
+        let cli = parse_from(arguments(&[
+            "gib",
+            "--no-config",
+            "backup",
+            "--continue",
+            "op-7-abc",
+            "/tmp/repository",
+        ]))
+        .expect("valid backup continuation input");
+        let Some(Command::Backup(command)) = cli.command else {
+            panic!("expected backup command");
+        };
+        assert_eq!(command.continue_id.as_deref(), Some("op-7-abc"));
+        assert_eq!(command.repository_path(), Path::new("/tmp/repository"));
+        assert!(command.action.is_none());
     }
 
     #[test]

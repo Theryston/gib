@@ -18,6 +18,9 @@ pub const CURRENT_PACK_OBJECT_VERSION: u16 = 1;
 /// The current payload version for pack-index objects.
 pub const CURRENT_INDEX_OBJECT_VERSION: u16 = 1;
 
+/// The current payload version for resumable-operation journal objects.
+pub const CURRENT_OPERATION_OBJECT_VERSION: u16 = 1;
+
 /// The length of a SHA-256 object identifier in hexadecimal bytes.
 pub const OBJECT_ID_HEX_LENGTH: usize = 64;
 
@@ -177,6 +180,8 @@ pub enum ObjectKind {
     Pack,
     /// An index for a pack.
     Index,
+    /// A bounded mutable operation journal.
+    Operation,
 }
 
 impl ObjectKind {
@@ -187,6 +192,7 @@ impl ObjectKind {
             Self::Tree => "tree",
             Self::Pack => "pack",
             Self::Index => "index",
+            Self::Operation => "operation",
         }
     }
 
@@ -202,6 +208,7 @@ impl ObjectKind {
             "tree" => Some(Self::Tree),
             "pack" => Some(Self::Pack),
             "index" => Some(Self::Index),
+            "operation" => Some(Self::Operation),
             _ => None,
         }
     }
@@ -213,6 +220,7 @@ impl ObjectKind {
             Self::Tree => CURRENT_TREE_OBJECT_VERSION,
             Self::Pack => CURRENT_PACK_OBJECT_VERSION,
             Self::Index => CURRENT_INDEX_OBJECT_VERSION,
+            Self::Operation => CURRENT_OPERATION_OBJECT_VERSION,
         }
     }
 
@@ -223,6 +231,7 @@ impl ObjectKind {
             Self::Tree => "trees",
             Self::Pack => "packs",
             Self::Index => "indexes",
+            Self::Operation => "operations",
         }
     }
 

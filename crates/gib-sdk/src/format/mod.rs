@@ -1,6 +1,7 @@
 mod configuration;
 mod envelope;
 mod identity;
+mod journal;
 mod pack;
 mod pack_index;
 mod repository;
@@ -18,11 +19,17 @@ pub(crate) use envelope::{
     decode_object_envelope_from_reader_with_password, decode_object_envelope_with_encryption,
     decode_object_envelope_with_password, encode_object_envelope,
     encode_object_envelope_with_encryption, encode_object_envelope_with_options,
-    encode_object_envelope_with_password,
+    encode_object_envelope_with_options_deterministic, encode_object_envelope_with_password,
 };
 pub(crate) use identity::{
     CURRENT_IDENTITY_CONFIGURATION_VERSION, MAX_IDENTITY_CONFIGURATION_BYTES,
     decode_identity_configuration, encode_identity_configuration,
+};
+pub use journal::CURRENT_OPERATION_JOURNAL_VERSION;
+pub(crate) use journal::{
+    MAX_OPERATION_JOURNAL_BYTES, MAX_OPERATION_JOURNAL_COMPLETED_OBJECTS,
+    OperationJournalCheckpoint, OperationJournalData, OperationJournalObject,
+    OperationJournalState, decode_operation_journal, encode_operation_journal,
 };
 pub(crate) use pack::{PackBuilder, PackFormatError, VerifiedPack};
 pub(crate) use pack_index::{PackIndexFormatError, PackIndexShardBuilder, VerifiedPackIndexShard};

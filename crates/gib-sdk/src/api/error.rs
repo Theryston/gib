@@ -82,6 +82,28 @@ pub enum ErrorCode {
     SnapshotReferenceNotFound,
     /// More than one snapshot matches a requested prefix.
     SnapshotReferenceAmbiguous,
+    /// A requested operation journal does not exist.
+    OperationJournalNotFound,
+    /// An operation journal failed integrity or structural validation.
+    OperationJournalMalformed,
+    /// An operation journal version is not supported by this SDK.
+    OperationJournalUnsupportedVersion,
+    /// An operation journal does not match the current repository or request.
+    OperationJournalIncompatible,
+    /// The repository HEAD changed since the journal's base read.
+    OperationJournalStale,
+    /// The journal describes a snapshot that is already published.
+    OperationJournalAlreadyPublished,
+    /// The source no longer matches the journal's captured assumptions.
+    OperationJournalSourceChanged,
+    /// The journal exceeds its bounded size or completion-record limit.
+    OperationJournalTooLarge,
+    /// The journal requires repository encryption material.
+    OperationJournalEncryptionRequired,
+    /// A journal could not be atomically read, written, or removed.
+    OperationJournalStorageFailure,
+    /// A new journal identifier collided with an existing object.
+    OperationJournalAlreadyExists,
 }
 
 impl ErrorCode {
@@ -125,6 +147,17 @@ impl ErrorCode {
             Self::SnapshotReferenceMalformed => "snapshot_reference_malformed",
             Self::SnapshotReferenceNotFound => "snapshot_reference_not_found",
             Self::SnapshotReferenceAmbiguous => "snapshot_reference_ambiguous",
+            Self::OperationJournalNotFound => "operation_journal_not_found",
+            Self::OperationJournalMalformed => "operation_journal_malformed",
+            Self::OperationJournalUnsupportedVersion => "operation_journal_unsupported_version",
+            Self::OperationJournalIncompatible => "operation_journal_incompatible",
+            Self::OperationJournalStale => "operation_journal_stale",
+            Self::OperationJournalAlreadyPublished => "operation_journal_already_published",
+            Self::OperationJournalSourceChanged => "operation_journal_source_changed",
+            Self::OperationJournalTooLarge => "operation_journal_too_large",
+            Self::OperationJournalEncryptionRequired => "operation_journal_encryption_required",
+            Self::OperationJournalStorageFailure => "operation_journal_storage_failure",
+            Self::OperationJournalAlreadyExists => "operation_journal_already_exists",
         }
     }
 }
@@ -249,6 +282,40 @@ pub enum SdkError {
     SnapshotReferenceNotFound,
     /// Multiple published snapshots match a requested prefix.
     SnapshotReferenceAmbiguous,
+    /// The requested operation journal does not exist.
+    OperationJournalNotFound,
+    /// The operation journal is corrupt or structurally invalid.
+    OperationJournalMalformed,
+    /// The operation journal version is not supported.
+    OperationJournalUnsupportedVersion {
+        /// The unsupported journal or envelope version.
+        version: u16,
+    },
+    /// The journal does not match the current request or repository identity.
+    OperationJournalIncompatible {
+        /// A stable explanation of the mismatch.
+        reason: &'static str,
+    },
+    /// The repository changed after the journal's base HEAD was captured.
+    OperationJournalStale {
+        /// A stable explanation of the stale precondition.
+        reason: &'static str,
+    },
+    /// The target snapshot was published before journal cleanup completed.
+    OperationJournalAlreadyPublished,
+    /// The source changed since the journal's source fingerprint was captured.
+    OperationJournalSourceChanged,
+    /// The journal exceeded a bounded loader or completion-record limit.
+    OperationJournalTooLarge,
+    /// The journal is encrypted and needs an explicit repository key.
+    OperationJournalEncryptionRequired,
+    /// A journal storage operation failed.
+    OperationJournalStorageFailure {
+        /// The stable journal operation that failed.
+        operation: &'static str,
+    },
+    /// A new journal identifier already exists.
+    OperationJournalAlreadyExists,
     /// An operation method conflicts with its current state.
     OperationStateConflict {
         /// The operation involved in the conflict.
@@ -352,6 +419,23 @@ impl SdkError {
             Self::SnapshotReferenceMalformed => ErrorCode::SnapshotReferenceMalformed,
             Self::SnapshotReferenceNotFound => ErrorCode::SnapshotReferenceNotFound,
             Self::SnapshotReferenceAmbiguous => ErrorCode::SnapshotReferenceAmbiguous,
+            Self::OperationJournalNotFound => ErrorCode::OperationJournalNotFound,
+            Self::OperationJournalMalformed => ErrorCode::OperationJournalMalformed,
+            Self::OperationJournalUnsupportedVersion { .. } => {
+                ErrorCode::OperationJournalUnsupportedVersion
+            }
+            Self::OperationJournalIncompatible { .. } => ErrorCode::OperationJournalIncompatible,
+            Self::OperationJournalStale { .. } => ErrorCode::OperationJournalStale,
+            Self::OperationJournalAlreadyPublished => ErrorCode::OperationJournalAlreadyPublished,
+            Self::OperationJournalSourceChanged => ErrorCode::OperationJournalSourceChanged,
+            Self::OperationJournalTooLarge => ErrorCode::OperationJournalTooLarge,
+            Self::OperationJournalEncryptionRequired => {
+                ErrorCode::OperationJournalEncryptionRequired
+            }
+            Self::OperationJournalStorageFailure { .. } => {
+                ErrorCode::OperationJournalStorageFailure
+            }
+            Self::OperationJournalAlreadyExists => ErrorCode::OperationJournalAlreadyExists,
         }
     }
 
@@ -395,7 +479,18 @@ impl SdkError {
             | Self::SnapshotReferenceEmpty
             | Self::SnapshotReferenceMalformed
             | Self::SnapshotReferenceNotFound
-            | Self::SnapshotReferenceAmbiguous => None,
+            | Self::SnapshotReferenceAmbiguous
+            | Self::OperationJournalNotFound
+            | Self::OperationJournalMalformed
+            | Self::OperationJournalUnsupportedVersion { .. }
+            | Self::OperationJournalIncompatible { .. }
+            | Self::OperationJournalStale { .. }
+            | Self::OperationJournalAlreadyPublished
+            | Self::OperationJournalSourceChanged
+            | Self::OperationJournalTooLarge
+            | Self::OperationJournalEncryptionRequired
+            | Self::OperationJournalStorageFailure { .. }
+            | Self::OperationJournalAlreadyExists => None,
         }
     }
 
@@ -571,6 +666,40 @@ impl fmt::Display for SdkError {
             }
             Self::SnapshotReferenceAmbiguous => {
                 formatter.write_str("snapshot reference is ambiguous; provide a longer reference")
+            }
+            Self::OperationJournalNotFound => {
+                formatter.write_str("the requested operation journal was not found")
+            }
+            Self::OperationJournalMalformed => {
+                formatter.write_str("the operation journal is corrupt or malformed")
+            }
+            Self::OperationJournalUnsupportedVersion { version } => {
+                write!(formatter, "operation journal version {version} is unsupported")
+            }
+            Self::OperationJournalIncompatible { reason } => {
+                write!(formatter, "operation journal is incompatible: {reason}")
+            }
+            Self::OperationJournalStale { reason } => {
+                write!(formatter, "operation journal is stale: {reason}")
+            }
+            Self::OperationJournalAlreadyPublished => formatter.write_str(
+                "the operation journal target is already published; no resume was performed",
+            ),
+            Self::OperationJournalSourceChanged => {
+                formatter.write_str("the backup source changed since the operation journal was created")
+            }
+            Self::OperationJournalTooLarge => {
+                formatter.write_str("the operation journal exceeds its bounded size")
+            }
+            Self::OperationJournalEncryptionRequired => formatter.write_str(
+                "the operation journal is encrypted and requires repository encryption material",
+            ),
+            Self::OperationJournalStorageFailure { operation } => write!(
+                formatter,
+                "operation journal storage {operation} operation failed",
+            ),
+            Self::OperationJournalAlreadyExists => {
+                formatter.write_str("the operation journal identifier already exists")
             }
         }
     }

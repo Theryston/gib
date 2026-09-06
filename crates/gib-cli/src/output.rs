@@ -1,9 +1,10 @@
 use crate::input::OutputMode;
 use crate::interactive;
 use gib::{
-    AuthorIdentity, ConfigurationSource, ResolvedConfiguration, SnapshotReference,
-    SnapshotSummaryPage, StorageAddRequest, StorageAddResult, StorageBackend,
-    StorageConfigurationMetadata, StorageListResult, StorageRemoveResult,
+    AuthorIdentity, BackupResult, ConfigurationSource, PendingOperation, PendingOperationPage,
+    ResolvedConfiguration, SnapshotReference, SnapshotSummaryPage, StorageAddRequest,
+    StorageAddResult, StorageBackend, StorageConfigurationMetadata, StorageListResult,
+    StorageRemoveResult,
 };
 use serde::Serialize;
 use std::path::Path;
@@ -11,6 +12,14 @@ use time::{OffsetDateTime, format_description::BorrowedFormatItem};
 
 const CLI_OUTPUT_SCHEMA_VERSION: u16 = 1;
 const HISTORY_TABLE_HEADERS: [&str; 5] = ["SNAPSHOT", "SIZE", "AUTHOR", "TIME", "MESSAGE"];
+const PENDING_TABLE_HEADERS: [&str; 6] = [
+    "OPERATION",
+    "STATUS",
+    "BASE",
+    "CHECKPOINT",
+    "OBJECTS",
+    "UPDATED",
+];
 const HISTORY_TIMESTAMP_FORMAT: &[BorrowedFormatItem<'static>] =
     time::macros::format_description!("[month repr:short] [day], [year] [hour]:[minute] UTC");
 
@@ -42,6 +51,41 @@ struct HistorySummaryOutput {
     author: Option<String>,
     timestamp: Option<u64>,
     size: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct BackupOutput {
+    snapshot: String,
+    pending_identifier: String,
+    files: u64,
+    bytes: u64,
+    packs: u64,
+    uploaded_objects: u64,
+    new_stored_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct PendingOperationsOutput {
+    operations: Vec<PendingOperationOutput>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PendingOperationOutput {
+    identifier: String,
+    status: String,
+    operation_id: Option<String>,
+    repository_format_version: Option<u16>,
+    base_generation: Option<u64>,
+    base_snapshot: Option<String>,
+    source_root: Option<String>,
+    checkpoint: Option<String>,
+    checkpoint_sequence: Option<u64>,
+    completed_objects: usize,
+    created_at: Option<u64>,
+    updated_at: Option<u64>,
+    target_snapshot: Option<String>,
+    object_size: u64,
 }
 
 #[derive(Serialize)]
@@ -215,6 +259,139 @@ pub fn render_empty_history(mode: OutputMode) {
         );
     } else {
         interactive::info("No snapshots yet. Run a backup to create your first checkpoint.");
+    }
+}
+
+pub fn render_backup_start(
+    repository: &Path,
+    source: &Path,
+    continue_identifier: Option<&str>,
+    mode: OutputMode,
+) {
+    if mode == OutputMode::Interactive {
+        interactive::banner(
+            if continue_identifier.is_some() {
+                "Resuming backup"
+            } else {
+                "Starting backup"
+            },
+            "Immutable packs will be journaled before the final HEAD publication.",
+        );
+        interactive::card(
+            "Backup",
+            &[
+                ("Repository", repository.display().to_string()),
+                ("Source", source.display().to_string()),
+                (
+                    "Journal",
+                    continue_identifier.unwrap_or("new operation").to_owned(),
+                ),
+            ],
+        );
+    }
+}
+
+pub fn render_backup_result(result: &BackupResult, pending_identifier: &str, mode: OutputMode) {
+    let metrics = result.metrics();
+    let data = BackupOutput {
+        snapshot: result.snapshot().to_string(),
+        pending_identifier: pending_identifier.to_owned(),
+        files: metrics.files(),
+        bytes: metrics.total_size(),
+        packs: metrics.packs(),
+        uploaded_objects: metrics.uploaded_objects(),
+        new_stored_bytes: metrics.new_stored_bytes(),
+    };
+    match mode {
+        OutputMode::Json => render_json("backup", data, false),
+        OutputMode::Interactive => {
+            interactive::success_value("Backup published", result.snapshot().as_str());
+            interactive::card(
+                "Result",
+                &[
+                    ("Files", metrics.files().to_string()),
+                    ("Bytes", format_size(metrics.total_size())),
+                    ("Packs", metrics.packs().to_string()),
+                    ("New stored", format_size(metrics.new_stored_bytes())),
+                ],
+            );
+        }
+    }
+}
+
+pub fn render_pending_operations(repository: &Path, page: &PendingOperationPage, mode: OutputMode) {
+    if mode == OutputMode::Json {
+        let data = PendingOperationsOutput {
+            operations: page
+                .operations()
+                .iter()
+                .map(pending_operation_output)
+                .collect(),
+            next_cursor: page.next_cursor().map(ToString::to_string),
+        };
+        render_json("pending_operations", data, false);
+        return;
+    }
+    let rows = page
+        .operations()
+        .iter()
+        .map(|operation| {
+            vec![
+                shorten(operation.identifier(), 22),
+                operation.status().to_string(),
+                operation
+                    .base_generation()
+                    .map_or_else(|| String::from("-"), |generation| generation.to_string()),
+                operation
+                    .checkpoint()
+                    .map_or_else(|| String::from("-"), |stage| stage.to_string()),
+                operation.completed_objects().to_string(),
+                operation
+                    .updated_at()
+                    .map_or_else(|| String::from("-"), format_timestamp),
+            ]
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        interactive::info(&format!(
+            "No active backup journals in {}.",
+            repository.display()
+        ));
+    } else {
+        interactive::table(&PENDING_TABLE_HEADERS, &rows);
+    }
+}
+
+pub fn render_pending_complete(count: usize, mode: OutputMode) {
+    if mode == OutputMode::Interactive {
+        interactive::success(
+            &format!(
+                "{count} pending operation{} shown",
+                if count == 1 { "" } else { "s" }
+            ),
+            Some("Resume one with `gib backup --continue <ID>`."),
+        );
+    }
+}
+
+fn pending_operation_output(operation: &PendingOperation) -> PendingOperationOutput {
+    PendingOperationOutput {
+        identifier: operation.identifier().to_owned(),
+        status: operation.status().to_string(),
+        operation_id: operation.operation_id().map(|value| value.to_string()),
+        repository_format_version: operation.repository_format_version(),
+        base_generation: operation.base_generation(),
+        base_snapshot: operation.base_snapshot().map(ToString::to_string),
+        source_root: operation
+            .source_root()
+            .map(|value| value.display().to_string()),
+        checkpoint: operation.checkpoint().map(|value| value.to_string()),
+        checkpoint_sequence: operation.checkpoint_sequence(),
+        completed_objects: operation.completed_objects(),
+        created_at: operation.created_at(),
+        updated_at: operation.updated_at(),
+        target_snapshot: operation.target_snapshot().map(ToString::to_string),
+        object_size: operation.object_size(),
     }
 }
 

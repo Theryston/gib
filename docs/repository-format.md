@@ -166,10 +166,14 @@ payload. For version 2, the object ID and envelope checksum rules are the
 same, while `payload` is first authenticated and then decoded back to `P`;
 `ImmutableObject::payload()` always returns canonical plaintext.
 
-The conventional object keys are `snapshots/<id>`, `trees/<id>`,
-`packs/<id>`, and `indexes/<id>`. These keys are derived from the validated
-object ID and kind; a caller must not use a human label as an immutable object
-key.
+The conventional immutable object keys are `snapshots/<id>`, `trees/<id>`,
+`packs/<id>`, and `indexes/<id>`. Resumable operation journals use the separate
+`operations/op-<operation-number>-<random-suffix>` namespace because a journal
+is mutable advisory state rather than a content-addressed immutable object.
+The journal still uses the common envelope, explicit object version, canonical
+MessagePack payload, checksums, and optional repository encryption. These keys
+are derived from validated values; a caller must not use a human label as an
+immutable object key.
 
 The existing `SnapshotId`/`SnapshotReference` API is retained for released
 repositories whose snapshot paths use historical IDs. New content-addressed

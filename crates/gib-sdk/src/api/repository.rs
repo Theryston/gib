@@ -1,5 +1,10 @@
+use super::backup::{
+    PendingOperationListRequest, PendingOperationPage, map_journal_error,
+    pending_page_from_application,
+};
 use super::error::{SdkError, SdkResult};
 use super::operation::CancellationToken;
+use crate::application::journal::list_pending_operations as list_pending_operations_use_case;
 use crate::application::ports::read_stream_to_vec;
 use crate::application::repository::{
     HeadRead as ApplicationHeadRead, RepositoryError, RepositoryOpenExpectations,
@@ -38,7 +43,8 @@ pub use crate::application::ports::{
 };
 pub use crate::domain::{
     ARGON2ID_MEMORY_COST_KIB, ARGON2ID_PARALLELISM, ARGON2ID_TIME_COST,
-    CURRENT_INDEX_OBJECT_VERSION, CURRENT_OBJECT_ENVELOPE_VERSION, CURRENT_PACK_OBJECT_VERSION,
+    CURRENT_INDEX_OBJECT_VERSION, CURRENT_OBJECT_ENVELOPE_VERSION,
+    CURRENT_OPERATION_OBJECT_VERSION, CURRENT_PACK_OBJECT_VERSION,
     CURRENT_TRANSFORMED_OBJECT_ENVELOPE_VERSION, CURRENT_TREE_OBJECT_VERSION, CompressionLevel,
     CompressionLevelError, DEFAULT_ZSTD_COMPRESSION_LEVEL, ImmutableObject,
     MAX_IMMUTABLE_OBJECT_BYTES, MAX_IMMUTABLE_OBJECT_PAYLOAD_BYTES,
@@ -97,6 +103,7 @@ pub use crate::domain::{
     RepositoryIdentity, RepositoryKey, RepositoryObject, RepositoryRoots, SnapshotPublication,
     SnapshotPublicationRequest, SnapshotReference,
 };
+pub use crate::format::CURRENT_OPERATION_JOURNAL_VERSION;
 #[cfg(feature = "s3")]
 pub use crate::infrastructure::storage::{
     DEFAULT_S3_CAPABILITY_CACHE_FILE_NAME, DEFAULT_S3_CAPABILITY_CACHE_TTL_SECONDS,
@@ -750,6 +757,19 @@ impl Repository {
         let request = request.into();
         list_snapshot_summaries_use_case(self.storage.as_storage(), &request)
             .map_err(SdkError::from)
+    }
+
+    /// Lists active backup operation journals through the dedicated bounded
+    /// journal prefix. Encrypted journals are reported as encrypted unless a
+    /// pipeline with matching repository encryption material is used.
+    pub fn list_pending_operations(
+        &self,
+        request: impl Into<PendingOperationListRequest>,
+    ) -> SdkResult<PendingOperationPage> {
+        let request = request.into().into_application()?;
+        list_pending_operations_use_case(self.storage.as_storage(), &request, None)
+            .map_err(map_journal_error)
+            .and_then(pending_page_from_application)
     }
 
     /// Alias for [`Self::list_snapshot_summaries`] using history terminology.

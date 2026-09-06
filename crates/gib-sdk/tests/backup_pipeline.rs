@@ -1,11 +1,11 @@
 use gib::{
     BackupBudgetError, BackupBudgets, BackupDeduplicationConfiguration, BackupRequest, BackupStage,
     ChunkingConfiguration, Client, DirectoryNode, EntryName, ErrorCode, MAX_BACKUP_CONCURRENCY,
-    MemoryStorage, MemoryStorageOperation, ObjectId, ObjectKey, ObjectListPage, ObjectListRequest,
-    ObjectRange, ObjectRead, ObjectWriteOptions, PackConfiguration, PackIndexCacheConfiguration,
-    PackIndexConfiguration, PackIndexReader, PackReader, RepositoryIdentity, RepositoryInitRequest,
-    RepositoryKey, RepositoryStorage, SdkError, Snapshot, StorageCapabilities, StorageError,
-    StorageVersion, TreeNode, TreeNodeKind, decode_tree_node_object, tree_node_object_id,
+    MemoryStorage, ObjectId, ObjectKey, ObjectListPage, ObjectListRequest, ObjectRange, ObjectRead,
+    ObjectWriteOptions, PackConfiguration, PackIndexCacheConfiguration, PackIndexConfiguration,
+    PackIndexReader, PackReader, RepositoryIdentity, RepositoryInitRequest, RepositoryKey,
+    RepositoryStorage, SdkError, Snapshot, StorageCapabilities, StorageError, StorageVersion,
+    TreeNode, TreeNodeKind, decode_tree_node_object, tree_node_object_id,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
@@ -723,6 +723,133 @@ impl RepositoryStorage for SlowStorage {
 }
 
 #[derive(Clone)]
+struct UploadFailureStorage {
+    inner: MemoryStorage,
+    fail_next: Arc<AtomicBool>,
+}
+
+impl UploadFailureStorage {
+    fn new(inner: MemoryStorage) -> Self {
+        Self {
+            inner,
+            fail_next: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
+impl RepositoryStorage for UploadFailureStorage {
+    fn capabilities(&self) -> StorageCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn read_stream(&self, object_key: &ObjectKey) -> Result<ObjectRead, StorageError> {
+        self.inner.read_stream(object_key)
+    }
+
+    fn read_range(
+        &self,
+        object_key: &ObjectKey,
+        range: ObjectRange,
+    ) -> Result<ObjectRead, StorageError> {
+        self.inner.read_range(object_key, range)
+    }
+
+    fn metadata(&self, object_key: &ObjectKey) -> Result<gib::ObjectMetadata, StorageError> {
+        self.inner.metadata(object_key)
+    }
+
+    fn write_stream(
+        &self,
+        object_key: &ObjectKey,
+        source: &mut dyn Read,
+        options: ObjectWriteOptions,
+    ) -> Result<gib::ObjectMetadata, StorageError> {
+        if ["snapshots/", "trees/", "packs/", "indexes/"]
+            .iter()
+            .any(|prefix| object_key.as_str().starts_with(prefix))
+            && self
+                .fail_next
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Err(StorageError::Transient);
+        }
+        self.inner.write_stream(object_key, source, options)
+    }
+
+    fn list_page(&self, request: &ObjectListRequest) -> Result<ObjectListPage, StorageError> {
+        self.inner.list_page(request)
+    }
+}
+
+#[derive(Clone)]
+struct PublicationValidationFailureStorage {
+    inner: MemoryStorage,
+    fail_pack_reads: Arc<AtomicBool>,
+}
+
+impl PublicationValidationFailureStorage {
+    fn new() -> Self {
+        Self {
+            inner: MemoryStorage::new(),
+            fail_pack_reads: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn fail_pack_reads(&self) {
+        self.fail_pack_reads.store(true, Ordering::Release);
+    }
+}
+
+impl RepositoryStorage for PublicationValidationFailureStorage {
+    fn capabilities(&self) -> StorageCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn read_stream(&self, object_key: &ObjectKey) -> Result<ObjectRead, StorageError> {
+        if self.fail_pack_reads.load(Ordering::Acquire) && object_key.as_str().starts_with("packs/")
+        {
+            return Err(StorageError::Transient);
+        }
+        self.inner.read_stream(object_key)
+    }
+
+    fn read_range(
+        &self,
+        object_key: &ObjectKey,
+        range: ObjectRange,
+    ) -> Result<ObjectRead, StorageError> {
+        self.inner.read_range(object_key, range)
+    }
+
+    fn metadata(&self, object_key: &ObjectKey) -> Result<gib::ObjectMetadata, StorageError> {
+        self.inner.metadata(object_key)
+    }
+
+    fn write_stream(
+        &self,
+        object_key: &ObjectKey,
+        source: &mut dyn Read,
+        options: ObjectWriteOptions,
+    ) -> Result<gib::ObjectMetadata, StorageError> {
+        self.inner.write_stream(object_key, source, options)
+    }
+
+    fn list_page(&self, request: &ObjectListRequest) -> Result<ObjectListPage, StorageError> {
+        self.inner.list_page(request)
+    }
+
+    fn conditional_write(
+        &self,
+        object_key: &str,
+        expected: Option<&StorageVersion>,
+        contents: &[u8],
+    ) -> Result<StorageVersion, StorageError> {
+        self.inner.conditional_write(object_key, expected, contents)
+    }
+}
+
+#[derive(Clone)]
 struct FaultStorage {
     inner: MemoryStorage,
     fail_head_cas: Arc<AtomicBool>,
@@ -1001,21 +1128,27 @@ fn publication_validation_failure_after_upload_keeps_previous_head_current()
         source.path().join("payload.bin"),
         deterministic_payload(8 * 1024),
     )?;
-    let storage = MemoryStorage::new();
+    let storage = PublicationValidationFailureStorage::new();
     let client = Client::default();
-    let repository = repository(&client, &storage)?;
+    let repository = client.initialize_repository(
+        storage.clone(),
+        RepositoryInitRequest::new(
+            RepositoryIdentity::new("backup-publication-validation-test")?,
+            RepositoryKey::new("test")?,
+        ),
+    )?;
     let request = small_request(source.path())?
         .with_index_configuration(PackIndexConfiguration::new(4096)?)
         .with_created_at(10);
     client.backup(repository.clone(), request.clone())?;
     let previous_head = repository.read_head()?;
-    let object_count_before = immutable_object_count(&storage)?;
+    let object_count_before = immutable_object_count(&storage.inner)?;
 
     fs::write(
         source.path().join("payload.bin"),
         deterministic_payload(8 * 1024 + 37),
     )?;
-    storage.inject_failure(MemoryStorageOperation::Range, StorageError::Transient);
+    storage.fail_pack_reads();
     let error = client
         .backup(repository.clone(), request.with_created_at(11))
         .expect_err("range validation failure must abort publication");
@@ -1027,7 +1160,7 @@ fn publication_validation_failure_after_upload_keeps_previous_head_current()
         other => panic!("expected a publish-stage storage error, got {other:?}"),
     }
     assert_eq!(repository.read_head()?, previous_head);
-    assert!(immutable_object_count(&storage)? >= object_count_before);
+    assert!(immutable_object_count(&storage.inner)? >= object_count_before);
     Ok(())
 }
 
@@ -1212,11 +1345,14 @@ fn injected_upload_failure_keeps_typed_stage_and_storage_context() -> Result<(),
     fs::write(source.path().join("payload.bin"), vec![b'p'; 512])?;
     let storage = MemoryStorage::new();
     let client = Client::default();
-    let repository = repository(&client, &storage)?;
-    storage.inject_failure(
-        MemoryStorageOperation::ConditionalWrite,
-        StorageError::Transient,
-    );
+    let failing_storage = UploadFailureStorage::new(storage.clone());
+    let repository = client.initialize_repository(
+        failing_storage,
+        RepositoryInitRequest::new(
+            RepositoryIdentity::new("backup-pipeline-test")?,
+            RepositoryKey::new("test")?,
+        ),
+    )?;
 
     let error = client
         .backup(repository, small_request(source.path())?)

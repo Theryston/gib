@@ -51,6 +51,13 @@ pub fn run() -> ExitCode {
     };
 
     match command {
+        Command::Backup(request) => match commands::backup::run(request, &configuration, mode) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                output::render_error(&error, error.code(), error.field(), mode);
+                ExitCode::from(error.exit_code())
+            }
+        },
         Command::Config(request) => match commands::config::run(request, mode) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -102,17 +109,29 @@ impl CommandError {
                     1
                 }
             }
-            Self::Sdk(error) => match error {
-                gib::SdkError::SnapshotReferenceEmpty
-                | gib::SdkError::SnapshotReferenceMalformed
-                | gib::SdkError::SnapshotReferenceNotFound
-                | gib::SdkError::SnapshotReferenceAmbiguous
-                | gib::SdkError::RepositoryNoSnapshots
-                | gib::SdkError::IdentityNotConfigured
-                | gib::SdkError::InvalidRequest { .. } => 2,
-                _ => 1,
-            },
+            Self::Sdk(error) if is_input_error(error) => 2,
+            Self::Sdk(_) => 1,
             Self::Configuration(_) => 2,
         }
+    }
+}
+
+fn is_input_error(error: &gib::SdkError) -> bool {
+    match error {
+        gib::SdkError::BackupStageFailed { source, .. } => is_input_error(source),
+        gib::SdkError::SnapshotReferenceEmpty
+        | gib::SdkError::SnapshotReferenceMalformed
+        | gib::SdkError::SnapshotReferenceNotFound
+        | gib::SdkError::SnapshotReferenceAmbiguous
+        | gib::SdkError::RepositoryNoSnapshots
+        | gib::SdkError::IdentityNotConfigured
+        | gib::SdkError::OperationJournalNotFound
+        | gib::SdkError::OperationJournalIncompatible { .. }
+        | gib::SdkError::OperationJournalStale { .. }
+        | gib::SdkError::OperationJournalSourceChanged
+        | gib::SdkError::OperationJournalTooLarge
+        | gib::SdkError::OperationJournalEncryptionRequired
+        | gib::SdkError::InvalidRequest { .. } => true,
+        _ => false,
     }
 }

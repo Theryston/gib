@@ -114,6 +114,45 @@ generation and storage version, so an unsuccessful run cannot publish a new
 snapshot. Uploaded objects that are not reachable from the winning HEAD are
 left for pruning rather than deleted in the publication transaction.
 
+## Resumable operation journals
+
+Every backup creates one journal below `operations/` after reading the current
+HEAD and before source preflight. The journal is a versioned common-envelope
+object with a canonical MessagePack payload. It records the operation number,
+repository format and identity, base HEAD generation/snapshot/version, a
+validated request fingerprint, source-root and source fingerprint, the last
+pipeline stage and sequence checkpoint, snapshot creation time, timestamps,
+the target snapshot, and a bounded set of immutable object keys with their
+stored byte sizes and SHA-256 digests. Credentials, passwords, salts, and
+derived encryption keys are never journal fields.
+
+Journal creation and every checkpoint update use the storage port's atomic
+conditional-write contract. The journal is authenticated by the common object
+envelope checksum. When a pipeline has repository encryption material, journal
+payloads use the same XChaCha20-Poly1305 envelope policy; listing without that
+material reports the row as encrypted and cannot decode or resume it. Journal
+loading is bounded to 8 MiB and 65,536 completion records. Pending listings
+page only the `operations` prefix and project safe metadata, so they do not
+scan immutable objects or retain a full completion set in the public result.
+
+The completion set is advisory. Before resume, every recorded object is
+re-read in a bounded stream and its size and digest are checked. Missing
+objects are removed from the advisory set and rebuilt through the normal
+create-if-absent path; a present object with different bytes is corruption and
+fails closed. Encrypted transformed chunk envelopes use a deterministic nonce
+derived from their immutable identity during backup, so rebuilding a pack has
+the same bytes and can skip a verified completed pack without re-uploading it.
+
+Resume compares the request fingerprint, repository format and identity, base
+HEAD generation/snapshot/version, source root, and source fingerprint before
+workers can publish. It rejects incompatible options, stale HEADs, changed
+sources, malformed journals, unsupported versions, missing encryption material,
+and already-published targets with distinct typed errors. A cancellation leaves
+the last atomically committed checkpoint. The journal is marked complete and
+then removed only after the HEAD CAS succeeds; a cleanup failure leaves a
+terminal marker that is excluded from active pending listings and can be
+recognized as already published on a later resume.
+
 Progress is deliberately off the hot path. A separate progress reporter has a
 small bounded queue and uses coalescing/drop semantics. The SDK event dispatcher
 has its own bounded queue per consumer: progress can be coalesced or dropped,
@@ -135,8 +174,9 @@ immutable object that finishes just as cancellation is observed may be left as
 an unpublished object, but no new HEAD is published by the failed operation.
 Derived `refs/history/<generation>` records are written after the HEAD CAS and
 can be rebuilt from authoritative snapshot objects if their update fails. The
-backup pipeline does not add resume journals or change snapshot publication
-rules.
+The journal does not change snapshot publication rules: HEAD remains the only
+commit boundary, and abandoned immutable objects are left for the existing
+pruning policy.
 
 ## Validation and measurement
 
@@ -148,7 +188,10 @@ content, explicit/latest/prefix and parentless selection, deletions, renames,
 type changes, missing or incompatible parents, one-leaf tree edits, missing
 packs, corrupt indexes, and a one-shard deduplication cache. Repository tests
 also cover concurrent CAS publication and typed expected/current HEAD conflict
-context.
+context. Resumable-backup tests cover encrypted and checksummed journals,
+bounded pending listings, cancellation with retained checkpoints, verified
+pack reuse, request/source mismatch, missing completed objects, corrupt
+journals, and already-published targets.
 The one-million-entry stress test is opt-in because it creates a large
 temporary dataset. The standalone benchmark performs and reports a cold first
 backup and a parent-based incremental backup against the same repository per
@@ -158,6 +201,8 @@ Useful commands from the workspace root:
 
 ```bash
 cargo test -p gib-sdk --test backup_pipeline -- --nocapture --test-threads=1
+cargo test -p gib-sdk --test resumable_backup -- --nocapture --test-threads=1
+cargo test -p gib-cli -- --nocapture
 GIB_BACKUP_STRESS_ENTRIES=1000000 cargo test -p gib-sdk --test backup_pipeline stress_opt_in_large_entry_count -- --ignored --nocapture
 GIB_BACKUP_BENCH_FILES=1024 GIB_BACKUP_BENCH_FILE_KIB=256 GIB_BACKUP_BENCH_RUNS=3 cargo bench -p gib-sdk --bench backup_pipeline
 ```
