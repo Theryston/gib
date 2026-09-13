@@ -88,6 +88,11 @@ pub enum DomainError {
         /// The stable reason for rejecting the metadata.
         reason: &'static str,
     },
+    /// A path delta or checkpoint is not a valid derived path record.
+    InvalidPathDelta {
+        /// The stable reason for rejecting the path delta.
+        reason: &'static str,
+    },
     /// A repository HEAD contains an invalid generation or snapshot state.
     InvalidRepositoryHead {
         /// The stable reason for rejecting the HEAD state.
@@ -108,6 +113,7 @@ impl DomainError {
             | Self::InvalidObjectId { reason }
             | Self::InvalidSnapshotSelector { reason }
             | Self::InvalidSnapshotMetadata { reason }
+            | Self::InvalidPathDelta { reason }
             | Self::InvalidRepositoryHead { reason } => reason,
         }
     }
@@ -142,6 +148,9 @@ impl fmt::Display for DomainError {
             }
             Self::InvalidSnapshotMetadata { reason } => {
                 write!(formatter, "invalid snapshot metadata: {reason}")
+            }
+            Self::InvalidPathDelta { reason } => {
+                write!(formatter, "invalid path delta: {reason}")
             }
             Self::InvalidRepositoryHead { reason } => {
                 write!(formatter, "invalid repository HEAD: {reason}")

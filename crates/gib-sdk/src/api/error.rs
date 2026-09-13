@@ -104,6 +104,14 @@ pub enum ErrorCode {
     OperationJournalStorageFailure,
     /// A new journal identifier collided with an existing object.
     OperationJournalAlreadyExists,
+    /// A requested path delta or checkpoint does not exist.
+    PathDeltaNotFound,
+    /// A path delta or checkpoint failed integrity validation.
+    PathDeltaMalformed,
+    /// A path delta or checkpoint exceeds its bounded loader limit.
+    PathDeltaTooLarge,
+    /// No path delta exists for a snapshot that predates deltas.
+    PathDeltaUnavailable,
 }
 
 impl ErrorCode {
@@ -158,6 +166,10 @@ impl ErrorCode {
             Self::OperationJournalEncryptionRequired => "operation_journal_encryption_required",
             Self::OperationJournalStorageFailure => "operation_journal_storage_failure",
             Self::OperationJournalAlreadyExists => "operation_journal_already_exists",
+            Self::PathDeltaNotFound => "path_delta_not_found",
+            Self::PathDeltaMalformed => "path_delta_malformed",
+            Self::PathDeltaTooLarge => "path_delta_too_large",
+            Self::PathDeltaUnavailable => "path_delta_unavailable",
         }
     }
 }
@@ -316,6 +328,14 @@ pub enum SdkError {
     },
     /// A new journal identifier already exists.
     OperationJournalAlreadyExists,
+    /// The requested path delta or checkpoint does not exist.
+    PathDeltaNotFound,
+    /// The path delta or checkpoint is corrupt or structurally invalid.
+    PathDeltaMalformed,
+    /// The path delta or checkpoint exceeds a bounded loader limit.
+    PathDeltaTooLarge,
+    /// No path delta exists for the requested snapshot.
+    PathDeltaUnavailable,
     /// An operation method conflicts with its current state.
     OperationStateConflict {
         /// The operation involved in the conflict.
@@ -436,6 +456,10 @@ impl SdkError {
                 ErrorCode::OperationJournalStorageFailure
             }
             Self::OperationJournalAlreadyExists => ErrorCode::OperationJournalAlreadyExists,
+            Self::PathDeltaNotFound => ErrorCode::PathDeltaNotFound,
+            Self::PathDeltaMalformed => ErrorCode::PathDeltaMalformed,
+            Self::PathDeltaTooLarge => ErrorCode::PathDeltaTooLarge,
+            Self::PathDeltaUnavailable => ErrorCode::PathDeltaUnavailable,
         }
     }
 
@@ -490,7 +514,11 @@ impl SdkError {
             | Self::OperationJournalTooLarge
             | Self::OperationJournalEncryptionRequired
             | Self::OperationJournalStorageFailure { .. }
-            | Self::OperationJournalAlreadyExists => None,
+            | Self::OperationJournalAlreadyExists
+            | Self::PathDeltaNotFound
+            | Self::PathDeltaMalformed
+            | Self::PathDeltaTooLarge
+            | Self::PathDeltaUnavailable => None,
         }
     }
 
@@ -700,6 +728,18 @@ impl fmt::Display for SdkError {
             ),
             Self::OperationJournalAlreadyExists => {
                 formatter.write_str("the operation journal identifier already exists")
+            }
+            Self::PathDeltaNotFound => {
+                formatter.write_str("the requested path delta was not found")
+            }
+            Self::PathDeltaMalformed => {
+                formatter.write_str("the path delta is corrupt or structurally invalid")
+            }
+            Self::PathDeltaTooLarge => {
+                formatter.write_str("the path delta exceeds a bounded loader limit")
+            }
+            Self::PathDeltaUnavailable => {
+                formatter.write_str("no path delta exists for the requested snapshot")
             }
         }
     }

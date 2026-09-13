@@ -1,3 +1,4 @@
+use super::delta::{CURRENT_PATH_CHECKPOINT_VERSION, CURRENT_PATH_DELTA_VERSION};
 use super::{DomainError, RepositoryObject};
 use std::fmt;
 use std::str::FromStr;
@@ -180,6 +181,10 @@ pub enum ObjectKind {
     Pack,
     /// An index for a pack.
     Index,
+    /// An immutable path delta tied to one snapshot.
+    PathDelta,
+    /// An immutable full path listing for one checkpoint generation.
+    Checkpoint,
     /// A bounded mutable operation journal.
     Operation,
 }
@@ -192,6 +197,8 @@ impl ObjectKind {
             Self::Tree => "tree",
             Self::Pack => "pack",
             Self::Index => "index",
+            Self::PathDelta => "path-delta",
+            Self::Checkpoint => "checkpoint",
             Self::Operation => "operation",
         }
     }
@@ -208,6 +215,8 @@ impl ObjectKind {
             "tree" => Some(Self::Tree),
             "pack" => Some(Self::Pack),
             "index" => Some(Self::Index),
+            "path-delta" => Some(Self::PathDelta),
+            "checkpoint" => Some(Self::Checkpoint),
             "operation" => Some(Self::Operation),
             _ => None,
         }
@@ -220,6 +229,8 @@ impl ObjectKind {
             Self::Tree => CURRENT_TREE_OBJECT_VERSION,
             Self::Pack => CURRENT_PACK_OBJECT_VERSION,
             Self::Index => CURRENT_INDEX_OBJECT_VERSION,
+            Self::PathDelta => CURRENT_PATH_DELTA_VERSION,
+            Self::Checkpoint => CURRENT_PATH_CHECKPOINT_VERSION,
             Self::Operation => CURRENT_OPERATION_OBJECT_VERSION,
         }
     }
@@ -231,6 +242,8 @@ impl ObjectKind {
             Self::Tree => "trees",
             Self::Pack => "packs",
             Self::Index => "indexes",
+            Self::PathDelta => crate::domain::PATH_DELTAS_PREFIX,
+            Self::Checkpoint => crate::domain::PATH_CHECKPOINTS_PREFIX,
             Self::Operation => "operations",
         }
     }

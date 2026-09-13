@@ -96,6 +96,8 @@ fn immutable_object_bytes(storage: &MemoryStorage) -> Result<u64, Box<dyn Error>
                 || key.starts_with("indexes/")
                 || key.starts_with("trees/")
                 || key.starts_with("snapshots/")
+                || key.starts_with("path-deltas/")
+                || key.starts_with("checkpoints/")
         })
         .try_fold(0_u64, |total, key| {
             let length = u64::try_from(storage.read_object(&key)?.len())?;
@@ -112,6 +114,8 @@ fn immutable_object_count(storage: &MemoryStorage) -> Result<usize, Box<dyn Erro
                 || key.starts_with("indexes/")
                 || key.starts_with("trees/")
                 || key.starts_with("snapshots/")
+                || key.starts_with("path-deltas/")
+                || key.starts_with("checkpoints/")
         })
         .count())
 }
@@ -194,7 +198,8 @@ fn identical_snapshot_reuses_content_and_writes_no_content_packs() -> Result<(),
         second.metrics().reused_bytes()
     );
     assert_eq!(object_keys(&storage, "packs/")?, packs_after_first);
-    assert_eq!(second.metrics().uploaded_objects(), 1);
+    // An unchanged rerun still publishes a new snapshot and its (empty) delta.
+    assert_eq!(second.metrics().uploaded_objects(), 2);
     assert_eq!(
         second.metrics().new_stored_bytes(),
         immutable_object_bytes(&storage)?.saturating_sub(bytes_after_first)

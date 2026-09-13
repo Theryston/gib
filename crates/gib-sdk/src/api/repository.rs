@@ -900,6 +900,10 @@ impl From<DomainError> for SdkError {
                 field: "repository_head",
                 reason,
             },
+            DomainError::InvalidPathDelta { reason } => SdkError::InvalidRequest {
+                field: "path_delta",
+                reason,
+            },
         }
     }
 }

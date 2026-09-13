@@ -276,10 +276,37 @@ child node kind alongside the child ID; a repository tree source verifies both
 the content ID and kind before returning a node. Lazy lookup loads only the
 root and the requested ancestor chain. Depth-first traversal retains only the
 active directory path, detects cycles in that path, and does not materialize a
-whole snapshot. Rebuilding a changed leaf creates the leaf and its ancestor
-chain while reusing every unrelated child reference.
+whole snapshot. Rebuilding a changed leaf creates the leaf and its ancestor chain while reusing every unrelated child reference.
 
-## Fixtures
+## Version-1 path delta and checkpoint payload
+
+Deltas and checkpoints are derived data for search/explore catalogs: restore
+never reads them, and a missing or corrupt object is regenerated from the
+authoritative trees. Both share one canonical named MessagePack map behind
+distinct envelope kinds. A delta uses kind `path-delta` with
+`object_version = 1` and key `path-deltas/<first-2-hex>/<snapshot-id>`; a
+checkpoint uses kind `checkpoint` with `object_version = 1` and key
+`checkpoints/<snapshot-id>`. Like trees and snapshots they are stored without
+compression or encryption. The payload fields, in this order, are:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `format_version` | unsigned 16-bit integer | Delta payload schema. Value: `1`. |
+| `snapshot` | UTF-8 string | Snapshot ID this object describes. |
+| `parent` | nil or UTF-8 string | Parent snapshot ID the delta was computed against; nil for full listings and checkpoints. |
+| `generation` | unsigned 64-bit integer | Positive publication generation. |
+| `records` | array of named maps | Path records in ascending path-byte order, no duplicates. |
+
+Each record is a named map with `path` (normalized relative path, at most
+4096 bytes, never the root for deletes), `operation` (`0` add, `1` modify,
+`2` delete), `kind` (`0` directory, `1` file, `2` symlink), and `size`
+(logical file size, zero otherwise). Renames are always a delete of the old
+path plus an add of the new path. Deleting a directory path implicitly
+deletes every path below it, so removed subtrees need no further records.
+Checkpoints contain only additions and must land on a checkpoint generation
+(every 16th); any other generation is rejected. The decoder enforces the
+8 MiB object cap, a 1,048,576-record cap, canonical re-encoding equality,
+and rejects unknown fields, wrong kinds, and version mismatches.
 
 The repository contains exact hexadecimal byte fixtures under
 `tests/fixtures/repository/v1/objects/`:

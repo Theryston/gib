@@ -7,6 +7,7 @@ mod event;
 mod filesystem;
 mod identity;
 mod operation;
+mod path_delta;
 mod repository;
 mod storage_configuration;
 mod tree;
@@ -14,11 +15,14 @@ mod tree;
 pub use crate::domain::{
     BackupBudgetError, BackupBudgets, BackupDeduplicationConfiguration,
     BackupDeduplicationConfigurationError, BackupMetrics, BackupResource, BackupStage,
-    DEFAULT_BACKUP_CPU_WORKERS, DEFAULT_BACKUP_DEDUP_BATCH_SIZE,
-    DEFAULT_BACKUP_DEDUP_CATALOG_ENTRIES, DEFAULT_BACKUP_FILE_DESCRIPTORS,
-    DEFAULT_BACKUP_MEMORY_BYTES, DEFAULT_BACKUP_NETWORK_REQUESTS, DEFAULT_BACKUP_QUEUE_CAPACITY,
-    MAX_BACKUP_DEDUP_BATCH_SIZE, MAX_BACKUP_DEDUP_CATALOG_ENTRIES, MAX_BACKUP_QUEUE_CAPACITY,
-    MIN_BACKUP_CPU_WORKERS, MIN_BACKUP_FILE_DESCRIPTORS, MIN_BACKUP_NETWORK_REQUESTS,
+    CURRENT_PATH_CHECKPOINT_VERSION, CURRENT_PATH_DELTA_VERSION, DEFAULT_BACKUP_CPU_WORKERS,
+    DEFAULT_BACKUP_DEDUP_BATCH_SIZE, DEFAULT_BACKUP_DEDUP_CATALOG_ENTRIES,
+    DEFAULT_BACKUP_FILE_DESCRIPTORS, DEFAULT_BACKUP_MEMORY_BYTES, DEFAULT_BACKUP_NETWORK_REQUESTS,
+    DEFAULT_BACKUP_QUEUE_CAPACITY, DeltaOperation, MAX_BACKUP_DEDUP_BATCH_SIZE,
+    MAX_BACKUP_DEDUP_CATALOG_ENTRIES, MAX_BACKUP_QUEUE_CAPACITY, MIN_BACKUP_CPU_WORKERS,
+    MIN_BACKUP_FILE_DESCRIPTORS, MIN_BACKUP_NETWORK_REQUESTS, PATH_CHECKPOINT_INTERVAL,
+    PATH_CHECKPOINTS_PREFIX, PATH_DELTAS_PREFIX, PathCheckpoint, PathDelta, PathDeltaRecord,
+    PathEntry, apply_path_records, is_checkpoint_generation, path_checkpoint_key, path_delta_key,
 };
 pub use backup::{
     BackupHandle, BackupPipeline, BackupRequest, BackupResult, PendingOperation,
@@ -67,6 +71,7 @@ pub use operation::{
     CancellationHandle, CancellationToken, OperationHandle, OperationId, OperationKind,
     OperationRequest, OperationResult, OperationStatus, Request,
 };
+pub use path_delta::RebuiltPathState;
 pub use repository::{
     ARGON2ID_MEMORY_COST_KIB, ARGON2ID_PARALLELISM, ARGON2ID_TIME_COST, BackupReference, ByteRange,
     CURRENT_INDEX_OBJECT_VERSION, CURRENT_OBJECT_ENVELOPE_VERSION,

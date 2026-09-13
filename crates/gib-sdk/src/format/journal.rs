@@ -336,7 +336,10 @@ fn validate_data(data: &OperationJournalData) -> Result<(), FormatError> {
         let Some((namespace, _)) = object.key.split_once('/') else {
             return Err(FormatError::InvalidField);
         };
-        if !matches!(namespace, "snapshots" | "trees" | "packs" | "indexes") {
+        if !matches!(
+            namespace,
+            "snapshots" | "trees" | "packs" | "indexes" | "path-deltas" | "checkpoints"
+        ) {
             return Err(FormatError::InvalidField);
         }
         if object.size == 0 {

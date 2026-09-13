@@ -1022,6 +1022,7 @@ fn map_domain_error(error: DomainError) -> FormatError {
         | DomainError::InvalidObjectId { .. }
         | DomainError::InvalidSnapshotSelector { .. }
         | DomainError::InvalidSnapshotMetadata { .. }
+        | DomainError::InvalidPathDelta { .. }
         | DomainError::InvalidRepositoryHead { .. } => FormatError::InvalidField,
     }
 }

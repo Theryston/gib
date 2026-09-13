@@ -700,6 +700,8 @@ fn is_immutable_object_key(value: &str) -> bool {
         ObjectKind::Tree.storage_prefix(),
         ObjectKind::Pack.storage_prefix(),
         ObjectKind::Index.storage_prefix(),
+        ObjectKind::PathDelta.storage_prefix(),
+        ObjectKind::Checkpoint.storage_prefix(),
     ]
     .iter()
     .any(|prefix| value.starts_with(&format!("{prefix}/")))

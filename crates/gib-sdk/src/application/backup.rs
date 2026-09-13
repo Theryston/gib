@@ -1,5 +1,6 @@
 use super::filesystem::FilesystemScanner;
 use super::journal::{JournalError, JournalRuntime, LoadedOperationJournal, create_journal};
+use super::path_delta::{PathDeltaError, diff_trees, load_tree};
 use super::ports::{
     ObjectKey, ObjectListRequest, ObjectPrefix, ObjectWriteOptions, RepositoryStorage,
     StorageError, read_stream_to_vec,
@@ -16,16 +17,18 @@ use crate::domain::{
     ObjectEncryption, ObjectId, ObjectKind, ObjectTransformOptions, PACK_ALIGNMENT,
     PACK_ENTRY_HEADER_LENGTH, PACK_FOOTER_LENGTH, PACK_HEADER_LENGTH, PACK_INDEX_RECORD_LENGTH,
     PackConfiguration, PackEntryInput, PackIndexConfiguration, PackIndexEntry, PackIndexId,
-    PackIndexShardId, PackIndexTransform, PortableMetadata, RegularFileNode, SealedPack,
-    SealedPackIndexShard, Snapshot, SnapshotId, SnapshotPublication, SnapshotReference,
-    SnapshotSelector, SnapshotSummary, SymbolicLinkNode, TreeEntry, TreeNode, TreeNodeKind,
-    TreeNodeReference,
+    PackIndexShardId, PackIndexTransform, PathCheckpoint, PathDelta, PortableMetadata,
+    RegularFileNode, RepositoryObject, SealedPack, SealedPackIndexShard, Snapshot, SnapshotId,
+    SnapshotPublication, SnapshotReference, SnapshotSelector, SnapshotSummary, SymbolicLinkNode,
+    TreeEntry, TreeNode, TreeNodeKind, TreeNodeReference, is_checkpoint_generation,
+    path_checkpoint_key, path_delta_key,
 };
 use crate::format::{
     EncryptionContext, OperationJournalCheckpoint, OperationJournalData, OperationJournalState,
     PackBuilder as FormatPackBuilder, PackIndexFormatError,
     PackIndexShardBuilder as FormatPackIndexShardBuilder, VerifiedPackIndexShard,
-    encode_object_envelope_with_options_deterministic, encode_snapshot, encode_tree_node_with_id,
+    encode_object_envelope_with_options_deterministic, encode_path_checkpoint, encode_path_delta,
+    encode_snapshot, encode_tree_node_with_id,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -285,6 +288,9 @@ where
         }
     };
     let parent_id = parent.as_ref().map(|parent| parent.snapshot_id.clone());
+    let parent_delta_base = parent
+        .as_ref()
+        .map(|parent| (parent.snapshot_id.clone(), parent.root.clone()));
 
     let catalog = match ExistingContentCatalog::discover(
         Arc::clone(&storage),
@@ -673,6 +679,34 @@ where
         .map_err(|_| BackupError::Invalid {
             stage: BackupStage::Publish,
         })?;
+    let uploader = ImmutableObjectUploader {
+        storage: Arc::clone(&storage),
+        network_requests: Arc::clone(&network_requests),
+        file_descriptors: Arc::clone(&file_descriptors),
+        control: control.clone(),
+        journal: Arc::clone(&journal),
+    };
+    let new_generation = head
+        .head
+        .generation()
+        .checked_add(1)
+        .ok_or(BackupError::Repository {
+            stage: BackupStage::Publish,
+            failure: BackupRepositoryFailure::GenerationExhausted,
+        })?;
+    let published_delta = publish_path_delta(
+        &storage,
+        &uploader,
+        &metrics,
+        &memory,
+        &control,
+        &snapshot_id,
+        new_generation,
+        parent_delta_base
+            .as_ref()
+            .map(|(snapshot_id, root)| (snapshot_id, root)),
+        &tree_result.root,
+    )?;
     let mut snapshot = Snapshot::new(snapshot_id, request.message, created_at).map_err(|_| {
         BackupError::Invalid {
             stage: BackupStage::Publish,
@@ -680,7 +714,8 @@ where
     })?;
     snapshot = snapshot
         .with_parent(parent_id)
-        .with_root_tree(root_object.clone());
+        .with_root_tree(root_object.clone())
+        .with_path_delta(published_delta.delta.clone());
     if let Some(author) = request.author {
         snapshot = snapshot
             .with_author(author)
@@ -712,13 +747,6 @@ where
         &control,
         BackupStage::Publish,
     )?;
-    let uploader = ImmutableObjectUploader {
-        storage: Arc::clone(&storage),
-        network_requests: Arc::clone(&network_requests),
-        file_descriptors: Arc::clone(&file_descriptors),
-        control: control.clone(),
-        journal: Arc::clone(&journal),
-    };
     let snapshot_upload = uploader.upload(
         BackupStage::Publish,
         "snapshot",
@@ -759,9 +787,13 @@ where
     let summary = SnapshotSummary::from_snapshot(&snapshot).map_err(|_| BackupError::Invalid {
         stage: BackupStage::Publish,
     })?;
+    let mut required_objects = vec![root_object.clone(), published_delta.delta.clone()];
+    if let Some(checkpoint) = published_delta.checkpoint.clone() {
+        required_objects.push(checkpoint);
+    }
     let publication = SnapshotPublication::with_required_objects_and_summary(
         snapshot_reference.clone(),
-        [root_object.clone()],
+        required_objects,
         summary,
     )
     .map_err(|_| BackupError::Invalid {
@@ -863,9 +895,13 @@ fn resume_published_snapshot(
     let summary = SnapshotSummary::from_snapshot(&snapshot).map_err(|_| BackupError::Invalid {
         stage: BackupStage::Publish,
     })?;
+    let mut required_objects = vec![root_object];
+    if let Some(delta) = snapshot.path_delta().cloned() {
+        required_objects.push(delta);
+    }
     let publication = SnapshotPublication::with_required_objects_and_summary(
         target_reference.clone(),
-        [root_object],
+        required_objects,
         summary,
     )
     .map_err(|_| BackupError::Invalid {
@@ -956,6 +992,126 @@ fn resume_published_snapshot(
     })
 }
 
+struct PublishedPathDelta {
+    delta: RepositoryObject,
+    checkpoint: Option<RepositoryObject>,
+}
+
+/// Generates the path delta for one snapshot, publishes it alongside an
+/// optional checkpoint, and returns their immutable references.
+///
+/// Generation compares Merkle trees without touching the filesystem; the
+/// uploader journals both objects, so an interrupted publish resumes without
+/// re-uploading verified bytes and rebuilds byte-identical objects through
+/// the normal create-if-absent path.
+#[allow(clippy::too_many_arguments)]
+fn publish_path_delta(
+    storage: &Arc<dyn RepositoryStorage>,
+    uploader: &ImmutableObjectUploader,
+    metrics: &Arc<MetricsState>,
+    memory: &Arc<ResourceBudget>,
+    control: &PipelineControl,
+    snapshot_id: &SnapshotId,
+    generation: u64,
+    parent: Option<(&SnapshotId, &TreeNodeReference)>,
+    new_root: &TreeNodeReference,
+) -> Result<PublishedPathDelta, BackupError> {
+    let stage = BackupStage::Publish;
+    let is_cancelled = || control.is_cancelled();
+    let mut permits = Vec::new();
+    let mut reserve = |bytes: usize| {
+        let permit = memory
+            .try_reserve(bytes, stage)
+            .map_err(|error| match error {
+                BackupError::Budget {
+                    requested, limit, ..
+                } => PathDeltaError::Budget { requested, limit },
+                BackupError::Cancelled => PathDeltaError::Cancelled,
+                _ => PathDeltaError::TooLarge,
+            })?;
+        permits.push(permit);
+        Ok(())
+    };
+    let mut load = |reference: &TreeNodeReference| load_tree(storage.as_ref(), reference);
+    let records = diff_trees(
+        &mut load,
+        parent.map(|(_, root)| root),
+        new_root,
+        &is_cancelled,
+        &mut reserve,
+    )
+    .map_err(|error| map_path_delta_error(stage, error))?;
+    let delta = PathDelta::new(
+        snapshot_id.clone(),
+        parent.map(|(id, _)| id.clone()),
+        generation,
+        records,
+    )
+    .map_err(|_| BackupError::Invalid { stage })?;
+    let delta_key = path_delta_key(snapshot_id).map_err(|_| BackupError::Invalid { stage })?;
+    let delta_bytes = encode_path_delta(&delta).map_err(|_| BackupError::Format { stage })?;
+    let upload = uploader.upload(stage, "path_delta", delta_key.as_str(), &delta_bytes)?;
+    if upload.newly_stored {
+        metrics.uploaded_objects.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .new_stored_bytes
+            .fetch_add(upload.stored_bytes, Ordering::Relaxed);
+    }
+    let checkpoint = if is_checkpoint_generation(generation) {
+        let checkpoint_records = diff_trees(&mut load, None, new_root, &is_cancelled, &mut reserve)
+            .map_err(|error| map_path_delta_error(stage, error))?;
+        let checkpoint = PathCheckpoint::new(snapshot_id.clone(), generation, checkpoint_records)
+            .map_err(|_| BackupError::Invalid { stage })?;
+        let checkpoint_key =
+            path_checkpoint_key(snapshot_id).map_err(|_| BackupError::Invalid { stage })?;
+        let checkpoint_bytes =
+            encode_path_checkpoint(&checkpoint).map_err(|_| BackupError::Format { stage })?;
+        let upload = uploader.upload(
+            stage,
+            "path_checkpoint",
+            checkpoint_key.as_str(),
+            &checkpoint_bytes,
+        )?;
+        if upload.newly_stored {
+            metrics.uploaded_objects.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .new_stored_bytes
+                .fetch_add(upload.stored_bytes, Ordering::Relaxed);
+        }
+        Some(checkpoint_key)
+    } else {
+        None
+    };
+    Ok(PublishedPathDelta {
+        delta: delta_key,
+        checkpoint,
+    })
+}
+
+fn map_path_delta_error(stage: BackupStage, error: PathDeltaError) -> BackupError {
+    match error {
+        PathDeltaError::Cancelled => BackupError::Cancelled,
+        PathDeltaError::NotFound => BackupError::Repository {
+            stage,
+            failure: BackupRepositoryFailure::RequiredObjectMissing,
+        },
+        PathDeltaError::Malformed => BackupError::Repository {
+            stage,
+            failure: BackupRepositoryFailure::Malformed,
+        },
+        PathDeltaError::TooLarge | PathDeltaError::Unavailable => BackupError::Invalid { stage },
+        PathDeltaError::Budget { requested, limit } => BackupError::Budget {
+            stage,
+            resource: BackupResource::Memory,
+            requested,
+            limit,
+        },
+        PathDeltaError::Storage { .. } => BackupError::Repository {
+            stage,
+            failure: BackupRepositoryFailure::Storage,
+        },
+    }
+}
 struct ResolvedParent {
     snapshot_id: SnapshotId,
     root: TreeNodeReference,

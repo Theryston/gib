@@ -4,6 +4,7 @@ mod identity;
 mod journal;
 mod pack;
 mod pack_index;
+mod path_delta;
 mod repository;
 mod storage_configuration;
 mod transform;
@@ -33,6 +34,10 @@ pub(crate) use journal::{
 };
 pub(crate) use pack::{PackBuilder, PackFormatError, VerifiedPack};
 pub(crate) use pack_index::{PackIndexFormatError, PackIndexShardBuilder, VerifiedPackIndexShard};
+pub(crate) use path_delta::{
+    MAX_PATH_DELTA_BYTES, MAX_PATH_DELTA_RECORDS, decode_path_checkpoint, decode_path_delta,
+    encode_path_checkpoint, encode_path_delta,
+};
 pub(crate) use repository::{
     FormatError, MAX_SNAPSHOT_BYTES, decode_bootstrap, decode_descriptor, decode_head,
     decode_history_record, decode_snapshot, encode_bootstrap, encode_descriptor, encode_head,

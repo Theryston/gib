@@ -2,6 +2,7 @@ mod author;
 mod backup;
 mod chunk;
 mod configuration;
+mod delta;
 mod filesystem;
 mod object;
 mod pack;
@@ -37,6 +38,12 @@ pub(crate) use configuration::{
     MAX_BACKUP_CONCURRENCY, MAX_CHUNK_SIZE_BYTES, MAX_COMPRESSION_LEVEL, MAX_LIVE_INTERVAL_MS,
     MIN_COMPRESSION_LEVEL, RepositoryConfigurationInput, RestoreConfigurationInput,
     ValidatedConfiguration, validate_configuration,
+};
+pub use delta::{
+    CURRENT_PATH_CHECKPOINT_VERSION, CURRENT_PATH_DELTA_VERSION, DeltaOperation,
+    PATH_CHECKPOINT_INTERVAL, PATH_CHECKPOINTS_PREFIX, PATH_DELTAS_PREFIX, PathCheckpoint,
+    PathDelta, PathDeltaRecord, PathEntry, apply_path_records, is_checkpoint_generation,
+    path_checkpoint_key, path_delta_key,
 };
 pub(crate) use object::ImmutableObjectParts;
 pub use object::{
