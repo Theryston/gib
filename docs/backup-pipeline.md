@@ -191,7 +191,14 @@ also cover concurrent CAS publication and typed expected/current HEAD conflict
 context. Resumable-backup tests cover encrypted and checksummed journals,
 bounded pending listings, cancellation with retained checkpoints, verified
 pack reuse, request/source mismatch, missing completed objects, corrupt
-journals, and already-published targets.
+journals, and already-published targets. They also cover one-shot faults at
+each immutable prefix (trees, packs, indexes, snapshots) plus journal creation,
+cancellation before the first upload, a mismatch case for every fingerprinted
+option (message, author, timestamp, chunking, pack, index, dedup, transforms,
+budgets, parent), stale HEAD advances, tampered completion bytes failing
+closed, oversized journals reported as too large, paged prefix-isolated
+listings, secret-free journal bytes, and encrypted journals listed and resumed
+with and without repository material.
 The one-million-entry stress test is opt-in because it creates a large
 temporary dataset. The standalone benchmark performs and reports a cold first
 backup and a parent-based incremental backup against the same repository per
